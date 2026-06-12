@@ -1,0 +1,10 @@
+{
+  "name": "autoform",
+  "version": "0.2.0",
+  "description": "Two-command Lean 4 autoformalization: /autoform:run points at a sorry/axiom or an informal textbook/paper and runs the whole spec-gated workflow (plan -> spec -> prove -> verify -> reviewer packet) in-session on the Claude subscription; /autoform:review builds the reviewer packet (spec sheet, kernel evidence, faithfulness scorecard) so human Lean experts verify statements, not generated proof bodies. Paid paths (Aristotle proof search, the legacy Python engine) are explicit opt-in flags. Bundles the lean-conventions, formalization-workflow, and eval-rubrics skills (auto-discovered when editing .lean files).",
+  "author": {
+    "name": "Jack McCarthy",
+    "url": "https://github.com/Deicyde"
+  },
+  "keywords": ["lean", "mathlib", "autoformalization", "multi-agent", "spec-driven", "autoform-bot"]
+}
