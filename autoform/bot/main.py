@@ -256,6 +256,28 @@ async def run_coordinator(
         coordinator._merge_eval_tasks.append(task)
         task.add_done_callback(coordinator._merge_eval_tasks.remove)
 
+        # Refresh formalization.yaml (mathlib-initiative v0.2 schema)
+        # in the code workspace, then commit the change as a follow-on
+        # commit on main. No-op when the project hasn't opted in
+        # (file missing — initialize via `autoform formalization-init`).
+        # Axiom check is enabled here: the merge queue's lake-build
+        # gate guarantees the build is current at this point, so
+        # `#print axioms` will resolve every main_results decl.
+        try:
+            from .formalization import update_formalization
+            written = update_formalization(
+                coordinator.code_path,
+                models=[str(coordinator.config.llm.get("model", ""))]
+                       if hasattr(coordinator.config, "llm") else None,
+                framework="autoform-bot",
+                check_axioms_on_build=True,
+            )
+            if written is not None:
+                logger.info("formalization.yaml refreshed at %s", written)
+        except Exception:  # noqa: BLE001 — soft-warning
+            logger.exception("formalization.yaml refresh failed; "
+                             "continuing without it")
+
     def _on_merge_step(phase: str, agent_id: str, success: bool, duration_ms: float, error: str | None) -> None:
         """Record per-agent merge queue steps into the active trace context."""
         from core.trace.step_trace import _current_step_ctx, StepRecord
@@ -630,4 +652,86 @@ def run(
 
 
 if __name__ == "__main__":
-    fire.Fire({"run": run})
+    # Human-paced review subcommands are imported lazily so the heavy
+    # `run` import path doesn't pull github_issues' subprocess machinery
+    # when it's not needed.
+    from autoform.bot.review import (
+        review_open,
+        review_reject,
+        review_verify,
+    )
+    from autoform.bot.rejection_sync import sync_rejections
+    from autoform.bot.formalization import (
+        FORMALIZATION_FILENAME,
+        update_formalization,
+    )
+
+    def formalization_init(
+        code_dir: str = ".",
+        force: bool = False,
+        framework: str = "autoform-bot",
+    ) -> None:
+        """Create formalization.yaml from the v0.2 template.
+
+        Args:
+            code_dir: Workspace's Lean code repo (where the yaml lives).
+                Default: current directory.
+            force: Overwrite an existing formalization.yaml.
+            framework: Stamped into automation.framework.
+        """
+        from pathlib import Path as _P
+        code_path = _P(code_dir).resolve()
+        target = code_path / FORMALIZATION_FILENAME
+        if target.is_file() and not force:
+            print(f"refusing to overwrite existing {target} "
+                  "(use --force to allow)")
+            raise SystemExit(2)
+        written = update_formalization(
+            code_path, framework=framework, create_if_missing=True,
+            commit=False,
+        )
+        print(f"wrote {written}")
+
+    def formalization_update(
+        code_dir: str = ".",
+        models: list[str] | None = None,
+        framework: str = "autoform-bot",
+        no_commit: bool = False,
+        check_axioms: bool = False,
+    ) -> None:
+        """Refresh formalization.yaml's auto-fields (no-op if file missing).
+
+        Args:
+            code_dir: Workspace's Lean code repo. Default: current dir.
+            models: Model identifiers for automation.models.
+            framework: Stamped into automation.framework.
+            no_commit: Skip the follow-on git commit.
+            check_axioms: If True, run `#print axioms` on every
+                declaration in `status.main_results` and refresh
+                their `axioms` lists. Requires the workspace's Lean
+                code to be built; safe after a successful
+                `autoform run` since the merge queue's build gate
+                ensures freshness.
+        """
+        from pathlib import Path as _P
+        written = update_formalization(
+            _P(code_dir).resolve(),
+            models=models, framework=framework, commit=not no_commit,
+            check_axioms_on_build=check_axioms,
+        )
+        if written is None:
+            print(f"no formalization.yaml at {code_dir}; "
+                  "run `autoform formalization-init` first")
+            raise SystemExit(1)
+        suffix = " (with axioms)" if check_axioms else ""
+        print(f"refreshed {written}{suffix}")
+
+    fire.Fire({
+        "run": run,
+        "review-open": review_open,
+        "review-verify": review_verify,
+        "review-reject": review_reject,
+        "sync-rejections": sync_rejections,
+        "formalization-init": formalization_init,
+        "formalization-update": formalization_update,
+    })

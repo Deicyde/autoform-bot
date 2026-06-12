@@ -1,10 +1,10 @@
 model: Opus 4.6
 context_window: 1000000
 compact_threshold: 0.85
-max_turns: 40
+max_turns: 200
 tool_timeout_s: 120
 tools:
-  servers: [lsp, filesystem, git]
+  servers: [filesystem, git, github-issues]
 skills:
   prompt: [project/project_rubric]
 inference:
