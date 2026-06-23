@@ -86,7 +86,28 @@ Remote API v2, Bearer-authenticated:
   dependencies, informalization}], count, processing_time_ms}`
 - `GET https://www.leanexplore.com/api/v2/declarations/<id>` → one such result.
 
-For heavier / programmatic use, Lean Explore also ships an official package
-(`pip install lean-explore`, an `ApiClient`, a CLI, and an MCP server
-`lean-explore mcp serve`); this skill deliberately stays stdlib-only so it works with
-no extra install.
+This skill deliberately stays stdlib-only so it works with no extra install.
+
+## Optional: native tools via the MCP server
+
+Lean Explore also ships an MCP server exposing **8 native tools** — `search`,
+`search_summary` (the recommended slim first step), then per-id `get_source_code`,
+`get_docstring`, `get_description`, `get_source_link`, `get_dependencies`,
+`get_module`. To use those *natively* (instead of this skill's CLI), install the
+optional extra and add the server to your `.mcp.json`:
+
+```jsonc
+// .mcp.json — also export LEANEXPLORE_API_KEY in your environment
+"autoform-leanexplore": {
+  "command": "uv",
+  "args": ["run", "--extra", "leanexplore", "lean-explore", "mcp", "serve", "--backend", "api"],
+  "cwd": "${CLAUDE_PLUGIN_ROOT}",
+  "env": { "LEANEXPLORE_API_KEY": "${LEANEXPLORE_API_KEY}" }
+}
+```
+
+The `leanexplore` extra (`uv sync --extra leanexplore` / `pip install lean-explore`) is
+declared in `pyproject.toml`. It is **not** registered by default: `lean-explore mcp
+serve --backend api` exits without a key, so leaving it opt-in keeps the plugin from
+showing a failed server for users with no Lean Explore account. This skill's CLI needs
+no install and is the default path.
