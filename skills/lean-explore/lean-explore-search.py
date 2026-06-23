@@ -32,6 +32,11 @@ import urllib.request
 API_BASE = "https://www.leanexplore.com/api/v2"
 PACKAGES = ["Batteries", "CSLib", "FLT", "FormalConjectures", "Init", "Lean", "Mathlib", "PhysLean", "Std"]
 _TIMEOUT = 20
+# Lean Explore sits behind Cloudflare, which rejects the default `Python-urllib`
+# User-Agent with Error 1010 ("blocked based on your browser's signature") before
+# the key is ever checked. A normal browser UA passes that browser-signature check.
+_USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
 def _bold_title(informalization: str | None) -> str:
@@ -56,7 +61,12 @@ def _ssl_context() -> ssl.SSLContext:
 
 def _get(url: str, key: str) -> dict:
     req = urllib.request.Request(
-        url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json"}
+        url,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "User-Agent": _USER_AGENT,
+        },
     )
     with urllib.request.urlopen(req, timeout=_TIMEOUT, context=_ssl_context()) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -96,12 +106,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         data = _get(url, key)
     except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore") if hasattr(e, "read") else ""
+        if "1010" in body or "browser's signature" in body.lower():
+            _die("Lean Explore's Cloudflare edge blocked this request (Error 1010 — browser "
+                 "signature), before the key was checked. The request needs a browser "
+                 "User-Agent — this is a client bug, not a key problem.", 1)
         if e.code in (401, 403):
             _die(f"Lean Explore rejected the API key ({e.code}) — check LEANEXPLORE_API_KEY.", 2)
         if e.code == 404 and a.id is not None:
             _die(f"declaration {a.id} not found", 1)
-        body = e.read().decode("utf-8", "ignore")[:300] if hasattr(e, "read") else ""
-        _die(f"Lean Explore API error {e.code}: {body}", 1)
+        _die(f"Lean Explore API error {e.code}: {body[:300]}", 1)
     except urllib.error.URLError as e:
         hint = ""
         if "CERTIFICATE_VERIFY" in str(e.reason):
