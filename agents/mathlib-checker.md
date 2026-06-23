@@ -47,7 +47,9 @@ Perform a multi-strategy search, in order:
 
 3. **Keyword search with `... grep <PATTERN>`** — search for key mathematical terms (e.g., `IsCompact`, `isClosed`, `T2Space`). Use `--context 2` to see surrounding declarations.
 
-4. **Read matched files with `... read <FILE>`** — when you find a promising match, read the relevant section to verify the statement matches and understand any differences in generality.
+4. **Semantic search (when name/keyword miss) — the `lean-explore` skill.** Search by *meaning* across Mathlib + 8 libraries: `python3 <plugin>/skills/lean-explore/lean-explore-search.py "<concept in words>" --packages Mathlib`. It often surfaces an existing declaration under a name you would not have guessed; **confirm any hit locally** with `... name <NAME>` before reporting it. Needs `LEANEXPLORE_API_KEY` — if unset, skip this step and rely on the local search above.
+
+5. **Read matched files with `... read <FILE>`** — when you find a promising match, read the relevant section to verify the statement matches and understand any differences in generality.
 
 Report only declaration names you actually saw in the search output.
 
