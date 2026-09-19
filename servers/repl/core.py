@@ -287,6 +287,11 @@ def format_message(msg: dict) -> str:
 def format_repl_response(response: dict[str, Any]) -> str:
     """Parse a raw REPL response and format it as readable diagnostics."""
     if response.get("repl_error") is not None:
+        if response.get("outcome_unknown") is True:
+            return (
+                "REPL error (execution outcome unknown; request not retried): "
+                f"{response['repl_error']}"
+            )
         return f"REPL error: {response['repl_error']}"
 
     messages = response.get("messages", [])
@@ -760,6 +765,26 @@ class LeanRepl:
                 f"the process was recycled. Tail: {stderr_tail!r}"
             )
 
+        def reject_unsolicited_stdout() -> None:
+            try:
+                chunk = os.read(stdout_fd, self.chunk_size)
+            except BlockingIOError:
+                return
+            except OSError as error:
+                self.close()
+                raise ReplProcessExited(
+                    "Lean REPL stdout failed before the request frame was fully sent"
+                ) from error
+            self.close()
+            if chunk:
+                raise ReplProcessExited(
+                    "Lean REPL emitted unsolicited stdout before the request frame "
+                    "was fully sent; the process was recycled"
+                )
+            raise ReplProcessExited(
+                "Lean REPL closed stdout before the request frame was fully sent"
+            )
+
         def drain_stderr(*, max_reads: int | None = None, after_response: bool = False) -> bool:
             """Drain process stderr fairly while retaining a bounded tail.
 
@@ -834,9 +859,17 @@ class LeanRepl:
         # stderr pipe may be unable to read its stdin, so service stderr fairly
         # while writing instead of waiting on stdin alone. Any stderr observed
         # here remains process-scoped; it is never assigned to this command.
-        payload = memoryview(command.encode("utf-8"))
+        encoded_command = command.encode("utf-8")
+        # Hold back the final blank-line byte. The REPL cannot dispatch this
+        # command until that delimiter arrives, which gives us a stdout check
+        # after the complete request body has been written. Once the delimiter
+        # is sent, output belongs to this request under the REPL's sequential
+        # one-response-per-frame protocol.
+        payloads = (memoryview(encoded_command[:-1]), memoryview(encoded_command[-1:]))
+        payload_index = 0
+        payload = payloads[payload_index]
         offset = 0
-        while offset < len(payload):
+        while payload_index < len(payloads):
             remaining = end_time - time.monotonic()
             if remaining <= 0:
                 if stderr_poison_reason is not None:
@@ -844,8 +877,11 @@ class LeanRepl:
                 raise TimeoutError(
                     f"REPL command timed out after {timeout} seconds while writing"
                 )
+            readable_fds = [stdout_fd]
+            if stderr_open:
+                readable_fds.append(stderr_fd)
             readable, writable, _ = select.select(
-                [stderr_fd] if stderr_open else [],
+                readable_fds,
                 [stdin_fd],
                 [],
                 remaining,
@@ -860,6 +896,8 @@ class LeanRepl:
                 drain_stderr(max_reads=1)
                 if stderr_poison_reason is not None:
                     retire_before_request()
+            if stdout_fd in readable:
+                reject_unsolicited_stdout()
             if stdin_fd not in writable:
                 continue
             try:
@@ -873,6 +911,11 @@ class LeanRepl:
             if written <= 0:
                 raise ReplProcessExited("REPL process closed stdin while writing")
             offset += written
+            if offset == len(payload):
+                payload_index += 1
+                if payload_index < len(payloads):
+                    payload = payloads[payload_index]
+                    offset = 0
 
         mark_sent()
         while True:

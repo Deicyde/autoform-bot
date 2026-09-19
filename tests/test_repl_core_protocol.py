@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import threading
 from contextlib import ExitStack
 
@@ -357,6 +358,15 @@ def test_format_repl_response_reports_explicit_repl_error():
     )
 
 
+def test_format_repl_response_preserves_unknown_outcome_warning():
+    assert repl_core.format_repl_response(
+        {"repl_error": "response timed out", "outcome_unknown": True}
+    ) == (
+        "REPL error (execution outcome unknown; request not retried): "
+        "response timed out"
+    )
+
+
 class _PipeProcess:
     def __init__(self, stack: ExitStack, stdout_chunks: list[bytes], stderr: bytes = b""):
         stdin_read, stdin_write = os.pipe()
@@ -479,6 +489,61 @@ def test_wire_protocol_retires_process_on_unsolicited_second_frame(monkeypatch):
         with pytest.raises(repl_core.ReplOutcomeUnknown, match="unsolicited bytes"):
             repl._run("#check Nat", env_id=3, timeout=1)
 
+        assert repl.process is None
+
+
+def test_wire_protocol_rejects_delayed_stdout_before_the_next_request():
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [])
+        repl = _repl_with_process(process)
+        first_request = bytearray()
+
+        def serve_first_request() -> None:
+            while b"\n\n" not in first_request:
+                first_request.extend(os.read(process._stdin_read.fileno(), 4096))
+            os.write(process._stdout_write.fileno(), b'{"env":1}\n\n')
+
+        worker = threading.Thread(target=serve_first_request, daemon=True)
+        worker.start()
+        assert repl._run("first", env_id=None, timeout=1) == {"env": 1}
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+
+        os.write(process._stdout_write.fileno(), b'{"env":999}\n\n')
+        with pytest.raises(repl_core.ReplProcessExited, match="unsolicited stdout"):
+            repl._run("second", env_id=None, timeout=1)
+
+        readable, _, _ = select.select([process._stdin_read.fileno()], [], [], 0)
+        assert readable == []
+        assert repl.process is None
+
+
+def test_wire_protocol_rechecks_stdout_before_dispatching_a_complete_request_body(
+    monkeypatch,
+):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [])
+        repl = _repl_with_process(process)
+        real_write = os.write
+        first_write = True
+
+        def write_body_then_emit_stdout(fd: int, data: bytes) -> int:
+            nonlocal first_write
+            if fd != process.stdin.fileno() or not first_write:
+                return real_write(fd, data)
+            first_write = False
+            written = real_write(fd, data)
+            real_write(process._stdout_write.fileno(), b'{"env":999}\n\n')
+            return written
+
+        monkeypatch.setattr(repl_core.os, "write", write_body_then_emit_stdout)
+
+        with pytest.raises(repl_core.ReplProcessExited, match="unsolicited stdout"):
+            repl._run("second", env_id=None, timeout=1)
+
+        os.set_blocking(process._stdin_read.fileno(), False)
+        written = os.read(process._stdin_read.fileno(), 4096)
+        assert written.endswith(b"\n") and not written.endswith(b"\n\n")
         assert repl.process is None
 
 
@@ -952,7 +1017,7 @@ def test_stderr_arriving_during_the_next_write_is_process_scoped(monkeypatch):
             result = normal_select(readable, writable, exceptional, timeout)
             if writable:
                 writes += 1
-                if writes == 2:
+                if writes == 4:
                     # These bytes are emitted by command one after command two's
                     # old preflight window, while command two is being written.
                     os.write(first._stderr_write.fileno(), b"x" * 32)
@@ -964,7 +1029,7 @@ def test_stderr_arriving_during_the_next_write_is_process_scoped(monkeypatch):
         # The process-generation quota is exceeded, but command two's captured
         # response survives without the dead environment identifier or a retry.
         assert repl.run("second", timeout=1) == {}
-        assert writes == 2
+        assert writes == 4
         assert repl.process is None
 
         monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
