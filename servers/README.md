@@ -22,9 +22,10 @@ sockets include a code fingerprint, so an in-place upgrade gracefully replaces
 the older build. The fingerprint includes the packaged server modules, Python
 runtime, and installed dependency closure. Stable lifetime locks, including
 the released v1 lock names, are taken exclusively during startup and retained
-shared by the daemon, every Lean launcher, and its watchdog. Old and new
-clients therefore cannot start a replacement after a daemon crash until its
-surviving child groups are gone.
+without a gap across the starter-to-daemon handoff, then shared by the daemon,
+every Lean launcher, and its watchdog. Old and new clients therefore cannot
+start a replacement after a starter or daemon crash until the surviving
+runtime generation and child groups are gone.
 
 Lean subprocesses remain lazy. A REPL call stays pending while its fresh child
 starts, and the first LSP call stays pending while its session starts, so no

@@ -182,10 +182,41 @@ def test_default_runtime_ownership_paths_are_protocol_independent(
     assert paths.lock.name == f"lean-{INSTALL_PATH_ID}.lock"
     assert paths.lifetime_lock.name == f"lean-{INSTALL_PATH_ID}.lifetime.lock"
     assert lean_client.LEGACY_LOCK_PROTOCOL_VERSIONS == (1,)
+    assert paths.compatibility_locks == (
+        runtime_dir / f"lean-v1-{INSTALL_PATH_ID}.lock",
+    )
     assert paths.compatibility_lifetime_locks == (
         runtime_dir / f"lean-v1-{INSTALL_PATH_ID}.lifetime.lock",
     )
     assert f"lean-v{PROTOCOL_VERSION}-" in paths.socket.name
+
+
+def test_daemon_fails_closed_if_an_inherited_lock_is_not_owned(
+    runtime_dir,
+    monkeypatch,
+):
+    import fcntl
+
+    paths = lean_client.runtime_paths_for_socket(runtime_dir / "unowned.sock")
+    bootstrap_fd = os.open(paths.lock, os.O_CREAT | os.O_RDWR, 0o600)
+    lifetime_fd = os.open(paths.lifetime_lock, os.O_CREAT | os.O_RDWR, 0o600)
+    real_flock = fcntl.flock
+
+    def flock(descriptor, operation):
+        if descriptor == bootstrap_fd and operation == fcntl.LOCK_EX | fcntl.LOCK_NB:
+            raise BlockingIOError
+        return real_flock(descriptor, operation)
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+
+    with pytest.raises(lean_client.LeanRuntimeError, match="not exclusively owned"):
+        lean_runtime.serve(
+            paths,
+            inherited_bootstrap_fds=(bootstrap_fd,),
+            inherited_lifetime_fds=(lifetime_fd,),
+        )
+
+    assert not paths.socket.exists()
 
 
 def runtime_config(**overrides):
@@ -2757,6 +2788,124 @@ def test_daemon_outlives_the_separate_process_that_started_it(
         ] == []
     finally:
         client.stop()
+
+
+@pytest.mark.daemon
+def test_killed_starter_cannot_leave_a_shadow_daemon(
+    tmp_path,
+    runtime_dir,
+    repo_root,
+    monkeypatch,
+):
+    import fcntl
+
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
+    startup_hook = tmp_path / "startup-hook"
+    startup_hook.mkdir()
+    daemon_started = tmp_path / "daemon-started"
+    release_daemon = tmp_path / "release-daemon"
+    (startup_hook / "sitecustomize.py").write_text(
+        """
+import os
+import time
+from pathlib import Path
+
+marker = os.environ.get("AUTOFORM_TEST_DAEMON_STARTED")
+gate = os.environ.get("AUTOFORM_TEST_RELEASE_DAEMON")
+if marker and gate:
+    Path(marker).write_text(str(os.getpid()), encoding="utf-8")
+    while not Path(gate).exists():
+        time.sleep(0.01)
+""",
+        encoding="utf-8",
+    )
+    helper_code = (
+        "import os, sys; "
+        "os.environ['PYTHONPATH'] = sys.argv[1]; "
+        "os.environ['AUTOFORM_TEST_DAEMON_STARTED'] = sys.argv[2]; "
+        "os.environ['AUTOFORM_TEST_RELEASE_DAEMON'] = sys.argv[3]; "
+        "from servers.lean_client import LeanRuntimeClient; "
+        "LeanRuntimeClient(startup_timeout=30).ensure_running()"
+    )
+    helper = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            helper_code,
+            str(startup_hook),
+            str(daemon_started),
+            str(release_daemon),
+        ],
+        cwd=repo_root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    replacement = LeanRuntimeClient(startup_timeout=15)
+    socket_path = replacement.socket_path
+    replacement_status = []
+    replacement_errors = []
+    daemon_pid = None
+
+    def start_replacement():
+        try:
+            replacement_status.append(replacement.ensure_running())
+        except BaseException as error:
+            replacement_errors.append(error)
+
+    replacement_thread = threading.Thread(target=start_replacement)
+    try:
+        deadline = time.monotonic() + 5
+        while not daemon_started.exists() and time.monotonic() < deadline:
+            if helper.poll() is not None:
+                stderr = helper.stderr.read() if helper.stderr is not None else b""
+                pytest.fail(
+                    "starter exited before the daemon reached its gate: "
+                    f"{stderr.decode(errors='replace')}"
+                )
+            time.sleep(0.01)
+        assert daemon_started.exists()
+        daemon_pid = int(daemon_started.read_text(encoding="utf-8"))
+
+        os.kill(helper.pid, signal.SIGKILL)
+        helper.wait(timeout=2)
+        inherited_lock_paths = (
+            replacement.paths.lock,
+            *replacement.paths.compatibility_locks,
+            *replacement._lifetime_lock_paths(),
+        )
+        for lock_path in inherited_lock_paths:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+        replacement_thread.start()
+        replacement_thread.join(timeout=0.2)
+
+        assert replacement_thread.is_alive()
+        assert not socket_path.exists()
+
+        release_daemon.write_text("continue", encoding="utf-8")
+        replacement_thread.join(timeout=20)
+
+        assert not replacement_thread.is_alive()
+        assert replacement_errors == []
+        assert [status["pid"] for status in replacement_status] == [daemon_pid]
+        assert replacement.ping()["pid"] == daemon_pid
+    finally:
+        release_daemon.write_text("continue", encoding="utf-8")
+        if replacement_thread.ident is not None:
+            replacement_thread.join(timeout=20)
+        try:
+            replacement.stop(deadline=time.monotonic() + 5)
+        except LeanRuntimeUnavailable:
+            pass
+        if helper.poll() is None:
+            helper.kill()
+            helper.wait(timeout=2)
+        if daemon_pid is not None and _process_is_live(daemon_pid):
+            os.kill(daemon_pid, signal.SIGKILL)
 
 
 @pytest.mark.daemon

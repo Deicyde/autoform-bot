@@ -2206,28 +2206,90 @@ def _configure_logging(log_path: Path | None) -> None:
     )
 
 
-def serve(paths: RuntimePaths) -> None:
+def serve(
+    paths: RuntimePaths,
+    *,
+    inherited_bootstrap_fds: tuple[int, ...] = (),
+    inherited_lifetime_fds: tuple[int, ...] = (),
+) -> None:
     """Run the internal runtime in the foreground until stop or a signal."""
     _configure_logging(paths.log)
     import fcntl
 
-    lifetime_fds = []
+    if bool(inherited_bootstrap_fds) != bool(inherited_lifetime_fds):
+        raise LeanRuntimeError(
+            "inherited bootstrap and lifetime locks must be provided together"
+        )
+    inherited_fds = (*inherited_bootstrap_fds, *inherited_lifetime_fds)
+    if (
+        any(isinstance(descriptor, bool) or descriptor < 3 for descriptor in inherited_fds)
+        or len(set(inherited_fds)) != len(inherited_fds)
+    ):
+        raise LeanRuntimeError("inherited runtime lock descriptors are invalid")
+
+    bootstrap_fds = list(inherited_bootstrap_fds)
+    lifetime_fds = list(inherited_lifetime_fds)
     try:
+        expected_bootstrap_paths = tuple(
+            dict.fromkeys((paths.lock, *paths.compatibility_locks))
+        )
+        expected_lifetime_paths = tuple(
+            dict.fromkeys(
+                (paths.lifetime_lock, *paths.compatibility_lifetime_locks)
+            )
+        )
+        if bootstrap_fds and (
+            len(bootstrap_fds) != len(expected_bootstrap_paths)
+            or len(lifetime_fds) != len(expected_lifetime_paths)
+        ):
+            raise LeanRuntimeError(
+                "inherited runtime locks do not match configured paths"
+            )
+        for kind, descriptors, paths_to_verify in (
+            ("bootstrap", bootstrap_fds, expected_bootstrap_paths),
+            ("lifetime", lifetime_fds, expected_lifetime_paths),
+        ):
+            for descriptor, path in zip(descriptors, paths_to_verify):
+                try:
+                    descriptor_info = os.fstat(descriptor)
+                    path_info = path.stat()
+                except OSError as error:
+                    raise LeanRuntimeError(
+                        f"inherited runtime {kind} lock is unavailable"
+                    ) from error
+                if (
+                    not stat.S_ISREG(descriptor_info.st_mode)
+                    or (descriptor_info.st_dev, descriptor_info.st_ino)
+                    != (path_info.st_dev, path_info.st_ino)
+                ):
+                    raise LeanRuntimeError(
+                        f"inherited runtime {kind} lock does not match its path"
+                    )
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError) as error:
+                    raise LeanRuntimeError(
+                        f"inherited runtime {kind} lock is not exclusively owned"
+                    ) from error
+
         # Claim the complete compatibility set exclusively before publishing
         # this daemon, then retain shared ownership through cleanup. Existing
         # clients still request these locks exclusively, while this daemon and
         # all of its Lean children can hold shared claims concurrently.
-        for path in dict.fromkeys(
-            (paths.lifetime_lock, *paths.compatibility_lifetime_locks)
-        ):
-            lifetime_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-            lifetime_fds.append(lifetime_fd)
-            fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
+        if not lifetime_fds:
+            for path in expected_lifetime_paths:
+                lifetime_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+                lifetime_fds.append(lifetime_fd)
+                fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
         for lifetime_fd in lifetime_fds:
             fcntl.flock(lifetime_fd, fcntl.LOCK_SH)
     except BaseException:
+        for bootstrap_fd in reversed(bootstrap_fds):
+            os.close(bootstrap_fd)
+        bootstrap_fds.clear()
         for lifetime_fd in reversed(lifetime_fds):
             os.close(lifetime_fd)
+        lifetime_fds.clear()
         raise
     services: LeanRuntimeServices | None = None
     server: LeanRuntimeServer | None = None
@@ -2263,6 +2325,14 @@ def serve(paths: RuntimePaths) -> None:
         for signum in (signal.SIGTERM, signal.SIGINT):
             previous_handlers[signum] = signal.signal(signum, request_shutdown)
 
+        # The spawning client and this daemon inherited the same exclusive
+        # bootstrap locks. Release the daemon copies only after the socket and
+        # signal handlers are ready. If the client dies during startup, these
+        # copies keep every compatible client behind the completed handoff.
+        for bootstrap_fd in reversed(bootstrap_fds):
+            os.close(bootstrap_fd)
+        bootstrap_fds.clear()
+
         logger.info("Lean runtime %s listening at %s", os.getpid(), paths.socket)
         server.serve_forever(poll_interval=0.25)
     finally:
@@ -2284,6 +2354,8 @@ def serve(paths: RuntimePaths) -> None:
                 for signum, handler in previous_handlers.items():
                     signal.signal(signum, handler)
                 logger.info("Lean runtime %s stopped", os.getpid())
+                for bootstrap_fd in reversed(bootstrap_fds):
+                    os.close(bootstrap_fd)
                 for lifetime_fd in reversed(lifetime_fds):
                     os.close(lifetime_fd)
 
@@ -2293,6 +2365,8 @@ def _paths_from_args(
     log_path: str | None,
     lifetime_lock_path: str | None = None,
     compatibility_lifetime_lock_paths: list[str] | None = None,
+    compatibility_lock_paths: list[str] | None = None,
+    lock_path: str | None = None,
 ) -> RuntimePaths:
     paths = (
         runtime_paths_for_socket(socket_path)
@@ -2303,9 +2377,12 @@ def _paths_from_args(
         log_path is None
         and lifetime_lock_path is None
         and compatibility_lifetime_lock_paths is None
+        and compatibility_lock_paths is None
+        and lock_path is None
     ):
         return paths
     log = paths.log if log_path is None else Path(log_path).expanduser()
+    lock = paths.lock if lock_path is None else Path(lock_path).expanduser()
     lifetime_lock = (
         paths.lifetime_lock
         if lifetime_lock_path is None
@@ -2313,6 +2390,12 @@ def _paths_from_args(
     )
     if not log.is_absolute():
         raise LeanRuntimeError("Lean runtime log path must be absolute")
+    if not lock.is_absolute():
+        raise LeanRuntimeError("Lean runtime lock path must be absolute")
+    if lock.parent != paths.directory:
+        raise LeanRuntimeError(
+            "Lean runtime lock must stay in the runtime directory"
+        )
     if not lifetime_lock.is_absolute():
         raise LeanRuntimeError("Lean runtime lifetime lock path must be absolute")
     compatibility_lifetime_locks = (
@@ -2332,12 +2415,27 @@ def _paths_from_args(
                 "Lean runtime compatibility lifetime locks must stay in the "
                 "runtime directory"
             )
+    compatibility_locks = (
+        paths.compatibility_locks
+        if compatibility_lock_paths is None
+        else tuple(Path(path).expanduser() for path in compatibility_lock_paths)
+    )
+    for path in compatibility_locks:
+        if not path.is_absolute():
+            raise LeanRuntimeError(
+                "Lean runtime compatibility locks must be absolute"
+            )
+        if path.parent != paths.directory:
+            raise LeanRuntimeError(
+                "Lean runtime compatibility locks must stay in the runtime directory"
+            )
     return RuntimePaths(
         directory=paths.directory,
         socket=paths.socket,
-        lock=paths.lock,
+        lock=lock,
         lifetime_lock=lifetime_lock,
         log=log,
+        compatibility_locks=compatibility_locks,
         compatibility_lifetime_locks=compatibility_lifetime_locks,
     )
 
@@ -2346,11 +2444,29 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", help="override the Unix socket path")
     parser.add_argument("--log", help="override the rotating log path")
+    parser.add_argument("--lock", help="override the runtime startup lock")
     parser.add_argument("--lifetime-lock", help="override the runtime lifetime lock")
+    parser.add_argument(
+        "--compatibility-lock",
+        action="append",
+        help="additional startup lock held for an older Autoform client",
+    )
     parser.add_argument(
         "--compatibility-lifetime-lock",
         action="append",
         help="additional lifetime lock held for an older Autoform client",
+    )
+    parser.add_argument(
+        "--inherited-bootstrap-lock-fd",
+        action="append",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--inherited-lifetime-lock-fd",
+        action="append",
+        type=int,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "command",
@@ -2360,14 +2476,20 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
     paths = _paths_from_args(
-        args.socket,
-        args.log,
-        args.lifetime_lock,
-        args.compatibility_lifetime_lock,
+        socket_path=args.socket,
+        log_path=args.log,
+        lifetime_lock_path=args.lifetime_lock,
+        compatibility_lifetime_lock_paths=args.compatibility_lifetime_lock,
+        compatibility_lock_paths=args.compatibility_lock,
+        lock_path=args.lock,
     )
 
     if args.command == "serve":
-        serve(paths)
+        serve(
+            paths,
+            inherited_bootstrap_fds=tuple(args.inherited_bootstrap_lock_fd or ()),
+            inherited_lifetime_fds=tuple(args.inherited_lifetime_lock_fd or ()),
+        )
         return
 
     # Preserve default-path semantics so start/stop also discover and replace

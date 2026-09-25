@@ -222,6 +222,7 @@ class RuntimePaths:
     lifetime_lock: Path
     log: Path
     compatibility_lifetime_locks: tuple[Path, ...] = ()
+    compatibility_locks: tuple[Path, ...] = ()
 
 
 def _private_runtime_directory(path: Path) -> Path:
@@ -279,6 +280,10 @@ def default_runtime_paths() -> RuntimePaths:
         lock=directory / f"lean-{INSTALL_PATH_ID}.lock",
         lifetime_lock=directory / f"lean-{INSTALL_PATH_ID}.lifetime.lock",
         log=directory / f"lean-v{PROTOCOL_VERSION}-{INSTALL_ID}.log",
+        compatibility_locks=tuple(
+            directory / f"lean-v{version}-{INSTALL_PATH_ID}.lock"
+            for version in LEGACY_LOCK_PROTOCOL_VERSIONS
+        ),
         compatibility_lifetime_locks=tuple(
             directory
             / f"lean-v{version}-{INSTALL_PATH_ID}.lifetime.lock"
@@ -425,12 +430,7 @@ class LeanRuntimeClient:
 
     def _acquire_bootstrap_locks(self, deadline: float) -> list[int]:
         """Hold stable and pre-stable startup locks during lifecycle changes."""
-        lock_paths = [self.paths.lock]
-        if self._uses_default_paths:
-            lock_paths.extend(
-                self.paths.directory / f"lean-v{version}-{INSTALL_PATH_ID}.lock"
-                for version in LEGACY_LOCK_PROTOCOL_VERSIONS
-            )
+        lock_paths = (self.paths.lock, *self.paths.compatibility_locks)
         lock_fds: list[int] = []
         try:
             for lock_path in dict.fromkeys(lock_paths):
@@ -505,7 +505,10 @@ class LeanRuntimeClient:
             try:
                 self._remaining(deadline, "Lean runtime startup")
                 self._remove_stale_socket()
-                process = self._spawn_daemon()
+                process = self._spawn_daemon(
+                    bootstrap_fds=tuple(lock_fds),
+                    lifetime_fds=tuple(lifetime_fds),
+                )
             finally:
                 for lifetime_fd in reversed(lifetime_fds):
                     os.close(lifetime_fd)
@@ -686,7 +689,13 @@ class LeanRuntimeClient:
         for path in self._lifetime_lock_paths():
             self._wait_for_lifetime(path, deadline=deadline)
 
-    def _spawn_daemon(self) -> subprocess.Popen[bytes]:
+    def _spawn_daemon(
+        self,
+        *,
+        bootstrap_fds: tuple[int, ...],
+        lifetime_fds: tuple[int, ...],
+    ) -> subprocess.Popen[bytes]:
+        """Spawn a daemon that inherits every already-acquired lifecycle lock."""
         command = [
             sys.executable,
             "-m",
@@ -695,12 +704,21 @@ class LeanRuntimeClient:
             str(self.paths.socket),
             "--log",
             str(self.paths.log),
+            "--lock",
+            str(self.paths.lock),
             "--lifetime-lock",
             str(self.paths.lifetime_lock),
         ]
         for path in self.paths.compatibility_lifetime_locks:
             command.extend(("--compatibility-lifetime-lock", str(path)))
+        for path in self.paths.compatibility_locks:
+            command.extend(("--compatibility-lock", str(path)))
+        for descriptor in bootstrap_fds:
+            command.extend(("--inherited-bootstrap-lock-fd", str(descriptor)))
+        for descriptor in lifetime_fds:
+            command.extend(("--inherited-lifetime-lock-fd", str(descriptor)))
         command.append("serve")
+        inherited_fds = tuple(dict.fromkeys((*bootstrap_fds, *lifetime_fds)))
         with self.paths.log.open("ab", buffering=0) as log:
             return subprocess.Popen(
                 command,
@@ -708,6 +726,7 @@ class LeanRuntimeClient:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 close_fds=True,
+                pass_fds=inherited_fds,
                 start_new_session=True,
                 cwd=PACKAGE_ROOT,
             )
