@@ -8,6 +8,7 @@ this process through a private Unix-domain socket.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 import json
 import logging
 import math
@@ -20,7 +21,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -274,12 +275,17 @@ class _CacheEntry(Generic[T]):
     resource: T
     fingerprint: ProjectFingerprint
     last_used: float
-    active: int = 0
+    active: set[object] = field(default_factory=set)
     invalid: bool = False
 
 
 class ProjectResourceCache(Generic[T]):
-    """Bounded project cache with active leases and idle/LRU eviction."""
+    """Bounded project cache with active leases and idle/LRU eviction.
+
+    ``deadline_factory`` receives the lease's absolute monotonic deadline.  It
+    lets a resource's own startup protocol share the cache admission deadline
+    without breaking existing one-argument factories.
+    """
 
     def __init__(
         self,
@@ -289,6 +295,7 @@ class ProjectResourceCache(Generic[T]):
         max_entries: int,
         idle_seconds: float,
         is_valid: Callable[[T], bool] | None = None,
+        deadline_factory: Callable[[Path, float], T] | None = None,
         start_sweeper: bool = True,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -299,10 +306,11 @@ class ProjectResourceCache(Generic[T]):
         self._max_entries = max_entries
         self._idle_seconds = idle_seconds
         self._is_valid = is_valid
+        self._deadline_factory = deadline_factory
         self._clock = clock
         self._entries: dict[Path, _CacheEntry[T]] = {}
         self._retiring: dict[Path, T] = {}
-        self._retiring_active: set[Path] = set()
+        self._retiring_active: dict[Path, object] = {}
         self._creating: set[Path] = set()
         self._condition = threading.Condition()
         self._closed = False
@@ -333,22 +341,27 @@ class ProjectResourceCache(Generic[T]):
         if deadline is not None and acquisition_timeout is not None:
             raise TypeError("pass acquisition_timeout or deadline, not both")
         root = resolve_lean_project_dir(project_dir)
-        resource = self._acquire(
-            root,
-            create=create,
-            acquisition_timeout=acquisition_timeout,
-            deadline=deadline,
-            creation_budget=creation_budget,
-            required_fingerprint=required_fingerprint,
-        )
+        effective_deadline = deadline
+        if effective_deadline is None and acquisition_timeout is not None:
+            effective_deadline = self._clock() + acquisition_timeout
+        lease_token = object()
+        resource: T | None = None
         operation_error: BaseException | None = None
         try:
+            resource = self._acquire(
+                root,
+                lease_token=lease_token,
+                create=create,
+                acquisition_timeout=acquisition_timeout,
+                deadline=effective_deadline,
+                creation_budget=creation_budget,
+                required_fingerprint=required_fingerprint,
+            )
             yield resource
         except BaseException as error:
             operation_error = error
         try:
-            if resource is not None:
-                self._release(root, resource)
+            self._release(root, lease_token, deadline=effective_deadline)
         except BaseException as cleanup_error:
             if operation_error is None:
                 raise
@@ -365,7 +378,13 @@ class ProjectResourceCache(Generic[T]):
         with self._condition:
             now = self._clock()
             entries = [
-                (root, entry.resource, entry.active, entry.invalid, entry.last_used)
+                (
+                    root,
+                    entry.resource,
+                    len(entry.active),
+                    entry.invalid,
+                    entry.last_used,
+                )
                 for root, entry in sorted(
                     self._entries.items(), key=lambda item: str(item[0])
                 )
@@ -399,13 +418,14 @@ class ProjectResourceCache(Generic[T]):
     def inspect(self, project_dir: str) -> Iterator[T | None]:
         """Borrow existing state without validating, replacing, or creating it."""
         root = resolve_lean_project_dir(project_dir)
+        lease_token = object()
         with self._condition:
             if self._closed:
                 raise RuntimeError("project resource cache is closed")
             entry = self._entries.get(root)
             resource = None if entry is None else entry.resource
             if entry is not None:
-                entry.active += 1
+                entry.active.add(lease_token)
         try:
             yield resource
         finally:
@@ -416,7 +436,7 @@ class ProjectResourceCache(Generic[T]):
                         raise RuntimeError(
                             "inspected project resource is no longer registered"
                         )
-                    entry.active -= 1
+                    entry.active.remove(lease_token)
                     self._condition.notify_all()
 
     def state(self, project_dir: str) -> str:
@@ -452,7 +472,7 @@ class ProjectResourceCache(Generic[T]):
             victims = [
                 root
                 for root, entry in self._entries.items()
-                if entry.active == 0 and now - entry.last_used >= self._idle_seconds
+                if not entry.active and now - entry.last_used >= self._idle_seconds
             ]
             for root in victims:
                 self._retiring[root] = self._entries.pop(root).resource
@@ -464,14 +484,7 @@ class ProjectResourceCache(Generic[T]):
             if victims:
                 self._condition.notify_all()
         for root, resource in retiring:
-            with self._condition:
-                if (
-                    self._retiring.get(root) is not resource
-                    or root in self._retiring_active
-                ):
-                    continue
-                self._retiring_active.add(root)
-            self._retire(root, resource)
+            self._retire_until_deadline(root, resource, deadline=None)
         return len(victims)
 
     def close(self) -> None:
@@ -493,15 +506,8 @@ class ProjectResourceCache(Generic[T]):
         first_error: BaseException | None = None
         try:
             for root, resource in retiring:
-                with self._condition:
-                    self._condition.wait_for(
-                        lambda: root not in self._retiring_active
-                    )
-                    if self._retiring.get(root) is not resource:
-                        continue
-                    self._retiring_active.add(root)
                 try:
-                    self._retire(root, resource)
+                    self._retire_until_deadline(root, resource, deadline=None)
                 except BaseException as error:
                     if first_error is None:
                         first_error = error
@@ -521,6 +527,7 @@ class ProjectResourceCache(Generic[T]):
         self,
         root: Path,
         *,
+        lease_token: object,
         create: bool,
         acquisition_timeout: float | None,
         deadline: float | None,
@@ -574,7 +581,6 @@ class ProjectResourceCache(Generic[T]):
                             deadline=deadline,
                             creation_budget=creation_budget,
                         )
-                        self._retiring_active.add(root)
                         retirement = (root, self._retiring[root])
                     entry = None
                 else:
@@ -609,7 +615,6 @@ class ProjectResourceCache(Generic[T]):
                             )
                             resource = self._entries.pop(root).resource
                             self._retiring[root] = resource
-                            self._retiring_active.add(root)
                             retirement = (root, resource)
                             self._condition.notify_all()
                             entry = None
@@ -619,7 +624,7 @@ class ProjectResourceCache(Generic[T]):
                         raise ProjectResourceBusyError(
                             f"timed out waiting for a shared Lean project slot: {root}"
                         )
-                    entry.active += 1
+                    entry.active.add(lease_token)
                     entry.last_used = self._clock()
                     candidate = entry.resource
 
@@ -655,13 +660,12 @@ class ProjectResourceCache(Generic[T]):
                         inactive = [
                             (candidate.last_used, path)
                             for path, candidate in self._entries.items()
-                            if candidate.active == 0
+                            if not candidate.active
                         ]
                         if inactive:
                             _, victim = min(inactive)
                             resource = self._entries.pop(victim).resource
                             self._retiring[victim] = resource
-                            self._retiring_active.add(victim)
                             retirement = (victim, resource)
                             self._condition.notify_all()
                         elif any(
@@ -673,7 +677,6 @@ class ProjectResourceCache(Generic[T]):
                                 for path in self._retiring
                                 if path not in self._retiring_active
                             )
-                            self._retiring_active.add(retiring_root)
                             retirement = (
                                 retiring_root,
                                 self._retiring[retiring_root],
@@ -702,14 +705,19 @@ class ProjectResourceCache(Generic[T]):
                     current_fingerprint = lean_project_fingerprint(root)
                 except OSError as error:
                     self.invalidate(str(root), candidate)
-                    self._release(root, candidate)
+                    self._release(root, lease_token, deadline=deadline)
                     raise ProjectResourceBusyError(
                         f"shared Lean project changed after validation: {root}"
                     ) from error
                 if current_fingerprint == fingerprint:
+                    if deadline is not None and self._clock() >= deadline:
+                        raise ProjectResourceBusyError(
+                            "shared Lean project validation exceeded its response "
+                            f"budget: {root}"
+                        )
                     return candidate
                 self.invalidate(str(root), candidate)
-                self._release(root, candidate)
+                self._release(root, lease_token, deadline=deadline)
                 if required_fingerprint is not None:
                     raise ProjectResourceBusyError(
                         f"shared Lean project changed after validation: {root}"
@@ -718,7 +726,17 @@ class ProjectResourceCache(Generic[T]):
 
             if retirement is not None:
                 retiring_root, retiring_resource = retirement
-                if not self._retire(retiring_root, retiring_resource):
+                retired = self._retire_until_deadline(
+                    retiring_root,
+                    retiring_resource,
+                    deadline=deadline,
+                )
+                if retired is None:
+                    raise ProjectResourceBusyError(
+                        "response budget expired while retiring a displaced Lean "
+                        f"project resource: {retiring_root}"
+                    )
+                if not retired:
                     raise ProjectResourceBusyError(
                         "failed to retire a stale Lean project resource: "
                         f"{retiring_root}"
@@ -730,56 +748,279 @@ class ProjectResourceCache(Generic[T]):
                 raise ProjectResourceBusyError(
                     f"shared Lean project changed before startup: {root}"
                 )
-            created = self._factory(root)
+            if deadline is not None and self._clock() >= deadline:
+                raise ProjectResourceBusyError(
+                    "shared Lean project startup exceeded its response budget: "
+                    f"{root}"
+                )
         except BaseException:
             with self._condition:
                 self._creating.discard(root)
                 self._condition.notify_all()
             raise
 
+        if deadline is None:
+            try:
+                created = self._factory(root)
+            except BaseException:
+                with self._condition:
+                    self._creating.discard(root)
+                    self._condition.notify_all()
+                raise
+            disposition = self._settle_created_resource(
+                root,
+                created,
+                fingerprint=fingerprint,
+                required_fingerprint=required_fingerprint,
+            )
+        else:
+            future: Future[None] = Future()
+            factory_outcome: list[tuple[bool, Any]] = []
+            start_gate = threading.Event()
+            start_decision = {"run": False}
+
+            def log_abandoned_failure(completed: Future[None]) -> None:
+                del completed
+                succeeded, outcome = factory_outcome[0]
+                if not succeeded:
+                    assert isinstance(outcome, BaseException)
+                    logger.error(
+                        "Lean project resource startup failed after its caller "
+                        "stopped waiting",
+                        exc_info=(type(outcome), outcome, outcome.__traceback__),
+                    )
+
+            def create_resource() -> None:
+                start_gate.wait()
+                if not start_decision["run"]:
+                    return
+                try:
+                    factory = self._deadline_factory
+                    resource = (
+                        self._factory(root)
+                        if factory is None
+                        else factory(root, deadline)
+                    )
+                except BaseException as error:
+                    with self._condition:
+                        self._creating.discard(root)
+                        self._condition.notify_all()
+                    factory_outcome.append((False, error))
+                else:
+                    try:
+                        disposition = self._settle_created_resource(
+                            root,
+                            resource,
+                            fingerprint=fingerprint,
+                            required_fingerprint=required_fingerprint,
+                        )
+                    except BaseException as error:
+                        factory_outcome.append((False, error))
+                    else:
+                        factory_outcome.append(
+                            (True, (resource, disposition))
+                        )
+                future.set_result(None)
+
+            creator: threading.Thread | None = None
+            try:
+                creator = threading.Thread(
+                    target=create_resource,
+                    name="autoform-project-startup",
+                    daemon=False,
+                )
+                creator.start()
+                start_decision["run"] = True
+                start_gate.set()
+            except BaseException:
+                # The worker cannot touch the factory until this thread makes
+                # an explicit decision.  This removes Thread.start's ambiguous
+                # interruption window: a possibly launched worker observes
+                # ``run == False`` and exits without creating a resource.
+                start_gate.set()
+                if not start_decision["run"]:
+                    with self._condition:
+                        self._creating.discard(root)
+                        self._condition.notify_all()
+                raise
+
+            try:
+                future.result(timeout=max(0.0, deadline - self._clock()))
+            except FutureTimeoutError:
+                future.add_done_callback(log_abandoned_failure)
+                raise ProjectResourceBusyError(
+                    "shared Lean project startup exceeded its response "
+                    f"budget: {root}"
+                ) from None
+            except BaseException:
+                future.add_done_callback(log_abandoned_failure)
+                raise
+            succeeded, outcome = factory_outcome[0]
+            if not succeeded:
+                assert isinstance(outcome, BaseException)
+                raise outcome.with_traceback(outcome.__traceback__)
+            created, disposition = outcome
+
+        if disposition == "closed":
+            raise RuntimeError("project resource cache closed during startup")
+        if disposition == "changed":
+            raise ProjectResourceBusyError(
+                f"shared Lean project changed during startup: {root}"
+            )
+        return self._claim_created_resource(
+            root,
+            created,
+            lease_token=lease_token,
+            fingerprint=fingerprint,
+            deadline=deadline,
+        )
+
+    def _settle_created_resource(
+        self,
+        root: Path,
+        resource: T,
+        *,
+        fingerprint: ProjectFingerprint,
+        required_fingerprint: ProjectFingerprint | None,
+    ) -> str:
+        """Publish a valid result or retain ownership until it is retired."""
+        fingerprint_error: BaseException | None = None
         try:
             current_fingerprint = lean_project_fingerprint(root)
         except OSError:
             current_fingerprint = None
-        close_created = False
-        startup_expired = False
-        project_changed = current_fingerprint != fingerprint
+        except BaseException as error:
+            current_fingerprint = None
+            fingerprint_error = error
+        try:
+            with self._condition:
+                if self._closed:
+                    disposition = "closed"
+                elif current_fingerprint != fingerprint or (
+                    required_fingerprint is not None
+                    and current_fingerprint != required_fingerprint
+                ):
+                    disposition = "changed"
+                elif root in self._entries or root in self._retiring:
+                    disposition = "closed"
+                else:
+                    disposition = "published"
+                    self._entries[root] = _CacheEntry(
+                        resource=resource,
+                        fingerprint=fingerprint,
+                        last_used=self._clock(),
+                    )
+                if disposition != "published":
+                    self._retiring[root] = resource
+                self._creating.discard(root)
+                self._condition.notify_all()
+        except BaseException as error:
+            try:
+                self._retain_created_resource(root, resource)
+            except BaseException as cleanup_error:
+                self._add_cleanup_note(error, cleanup_error)
+            raise error.with_traceback(error.__traceback__)
+        if disposition != "published":
+            cleanup_error: BaseException | None = None
+            try:
+                self._ensure_retirement_started(root, resource)
+            except BaseException as error:
+                cleanup_error = error
+            if fingerprint_error is not None:
+                if cleanup_error is not None:
+                    self._add_cleanup_note(fingerprint_error, cleanup_error)
+                raise fingerprint_error.with_traceback(
+                    fingerprint_error.__traceback__
+                )
+            if cleanup_error is not None:
+                raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+        return disposition
+
+    def _retain_created_resource(self, root: Path, resource: T) -> None:
+        """Recover ownership when settlement is interrupted mid-publication."""
+        start_retirement = False
         with self._condition:
             self._creating.discard(root)
-            if self._closed:
-                close_created = True
-            elif project_changed:
-                close_created = True
-            elif deadline is not None and self._clock() >= deadline:
-                close_created = True
-                startup_expired = True
+            entry = self._entries.get(root)
+            retiring = self._retiring.get(root)
+            if entry is not None and entry.resource is resource:
+                pass
+            elif retiring is resource:
+                if root not in self._retiring_active:
+                    start_retirement = True
             else:
-                self._entries[root] = _CacheEntry(
-                    resource=created,
-                    fingerprint=fingerprint,
-                    last_used=self._clock(),
-                    active=1,
-                )
-            if close_created:
-                self._retiring[root] = created
-                self._retiring_active.add(root)
+                if entry is not None or retiring is not None:
+                    raise RuntimeError(
+                        "created Lean project resource collided with another owner"
+                    )
+                self._retiring[root] = resource
+                start_retirement = True
             self._condition.notify_all()
-        if close_created:
-            cleaned = self._retire(root, created)
-            if not cleaned:
-                raise ProjectResourceBusyError(
-                    f"failed to retire a late Lean project resource: {root}"
-                )
-            if startup_expired:
-                raise ProjectResourceBusyError(
-                    f"shared Lean project startup exceeded its response budget: {root}"
-                )
-            if project_changed:
-                raise ProjectResourceBusyError(
-                    f"shared Lean project changed during startup: {root}"
-                )
-            raise RuntimeError("project resource cache closed during startup")
-        return created
+        if start_retirement:
+            self._ensure_retirement_started(root, resource)
+
+    def _claim_created_resource(
+        self,
+        root: Path,
+        resource: T,
+        *,
+        lease_token: object,
+        fingerprint: ProjectFingerprint,
+        deadline: float | None,
+    ) -> T:
+        """Turn an idle published startup into the caller's active lease."""
+        try:
+            current_fingerprint = lean_project_fingerprint(root)
+        except OSError:
+            current_fingerprint = None
+        if current_fingerprint != fingerprint:
+            self.invalidate(str(root), resource)
+            raise ProjectResourceBusyError(
+                f"shared Lean project changed during startup: {root}"
+            )
+
+        try:
+            with self._condition:
+                if self._closed:
+                    raise RuntimeError("project resource cache is closed")
+                entry = self._entries.get(root)
+                if (
+                    entry is None
+                    or entry.resource is not resource
+                    or entry.invalid
+                    or entry.fingerprint != fingerprint
+                ):
+                    raise ProjectResourceBusyError(
+                        "created Lean project resource became unavailable before "
+                        f"its lease was claimed: {root}"
+                    )
+                if deadline is not None and self._clock() >= deadline:
+                    raise ProjectResourceBusyError(
+                        "shared Lean project startup exceeded its response "
+                        f"budget: {root}"
+                    )
+                entry.active.add(lease_token)
+                entry.last_used = self._clock()
+                return resource
+        except BaseException as error:
+            with self._condition:
+                entry = self._entries.get(root)
+                claimed = entry is not None and lease_token in entry.active
+            if claimed:
+                try:
+                    self._release(root, lease_token, deadline=deadline)
+                except BaseException as cleanup_error:
+                    self._add_cleanup_note(error, cleanup_error)
+            raise error.with_traceback(error.__traceback__)
+
+    @staticmethod
+    def _add_cleanup_note(error: BaseException, cleanup_error: BaseException) -> None:
+        note = f"Lean project resource cleanup also failed: {cleanup_error}"
+        add_note = getattr(error, "add_note", None)
+        if add_note is not None:
+            add_note(note)
+        else:  # pragma: no cover - Python 3.10 compatibility
+            logger.error("%s", note)
 
     def _require_creation_budget(
         self,
@@ -795,14 +1036,21 @@ class ProjectResourceCache(Generic[T]):
                 f"not enough response budget to start a shared Lean project slot: {root}"
             )
 
-    def _release(self, root: Path, resource: T) -> None:
+    def _release(
+        self,
+        root: Path,
+        lease_token: object,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         retirement: tuple[Path, T] | None = None
         validation_error: BaseException | None = None
         with self._condition:
             entry = self._entries.get(root)
-            if entry is None or entry.resource is not resource:
-                raise RuntimeError("project resource lease is no longer registered")
-            entry.active -= 1
+            if entry is None or lease_token not in entry.active:
+                return
+            resource = entry.resource
+            entry.active.remove(lease_token)
             entry.last_used = self._clock()
             invalid = entry.invalid
             if not invalid and self._is_valid is not None:
@@ -811,15 +1059,14 @@ class ProjectResourceCache(Generic[T]):
                 except BaseException as error:
                     validation_error = error
                     invalid = True
-            if entry.active == 0 and invalid:
+            if not entry.active and invalid:
                 self._entries.pop(root)
                 self._retiring[root] = resource
-                self._retiring_active.add(root)
                 retirement = (root, resource)
             self._condition.notify_all()
         if retirement is not None:
             try:
-                self._retire(*retirement)
+                self._retire_until_deadline(*retirement, deadline=deadline)
             except BaseException as cleanup_error:
                 if validation_error is None:
                     raise
@@ -839,7 +1086,107 @@ class ProjectResourceCache(Generic[T]):
             except Exception:
                 logger.exception("failed to evict idle Lean project resources")
 
-    def _retire(self, root: Path, resource: T) -> bool:
+    def _retirement_future(
+        self, root: Path, resource: T
+    ) -> Future[bool] | None:
+        """Claim and start one retirement, or report another current owner."""
+        future: Future[bool] = Future()
+        start_gate = threading.Event()
+        start_decision = {"run": False}
+        owner = object()
+
+        def retire() -> None:
+            start_gate.wait()
+            if not start_decision["run"]:
+                return
+            try:
+                future.set_result(self._retire(root, resource, owner))
+            except BaseException as error:
+                future.set_exception(error)
+
+        worker: threading.Thread | None = None
+        try:
+            with self._condition:
+                if self._retiring.get(root) is not resource:
+                    return None
+                if root in self._retiring_active:
+                    return None
+                self._retiring_active[root] = owner
+                self._condition.notify_all()
+            worker = threading.Thread(
+                target=retire,
+                name="autoform-project-retirement",
+                daemon=False,
+            )
+            worker.start()
+            start_decision["run"] = True
+            start_gate.set()
+        except BaseException:
+            start_gate.set()
+            if not start_decision["run"]:
+                with self._condition:
+                    if self._retiring_active.get(root) is owner:
+                        self._retiring_active.pop(root)
+                    self._condition.notify_all()
+            raise
+        return future
+
+    def _start_retirement(self, root: Path, resource: T) -> None:
+        """Retire in the background, leaving failures quarantined for retry."""
+        try:
+            self._retirement_future(root, resource)
+        except Exception:
+            logger.exception("failed to start Lean project resource retirement")
+
+    def _ensure_retirement_started(self, root: Path, resource: T) -> None:
+        """Claim an inactive quarantine entry and start exactly one closer."""
+        self._start_retirement(root, resource)
+
+    def _retire_until_deadline(
+        self,
+        root: Path,
+        resource: T,
+        *,
+        deadline: float | None,
+    ) -> bool | None:
+        """Return a retirement result, or ``None`` while it remains owned."""
+        waited_for_owner = False
+        while True:
+            with self._condition:
+                if self._retiring.get(root) is not resource:
+                    return True
+                if root in self._retiring_active:
+                    waited_for_owner = True
+                    wait_seconds = 0.5
+                    if deadline is not None:
+                        remaining = deadline - self._clock()
+                        if remaining <= 0:
+                            return None
+                        wait_seconds = min(wait_seconds, remaining)
+                    self._condition.wait(timeout=wait_seconds)
+                    continue
+                if waited_for_owner:
+                    return False
+            try:
+                future = self._retirement_future(root, resource)
+            except Exception:
+                logger.exception("failed to start Lean project resource retirement")
+                return False
+            if future is None:
+                waited_for_owner = True
+                continue
+            try:
+                if deadline is None:
+                    return future.result()
+                return future.result(
+                    timeout=max(0.0, deadline - self._clock())
+                )
+            except FutureTimeoutError:
+                if future.done():
+                    return future.result()
+                return None
+
+    def _retire(self, root: Path, resource: T, owner: object) -> bool:
         """Try one bounded close while retaining failed ownership in quarantine."""
         succeeded = False
         try:
@@ -852,7 +1199,8 @@ class ProjectResourceCache(Generic[T]):
             return True
         finally:
             with self._condition:
-                self._retiring_active.discard(root)
+                if self._retiring_active.get(root) is owner:
+                    self._retiring_active.pop(root)
                 if succeeded and self._retiring.get(root) is resource:
                     self._retiring.pop(root)
                 self._condition.notify_all()
