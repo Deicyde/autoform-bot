@@ -33,6 +33,8 @@ def test_start_owns_a_posix_process_group(monkeypatch):
         captured.update(kwargs)
         return process
 
+    for name in ("ELAN_TOOLCHAIN", "LEAN_PATH", "LAKE_CONFIG", "PYTHONPATH"):
+        monkeypatch.setenv(name, "poisoned")
     monkeypatch.setattr(repl_core.subprocess, "Popen", popen)
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
@@ -44,6 +46,10 @@ def test_start_owns_a_posix_process_group(monkeypatch):
     repl.start()
 
     assert captured["start_new_session"] is True
+    assert all(
+        name not in captured["env"]
+        for name in ("ELAN_TOOLCHAIN", "LEAN_PATH", "LAKE_CONFIG", "PYTHONPATH")
+    )
     assert repl._process_group_id == process.pid
     repl.process = None
     repl._process_group_id = None

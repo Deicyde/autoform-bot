@@ -25,7 +25,12 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
-from servers import resolve_lean_file, resolve_lean_project_dir
+from servers import (
+    ProjectFingerprint,
+    lean_project_fingerprint,
+    resolve_lean_file,
+    resolve_lean_project_dir,
+)
 from servers.lean_client import (
     BUILD_GENERATION,
     INSTALL_ID,
@@ -264,24 +269,10 @@ class LeanRuntimeConfig:
         }
 
 
-def lean_project_fingerprint(project_dir: Path) -> tuple[tuple[str, int, int], ...]:
-    """Return the project metadata that makes a resident Lean process stale."""
-    files = ("lean-toolchain", "lake-manifest.json", "lakefile.toml", "lakefile.lean")
-    fingerprint: list[tuple[str, int, int]] = []
-    for name in files:
-        path = project_dir / name
-        try:
-            info = path.stat()
-        except FileNotFoundError:
-            continue
-        fingerprint.append((name, info.st_mtime_ns, info.st_size))
-    return tuple(fingerprint)
-
-
 @dataclass
 class _CacheEntry(Generic[T]):
     resource: T
-    fingerprint: tuple[tuple[str, int, int], ...]
+    fingerprint: ProjectFingerprint
     last_used: float
     active: int = 0
     invalid: bool = False
@@ -367,28 +358,60 @@ class ProjectResourceCache(Generic[T]):
     def stats(self) -> dict[str, Any]:
         with self._condition:
             now = self._clock()
-            return {
-                "limit": self._max_entries,
-                "resident": [
-                    {
-                        "project_dir": str(root),
-                        "active": entry.active,
-                        "valid": (
-                            not entry.invalid
-                            and (
-                                self._is_valid is None
-                                or self._is_valid(entry.resource)
-                            )
-                        ),
-                        "idle_seconds": round(max(0.0, now - entry.last_used), 3),
-                    }
-                    for root, entry in sorted(
-                        self._entries.items(), key=lambda item: str(item[0])
-                    )
-                ],
-                "retiring": sorted(str(root) for root in self._retiring),
-                "creating": sorted(str(root) for root in self._creating),
-            }
+            entries = [
+                (root, entry.resource, entry.active, entry.invalid, entry.last_used)
+                for root, entry in sorted(
+                    self._entries.items(), key=lambda item: str(item[0])
+                )
+            ]
+            retiring = sorted(str(root) for root in self._retiring)
+            creating = sorted(str(root) for root in self._creating)
+        resident = []
+        for root, resource, active, invalid, last_used in entries:
+            valid = not invalid
+            if valid and self._is_valid is not None:
+                try:
+                    valid = self._is_valid(resource)
+                except Exception:
+                    valid = False
+            resident.append(
+                {
+                    "project_dir": str(root),
+                    "active": active,
+                    "valid": valid,
+                    "idle_seconds": round(max(0.0, now - last_used), 3),
+                }
+            )
+        return {
+            "limit": self._max_entries,
+            "resident": resident,
+            "retiring": retiring,
+            "creating": creating,
+        }
+
+    @contextmanager
+    def inspect(self, project_dir: str) -> Iterator[T | None]:
+        """Borrow existing state without validating, replacing, or creating it."""
+        root = resolve_lean_project_dir(project_dir)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("project resource cache is closed")
+            entry = self._entries.get(root)
+            resource = None if entry is None else entry.resource
+            if entry is not None:
+                entry.active += 1
+        try:
+            yield resource
+        finally:
+            if resource is not None:
+                with self._condition:
+                    entry = self._entries.get(root)
+                    if entry is None or entry.resource is not resource:
+                        raise RuntimeError(
+                            "inspected project resource is no longer registered"
+                        )
+                    entry.active -= 1
+                    self._condition.notify_all()
 
     def state(self, project_dir: str) -> str:
         """Return the current project-resource lifecycle state."""
@@ -396,10 +419,7 @@ class ProjectResourceCache(Generic[T]):
         with self._condition:
             entry = self._entries.get(root)
             if entry is not None:
-                valid = not entry.invalid and (
-                    self._is_valid is None or self._is_valid(entry.resource)
-                )
-                return "warm" if valid else "retiring"
+                return "retiring" if entry.invalid else "warm"
             if root in self._retiring:
                 return "retiring"
             if root in self._creating:
@@ -857,9 +877,13 @@ class LeanRuntimeServices:
                 return format_repl_response(pool.run(code, timeout=effective_timeout))
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")
-            with self.repl_projects.lease(project_dir, create=False) as pool:
+            with self.repl_projects.inspect(project_dir) as pool:
                 state = (
-                    "warm"
+                    (
+                        "warm"
+                        if getattr(pool, "is_usable", lambda: True)()
+                        else "retiring"
+                    )
                     if pool is not None
                     else self.repl_projects.state(project_dir)
                 )

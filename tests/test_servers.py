@@ -72,6 +72,31 @@ class TestProjectResolution:
         with pytest.raises(ValueError, match="file_path"):
             resolve_lean_file(str(project), name)
 
+    def test_lake_environment_ignores_ambient_toolchain_overrides(self, monkeypatch):
+        from servers import clean_lake_environment
+
+        monkeypatch.setenv("LEAN_PATH", "/wrong/lean")
+        monkeypatch.setenv("LAKE_CONFIG", "/wrong/lake")
+        monkeypatch.setenv("PYTHONPATH", "/wrong/python")
+        monkeypatch.setenv("AUTOFORM_SENTINEL", "kept")
+
+        environment = clean_lake_environment()
+
+        assert "LEAN_PATH" not in environment
+        assert "LAKE_CONFIG" not in environment
+        assert "PYTHONPATH" not in environment
+        assert environment["AUTOFORM_SENTINEL"] == "kept"
+
+    def test_project_fingerprint_includes_configuration_identity(self, tmp_path):
+        from servers import lean_project_fingerprint
+
+        project = make_lake_project(tmp_path)
+        first = lean_project_fingerprint(project)
+
+        (project / "lakefile.toml").chmod(0o600)
+
+        assert lean_project_fingerprint(project) != first
+
 
 # ---------------------------------------------------------------------------
 # REPL server

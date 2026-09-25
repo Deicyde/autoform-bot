@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any, Callable
 
+from servers import clean_lake_environment
+
 logger = getLogger(__name__)
 
 DEFAULT_MAX_DIAGNOSTICS = 10
@@ -163,13 +165,6 @@ def _kill_subprocesses(
         parent_reaped = _wait_for_process(process, kill_deadline)
     if not parent_reaped:
         raise RuntimeError("timed out reaping the Lean REPL process")
-
-
-def _inherit_clean_env() -> dict[str, str]:
-    """Return a copy of the current environment without PYTHONPATH noise."""
-    env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
-    return env
 
 
 def _is_natural_number(value: Any) -> bool:
@@ -590,7 +585,7 @@ class LeanRepl:
                 raise TimeoutError(f"REPL startup timed out after {timeout:g} seconds")
             return value
 
-        env = _inherit_clean_env()
+        env = clean_lake_environment()
         env.update(self.config.env)
 
         try:

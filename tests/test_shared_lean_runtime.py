@@ -159,6 +159,35 @@ def test_status_reports_an_active_poisoned_pool_as_retiring(tmp_path):
         services.close()
 
 
+def test_cache_inspection_does_not_validate_or_retire_state(tmp_path):
+    project = make_lake_project(tmp_path, "inspection")
+    validations = 0
+
+    def is_valid(resource):
+        nonlocal validations
+        validations += 1
+        return True
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    before = validations
+
+    with cache.inspect(str(project)) as resource:
+        assert resource == project.resolve()
+
+    assert validations == before
+    assert cache.state(str(project)) == "warm"
+    cache.close()
+
+
 def test_shared_runtime_disables_ambiguous_repl_retries(tmp_path, monkeypatch):
     from servers import lean_runtime
 
