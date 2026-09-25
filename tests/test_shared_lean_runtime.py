@@ -13,6 +13,7 @@ import time
 import pytest
 
 from servers.lean_client import (
+    INSTALL_ID,
     INSTALL_PATH_ID,
     PROTOCOL_VERSION,
     LeanRuntimeClient,
@@ -735,18 +736,37 @@ def test_previous_build_shutdown_uses_the_startup_deadline(runtime_dir, monkeypa
         def __init__(self, *, socket_path, **kwargs):
             assert socket_path == old_socket
 
-        def request(self, method, *, autostart, deadline):
-            calls.append((method, deadline))
-            return {"build_generation": 0}
+        def _request_once(
+            self,
+            method,
+            params,
+            *,
+            deadline,
+            response_timeout,
+            protocol_version,
+        ):
+            calls.append((method, deadline, protocol_version))
+            return {
+                "protocol": protocol_version,
+                "install_id": INSTALL_ID,
+                "build_generation": 0,
+            }
 
-        def stop(self, *, deadline):
-            calls.append(("stop", deadline))
+        def _stop_protocol(self, protocol_version, *, deadline):
+            calls.append(("stop", deadline, protocol_version))
             return {"pid": 7}
+
+        def _wait_for_lifetime(self, path, *, deadline):
+            calls.append(("lifetime", deadline, path))
 
     monkeypatch.setattr(lean_client, "LeanRuntimeClient", PreviousClient)
 
     assert client._stop_previous_builds(deadline=123.0) == [7]
-    assert calls == [("daemon.ping", 123.0), ("stop", 123.0)]
+    assert calls == [
+        ("daemon.ping", 123.0, PROTOCOL_VERSION),
+        ("stop", 123.0, PROTOCOL_VERSION),
+        ("lifetime", 123.0, old_socket.with_suffix(".lifetime.lock")),
+    ]
 
 
 def test_failed_start_never_hard_kills_a_daemon_that_may_own_work(runtime_dir):
