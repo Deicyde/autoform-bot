@@ -291,6 +291,57 @@ def test_project_startup_that_misses_its_budget_is_discarded(tmp_path):
     cache.close()
 
 
+def test_project_startup_accepts_only_initial_manifest_materialization(tmp_path):
+    from servers import lean_project_fingerprint
+
+    project = make_lake_project(tmp_path, "manifest-bootstrap")
+
+    def create(root):
+        (root / "lake-manifest.json").write_text('{"version": "1.1.0"}\n')
+        return root
+
+    cache = ProjectResourceCache(
+        create,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    with cache.lease(str(project)) as resource:
+        assert resource == project.resolve()
+
+    assert cache._entries[project.resolve()].fingerprint == lean_project_fingerprint(
+        project.resolve()
+    )
+    cache.close()
+
+
+def test_project_startup_rejects_other_configuration_changes(tmp_path):
+    project = make_lake_project(tmp_path, "startup-change")
+    closed = []
+
+    def create(root):
+        (root / "lakefile.toml").write_text('[package]\nname = "Changed"\n')
+        return root
+
+    cache = ProjectResourceCache(
+        create,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    with pytest.raises(ProjectResourceBusyError, match="changed during startup"):
+        with cache.lease(str(project)):
+            pytest.fail("a resource from mixed project generations must not be leased")
+
+    assert closed == [project.resolve()]
+    assert cache.state(str(project)) == "cold"
+    cache.close()
+
+
 def test_idle_ttl_never_closes_an_active_resource(tmp_path):
     project = make_lake_project(tmp_path, "idle")
     clock = {"now": 0.0}
