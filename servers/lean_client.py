@@ -97,6 +97,34 @@ class LeanRuntimeRemoteError(LeanRuntimeError):
     """The runtime rejected a well-formed request."""
 
 
+def _decode_runtime_response(raw: str) -> Any:
+    """Decode canonical JSON without ambiguous duplicate fields or constants."""
+
+    def reject_constant(value: str) -> None:
+        raise LeanRuntimeProtocolError(
+            f"Lean runtime returned nonstandard JSON constant {value!r}"
+        )
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise LeanRuntimeProtocolError(
+                    f"Lean runtime returned duplicate JSON key {key!r}"
+                )
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(
+            raw,
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except json.JSONDecodeError as error:
+        raise LeanRuntimeProtocolError("Lean runtime returned invalid JSON") from error
+
+
 def _response_timeout_from_environment() -> float:
     raw = os.environ.get(
         "AUTOFORM_RUNTIME_RESPONSE_TIMEOUT",
@@ -597,34 +625,46 @@ class LeanRuntimeClient:
             connection.close()
 
         try:
-            try:
-                response = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise LeanRuntimeProtocolError(
-                    "Lean runtime returned invalid JSON"
-                ) from error
+            response = _decode_runtime_response(raw)
             if not isinstance(response, dict):
                 raise LeanRuntimeProtocolError("Lean runtime response is not an object")
-            if response.get("v") != PROTOCOL_VERSION:
+            version = response.get("v")
+            if type(version) is not int or version != PROTOCOL_VERSION:
                 raise LeanRuntimeProtocolError(
                     "Lean runtime protocol mismatch: expected "
-                    f"{PROTOCOL_VERSION}, got {response.get('v')!r}"
+                    f"{PROTOCOL_VERSION}, got {version!r}"
                 )
-            if response.get("id") != request_id:
+            response_id = response.get("id")
+            if type(response_id) is not str or response_id != request_id:
                 raise LeanRuntimeProtocolError(
                     "Lean runtime response id does not match the request"
                 )
-            if response.get("ok") is True:
-                return response.get("result")
-            if response.get("ok") is not False:
+            ok = response.get("ok")
+            if type(ok) is not bool:
                 raise LeanRuntimeProtocolError(
                     "Lean runtime response has an invalid success marker"
                 )
-            remote_error = response.get("error")
-            if not isinstance(remote_error, dict):
+            expected_keys = (
+                {"v", "id", "ok", "result"}
+                if ok
+                else {"v", "id", "ok", "error"}
+            )
+            if set(response) != expected_keys:
+                raise LeanRuntimeProtocolError(
+                    "Lean runtime response has an invalid envelope"
+                )
+            if ok:
+                return response["result"]
+            remote_error = response["error"]
+            if not isinstance(remote_error, dict) or set(remote_error) != {
+                "type",
+                "message",
+            }:
                 raise LeanRuntimeProtocolError("Lean runtime returned a malformed error")
-            error_type = remote_error.get("type", "RuntimeError")
-            message = remote_error.get("message", "unspecified runtime error")
+            error_type = remote_error["type"]
+            message = remote_error["message"]
+            if type(error_type) is not str or type(message) is not str:
+                raise LeanRuntimeProtocolError("Lean runtime returned a malformed error")
         except LeanRuntimeProtocolError as error:
             raise outcome_unknown() from error
         raise LeanRuntimeRemoteError(f"{error_type}: {message}")
@@ -641,5 +681,10 @@ class LeanRuntimeClient:
             if newline >= 0:
                 if data[newline + 1 :]:
                     raise LeanRuntimeProtocolError("Lean runtime returned trailing response data")
-                return bytes(data[:newline]).decode("utf-8")
+                try:
+                    return bytes(data[:newline]).decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise LeanRuntimeProtocolError(
+                        "Lean runtime returned invalid UTF-8"
+                    ) from error
         raise LeanRuntimeProtocolError("Lean runtime response exceeds the message limit")

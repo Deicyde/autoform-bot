@@ -17,6 +17,8 @@ from servers.lean_client import (
     PROTOCOL_VERSION,
     LeanRuntimeClient,
     LeanRuntimeOutcomeUnknown,
+    LeanRuntimeProtocolError,
+    LeanRuntimeRemoteError,
     LeanRuntimeUnavailable,
 )
 from servers.lean_runtime import (
@@ -972,6 +974,146 @@ def test_post_dispatch_invalid_response_is_explicitly_outcome_unknown(
 
     with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed"):
         client.request("repl.run", {"project_dir": "/lean", "code": "#check Nat"})
+
+
+class _RuntimeResponseSocket:
+    def __init__(self, response):
+        self.response = response
+
+    def settimeout(self, timeout):
+        pass
+
+    def connect(self, path):
+        pass
+
+    def sendall(self, payload):
+        pass
+
+    def recv(self, size):
+        response, self.response = self.response, b""
+        return response
+
+    def close(self):
+        pass
+
+
+def _runtime_response(client, monkeypatch, response):
+    from servers import lean_client
+
+    monkeypatch.setattr(lean_client.uuid, "uuid4", lambda: type("UUID", (), {"hex": "request-id"})())
+    monkeypatch.setattr(
+        lean_client.socket,
+        "socket",
+        lambda *args: _RuntimeResponseSocket(response),
+    )
+    return client.request("repl.run", {"project_dir": "/lean", "code": "#check Nat"})
+
+
+@pytest.mark.parametrize(
+    ("encoded_result", "expected"),
+    [
+        (b"null", None),
+        (b"false", False),
+        (b"0", 0),
+        (b'"value"', "value"),
+        (b"[1,2]", [1, 2]),
+        (b'{"nested":true}', {"nested": True}),
+    ],
+)
+def test_runtime_response_accepts_unconstrained_success_result(
+    runtime_dir,
+    monkeypatch,
+    encoded_result,
+    expected,
+):
+    client = LeanRuntimeClient(socket_path=runtime_dir / "fake.sock")
+
+    response = (
+        b'{"v":1,"id":"request-id","ok":true,"result":'
+        + encoded_result
+        + b"}\n"
+    )
+
+    assert _runtime_response(client, monkeypatch, response) == expected
+
+
+def test_runtime_response_accepts_exact_error_envelope(runtime_dir, monkeypatch):
+    client = LeanRuntimeClient(socket_path=runtime_dir / "fake.sock")
+
+    with pytest.raises(LeanRuntimeRemoteError, match="ValueError: bad request"):
+        _runtime_response(
+            client,
+            monkeypatch,
+            b'{"v":1,"id":"request-id","ok":false,'
+            b'"error":{"type":"ValueError","message":"bad request"}}\n',
+        )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        b'{"v":true,"id":"request-id","ok":true,"result":null}\n',
+        b'{"v":1.0,"id":"request-id","ok":true,"result":null}\n',
+        b'{"v":1,"id":1,"ok":true,"result":null}\n',
+        b'{"v":1,"id":"wrong-id","ok":true,"result":null}\n',
+        b'{"v":1,"id":"request-id","ok":1,"result":null}\n',
+        b'{"v":1,"id":"request-id","ok":true}\n',
+        b'{"v":1,"id":"request-id","ok":true,"result":null,"error":null}\n',
+        b'{"v":1,"id":"request-id","ok":true,"result":null,"extra":null}\n',
+        b'{"v":1,"id":"request-id","ok":false}\n',
+        b'{"v":1,"id":"request-id","ok":false,"error":{},"result":null}\n',
+        b'{"v":1,"id":"request-id","ok":false,"error":{"type":"ValueError"}}\n',
+        b'{"v":1,"id":"request-id","ok":false,'
+        b'"error":{"type":"ValueError","message":"bad","extra":null}}\n',
+        b'{"v":1,"id":"request-id","ok":false,'
+        b'"error":{"type":1,"message":"bad"}}\n',
+        b'{"v":1,"id":"request-id","ok":false,'
+        b'"error":{"type":"ValueError","message":null}}\n',
+    ],
+)
+def test_runtime_response_rejects_malformed_envelopes(
+    runtime_dir,
+    monkeypatch,
+    response,
+):
+    client = LeanRuntimeClient(socket_path=runtime_dir / "fake.sock")
+
+    with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed") as caught:
+        _runtime_response(client, monkeypatch, response)
+
+    assert isinstance(caught.value.__cause__, LeanRuntimeProtocolError)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        b'{"v":1,"v":1,"id":"request-id","ok":true,"result":null}\n',
+        b'{"v":1,"id":"request-id","ok":true,"result":NaN}\n',
+    ],
+)
+def test_runtime_response_rejects_noncanonical_json(
+    runtime_dir,
+    monkeypatch,
+    response,
+):
+    client = LeanRuntimeClient(socket_path=runtime_dir / "fake.sock")
+
+    with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed") as caught:
+        _runtime_response(client, monkeypatch, response)
+
+    assert isinstance(caught.value.__cause__, LeanRuntimeProtocolError)
+
+
+def test_runtime_response_rejects_invalid_utf8_as_unknown_outcome(
+    runtime_dir,
+    monkeypatch,
+):
+    client = LeanRuntimeClient(socket_path=runtime_dir / "fake.sock")
+
+    with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed") as caught:
+        _runtime_response(client, monkeypatch, b"\xff\n")
+
+    assert isinstance(caught.value.__cause__, LeanRuntimeProtocolError)
 
 
 @pytest.mark.parametrize(
