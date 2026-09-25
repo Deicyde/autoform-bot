@@ -89,6 +89,10 @@ class LeanRuntimeProtocolError(LeanRuntimeError):
     """The runtime spoke an incompatible or malformed protocol."""
 
 
+class LeanRuntimeOutcomeUnknown(LeanRuntimeError):
+    """A dispatched runtime request did not produce a trustworthy response."""
+
+
 class LeanRuntimeRemoteError(LeanRuntimeError):
     """The runtime rejected a well-formed request."""
 
@@ -532,6 +536,13 @@ class LeanRuntimeClient:
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         dispatched = False
 
+        def outcome_unknown() -> LeanRuntimeOutcomeUnknown:
+            return LeanRuntimeOutcomeUnknown(
+                "Lean runtime request may have completed, but no trustworthy "
+                "response was received after request dispatch. The request was "
+                "not retried and must not be replayed."
+            )
+
         def bounded_timeout(configured: float) -> float:
             if deadline is None:
                 return configured
@@ -569,40 +580,53 @@ class LeanRuntimeClient:
             connection.sendall(payload)
             raw = self._read_line(connection)
         except socket.timeout as error:
-            phase = "response" if dispatched else "connection"
-            raise LeanRuntimeError(f"timed out waiting for Lean runtime {phase}") from error
-        except LeanRuntimeError:
+            if dispatched:
+                raise outcome_unknown() from error
+            raise LeanRuntimeError("timed out waiting for Lean runtime connection") from error
+        except LeanRuntimeError as error:
+            if dispatched:
+                raise outcome_unknown() from error
             raise
         except OSError as error:
             if not dispatched:
                 raise LeanRuntimeUnavailable(
                     f"Lean runtime is not listening at {self.paths.socket}"
                 ) from error
-            raise LeanRuntimeError(
-                "connection to Lean runtime closed after request dispatch; the request was not retried"
-            ) from error
+            raise outcome_unknown() from error
         finally:
             connection.close()
 
         try:
-            response = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise LeanRuntimeProtocolError("Lean runtime returned invalid JSON") from error
-        if not isinstance(response, dict):
-            raise LeanRuntimeProtocolError("Lean runtime response is not an object")
-        if response.get("v") != PROTOCOL_VERSION:
-            raise LeanRuntimeProtocolError(
-                f"Lean runtime protocol mismatch: expected {PROTOCOL_VERSION}, got {response.get('v')!r}"
-            )
-        if response.get("id") != request_id:
-            raise LeanRuntimeProtocolError("Lean runtime response id does not match the request")
-        if response.get("ok") is True:
-            return response.get("result")
-        error = response.get("error")
-        if not isinstance(error, dict):
-            raise LeanRuntimeProtocolError("Lean runtime returned a malformed error")
-        error_type = error.get("type", "RuntimeError")
-        message = error.get("message", "unspecified runtime error")
+            try:
+                response = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise LeanRuntimeProtocolError(
+                    "Lean runtime returned invalid JSON"
+                ) from error
+            if not isinstance(response, dict):
+                raise LeanRuntimeProtocolError("Lean runtime response is not an object")
+            if response.get("v") != PROTOCOL_VERSION:
+                raise LeanRuntimeProtocolError(
+                    "Lean runtime protocol mismatch: expected "
+                    f"{PROTOCOL_VERSION}, got {response.get('v')!r}"
+                )
+            if response.get("id") != request_id:
+                raise LeanRuntimeProtocolError(
+                    "Lean runtime response id does not match the request"
+                )
+            if response.get("ok") is True:
+                return response.get("result")
+            if response.get("ok") is not False:
+                raise LeanRuntimeProtocolError(
+                    "Lean runtime response has an invalid success marker"
+                )
+            remote_error = response.get("error")
+            if not isinstance(remote_error, dict):
+                raise LeanRuntimeProtocolError("Lean runtime returned a malformed error")
+            error_type = remote_error.get("type", "RuntimeError")
+            message = remote_error.get("message", "unspecified runtime error")
+        except LeanRuntimeProtocolError as error:
+            raise outcome_unknown() from error
         raise LeanRuntimeRemoteError(f"{error_type}: {message}")
 
     @staticmethod

@@ -16,7 +16,7 @@ from servers.lean_client import (
     INSTALL_PATH_ID,
     PROTOCOL_VERSION,
     LeanRuntimeClient,
-    LeanRuntimeError,
+    LeanRuntimeOutcomeUnknown,
     LeanRuntimeUnavailable,
 )
 from servers.lean_runtime import (
@@ -904,7 +904,73 @@ def test_connected_send_failure_is_never_retried(runtime_dir, monkeypatch):
         lambda: pytest.fail("an ambiguously dispatched request must not be retried"),
     )
 
-    with pytest.raises(LeanRuntimeError, match="after request dispatch"):
+    with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed"):
+        client.request("repl.run", {"project_dir": "/lean", "code": "#check Nat"})
+
+
+def test_post_dispatch_timeout_is_explicitly_outcome_unknown(runtime_dir, monkeypatch):
+    from servers import lean_client
+
+    class TimingOutSocket:
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            pass
+
+        def recv(self, size):
+            raise socket.timeout
+
+        def close(self):
+            pass
+
+    client = LeanRuntimeClient(socket_path=runtime_dir / "fake.sock")
+    monkeypatch.setattr(lean_client.socket, "socket", lambda *args: TimingOutSocket())
+    monkeypatch.setattr(
+        client,
+        "ensure_running",
+        lambda **kwargs: pytest.fail("a dispatched request must not be retried"),
+    )
+
+    with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed"):
+        client.request("repl.run", {"project_dir": "/lean", "code": "#check Nat"})
+
+
+@pytest.mark.parametrize("response", [b"", b"{\n"])
+def test_post_dispatch_invalid_response_is_explicitly_outcome_unknown(
+    runtime_dir,
+    monkeypatch,
+    response,
+):
+    from servers import lean_client
+
+    class InvalidResponseSocket:
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            pass
+
+        def recv(self, size):
+            return response
+
+        def close(self):
+            pass
+
+    client = LeanRuntimeClient(socket_path=runtime_dir / "fake.sock")
+    monkeypatch.setattr(
+        lean_client.socket,
+        "socket",
+        lambda *args: InvalidResponseSocket(),
+    )
+
+    with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed"):
         client.request("repl.run", {"project_dir": "/lean", "code": "#check Nat"})
 
 
