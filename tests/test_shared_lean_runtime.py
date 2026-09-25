@@ -870,6 +870,202 @@ def test_interruption_before_validation_start_rolls_back_reservation(
     cache.close()
 
 
+@pytest.mark.parametrize("during_release", [False, True])
+def test_interruption_after_validation_authorization_retains_reservation(
+    tmp_path, monkeypatch, during_release
+):
+    from servers import lean_runtime as lean_runtime_module
+
+    project = make_lake_project(
+        tmp_path,
+        f"validation-after-authorization-{during_release}",
+    )
+    validations = 0
+
+    def is_valid(resource):
+        nonlocal validations
+        validations += 1
+        return True
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    before = validations
+    lease = cache.lease(str(project), acquisition_timeout=1)
+    if during_release:
+        assert lease.__enter__() == project.resolve()
+        before = validations
+
+    real_validation = lean_runtime_module._CacheValidation
+
+    class InterruptingValidation(real_validation):
+        interrupted = False
+
+        def __setattr__(self, name, value):
+            super().__setattr__(name, value)
+            if name == "started" and value and not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt("after validation authorization")
+
+    monkeypatch.setattr(
+        lean_runtime_module,
+        "_CacheValidation",
+        InterruptingValidation,
+    )
+    with pytest.raises(KeyboardInterrupt, match="after validation authorization"):
+        if during_release:
+            lease.__exit__(None, None, None)
+        else:
+            with lease:
+                pytest.fail("an interrupted handoff must not transfer the lease")
+
+    deadline = time.monotonic() + 2
+    while cache._validating and time.monotonic() < deadline:
+        time.sleep(0.01)
+    with cache._condition:
+        assert cache._entries[project.resolve()].active == set()
+        assert cache._validating == {}
+    assert validations == before + 1
+    monkeypatch.undo()
+    cache.close()
+
+
+def test_completed_validation_is_not_reused_by_a_later_caller(
+    tmp_path, monkeypatch
+):
+    project = make_lake_project(tmp_path, "completed-validation")
+    closed = []
+    outcomes = []
+    validation_calls = 0
+
+    def is_valid(resource):
+        nonlocal validation_calls
+        if not outcomes:
+            return True
+        validation_calls += 1
+        return outcomes.pop(0)
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    outcomes.extend((True, False))
+    drop_paused = threading.Event()
+    release_drop = threading.Event()
+    waiter_paused = threading.Event()
+    release_waiter = threading.Event()
+    real_drop = cache._drop_completed_validation
+    real_finish = cache._finish_validation_waiter
+    pause_once = True
+    pause_waiter_once = True
+
+    def drop_completed(root, validation):
+        nonlocal pause_once
+        if pause_once:
+            pause_once = False
+            drop_paused.set()
+            assert release_drop.wait(timeout=2)
+        return real_drop(root, validation)
+
+    def finish_waiter(root, validation, waiter, **kwargs):
+        nonlocal pause_waiter_once
+        if kwargs.get("lease_token") is not None and pause_waiter_once:
+            pause_waiter_once = False
+            waiter_paused.set()
+            assert release_waiter.wait(timeout=2)
+        return real_finish(root, validation, waiter, **kwargs)
+
+    monkeypatch.setattr(cache, "_drop_completed_validation", drop_completed)
+    monkeypatch.setattr(cache, "_finish_validation_waiter", finish_waiter)
+    first_result = []
+
+    def first_acquisition():
+        with cache.lease(
+            str(project),
+            create=False,
+            acquisition_timeout=2,
+        ) as resource:
+            first_result.append(resource)
+
+    first = threading.Thread(target=first_acquisition)
+    first.start()
+    assert drop_paused.wait(timeout=1)
+    assert waiter_paused.wait(timeout=1)
+    assert cache._validating[project.resolve()].future.done()
+
+    with cache.lease(
+        str(project),
+        create=False,
+        acquisition_timeout=1,
+    ) as resource:
+        assert resource is None
+    assert validation_calls == 2
+
+    release_drop.set()
+    release_waiter.set()
+    first.join(timeout=2)
+    assert not first.is_alive()
+    assert first_result == [None]
+    deadline = time.monotonic() + 2
+    while not closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert closed == [project.resolve()]
+    cache.close()
+
+
+def test_inspection_retires_invalid_resource_after_validation_finishes(tmp_path):
+    project = make_lake_project(tmp_path, "inspect-invalid-validation")
+    valid = True
+    closed = []
+
+    def is_valid(resource):
+        return valid
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    inspection = cache.inspect(str(project))
+    assert inspection.__enter__() == project.resolve()
+    valid = False
+
+    with cache.lease(
+        str(project),
+        create=False,
+        acquisition_timeout=1,
+    ) as resource:
+        assert resource is None
+    assert cache.state(str(project)) == "retiring"
+    assert closed == []
+
+    inspection.__exit__(None, None, None)
+    deadline = time.monotonic() + 2
+    while not closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert closed == [project.resolve()]
+    assert cache.state(str(project)) == "cold"
+    cache.close()
+
+
 def test_cache_close_waits_for_abandoned_validation_reservation(tmp_path):
     project = make_lake_project(tmp_path, "validation-close")
     validation_started = threading.Event()

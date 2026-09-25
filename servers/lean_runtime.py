@@ -430,6 +430,7 @@ class ProjectResourceCache(Generic[T]):
         root = resolve_lean_project_dir(project_dir)
         lease_token = object()
         resource: T | None = None
+        retirement: tuple[Path, T] | None = None
         try:
             with self._condition:
                 if self._closed:
@@ -449,7 +450,14 @@ class ProjectResourceCache(Generic[T]):
                         and lease_token in entry.active
                     ):
                         entry.active.remove(lease_token)
+                        entry.last_used = self._clock()
+                        if not entry.active and entry.invalid:
+                            self._entries.pop(root)
+                            self._retiring[root] = resource
+                            retirement = (root, resource)
                         self._condition.notify_all()
+                if retirement is not None:
+                    self._ensure_retirement_started(*retirement)
 
     def state(self, project_dir: str) -> str:
         """Return the current project-resource lifecycle state."""
@@ -656,6 +664,10 @@ class ProjectResourceCache(Generic[T]):
                     else:
                         validation_waiter = object()
                         validation = self._validating.get(root)
+                        if validation is not None and validation.future.done():
+                            if self._validating.get(root) is validation:
+                                self._validating.pop(root)
+                            validation = None
                         if validation is None:
                             validation = self._reserve_validation(
                                 root,
@@ -1277,7 +1289,6 @@ class ProjectResourceCache(Generic[T]):
             if (
                 self._validating.get(root) is validation
                 and validation.future.done()
-                and not validation.waiters
             ):
                 self._validating.pop(root)
             self._condition.notify_all()
@@ -1289,11 +1300,10 @@ class ProjectResourceCache(Generic[T]):
     ) -> None:
         assert self._is_valid is not None
         start_gate = threading.Event()
-        start_decision = {"run": False}
 
         def validate() -> None:
             start_gate.wait()
-            if not start_decision["run"]:
+            if not validation.started:
                 return
             validation_error: BaseException | None = None
             try:
@@ -1326,12 +1336,11 @@ class ProjectResourceCache(Generic[T]):
                 daemon=False,
             )
             worker.start()
-            start_decision["run"] = True
             validation.started = True
             start_gate.set()
         except BaseException as error:
             start_gate.set()
-            if not start_decision["run"]:
+            if not validation.started:
                 self._fail_validation_start(root, validation, error)
                 return
             raise error.with_traceback(error.__traceback__)
@@ -1348,6 +1357,7 @@ class ProjectResourceCache(Generic[T]):
         claimed = False
         with self._condition:
             entry = self._entries.get(root)
+            current_validation = self._validating.get(root)
             if (
                 lease_token is not None
                 and (deadline is None or self._clock() < deadline)
@@ -1355,6 +1365,10 @@ class ProjectResourceCache(Generic[T]):
                 and entry is not None
                 and entry.resource is validation.resource
                 and not entry.invalid
+                and (
+                    current_validation is None
+                    or current_validation is validation
+                )
             ):
                 entry.active.add(lease_token)
                 entry.last_used = self._clock()
@@ -1363,7 +1377,6 @@ class ProjectResourceCache(Generic[T]):
             if (
                 self._validating.get(root) is validation
                 and validation.future.done()
-                and not validation.waiters
             ):
                 self._validating.pop(root)
             self._condition.notify_all()
@@ -1517,6 +1530,10 @@ class ProjectResourceCache(Generic[T]):
             if not entry.invalid and self._is_valid is not None:
                 validation_waiter = object()
                 validation = self._validating.get(root)
+                if validation is not None and validation.future.done():
+                    if self._validating.get(root) is validation:
+                        self._validating.pop(root)
+                    validation = None
                 if validation is None:
                     validation = self._reserve_validation(
                         root,
