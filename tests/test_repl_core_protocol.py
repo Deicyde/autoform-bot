@@ -883,6 +883,70 @@ def test_run_disposable_closes_before_rejecting_an_import(monkeypatch):
     assert repl.process is None
 
 
+def test_run_disposable_rejects_project_change_before_dispatch(tmp_path, monkeypatch):
+    config = tmp_path / "lakefile.toml"
+    config.write_text('name = "Fixture"\n', encoding="utf-8")
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+
+    def start(*args, **kwargs):
+        config.write_text('name = "Changed generation"\n', encoding="utf-8")
+
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", start)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("a stale project must not execute code"),
+    )
+
+    response = repl.run_disposable("#check Nat", timeout=1)
+
+    assert response == {"repl_error": "Lean project changed before REPL dispatch"}
+
+
+@pytest.mark.parametrize("response_kind", ["success", "command_error", "stderr"])
+def test_run_disposable_reports_project_change_after_dispatch_as_unknown(
+    tmp_path,
+    monkeypatch,
+    response_kind,
+):
+    config = tmp_path / "lakefile.toml"
+    config.write_text('name = "Fixture"\n', encoding="utf-8")
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+
+    def run_frame(*args, **kwargs):
+        config.write_text('name = "Changed generation"\n', encoding="utf-8")
+        if response_kind == "success":
+            return {"env": 1, "messages": [], "sorries": []}
+        if response_kind == "command_error":
+            return {"message": "rejected"}
+        raise repl_core.ReplStderrBacklog(
+            "stderr backlog",
+            {"env": 1, "messages": [], "sorries": []},
+        )
+
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(repl, "_run", run_frame)
+
+    response = repl.run_disposable("#check Nat", timeout=1)
+
+    assert response["outcome_unknown"] is True
+    assert "freshness changed" in response["repl_error"]
+
+
 class _PipeProcess:
     def __init__(self, stack: ExitStack, stdout_chunks: list[bytes], stderr: bytes = b""):
         stdin_read, stdin_write = os.pipe()

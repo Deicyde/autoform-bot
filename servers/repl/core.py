@@ -17,9 +17,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from logging import getLogger
+from pathlib import Path
 from typing import Any, Callable
 
-from servers import clean_lake_environment
+from servers import ProjectFingerprint, clean_lake_environment, lean_project_fingerprint
 
 logger = getLogger(__name__)
 
@@ -753,11 +754,37 @@ class LeanRepl:
                     )
                     prefix = "\n".join(f"import {root}" for root in added_imports)
                     command = f"{prefix}\n{code}" if prefix else code
+                    remaining()
+                    project_identity = Path(self.cwd).resolve()
+                    try:
+                        dispatch_fingerprint = lean_project_fingerprint(
+                            project_identity
+                        )
+                    except OSError as error:
+                        raise RuntimeError(
+                            "Lean project changed before REPL startup"
+                        ) from error
                     self.start(startup_timeout=remaining(), warmup_imports=())
-                    response = self._run(
-                        code=command,
-                        env_id=None,
-                        timeout=remaining(),
+                    self._assert_project_current_before_dispatch(
+                        deadline,
+                        project_identity,
+                        dispatch_fingerprint,
+                    )
+                    backlog: ReplStderrBacklog | None = None
+                    try:
+                        response = self._run(
+                            code=command,
+                            env_id=None,
+                            timeout=remaining(),
+                        )
+                    except ReplStderrBacklog as error:
+                        backlog = error
+                        response = error.response
+                    self._assert_project_unchanged_after_dispatch(
+                        deadline,
+                        project_identity,
+                        dispatch_fingerprint,
+                        allow_expired=backlog is not None,
                     )
                     _validate_command_response(
                         response,
@@ -766,24 +793,6 @@ class LeanRepl:
                     )
                     _adjust_line_numbers(response, -len(added_imports))
                     result = _without_process_handles(response)
-            except ReplStderrBacklog as error:
-                try:
-                    _validate_command_response(
-                        error.response,
-                        context="the requested command",
-                        require_environment=True,
-                    )
-                except ReplCommandError as command_error:
-                    result = {"repl_error": str(command_error)}
-                except ReplProtocolError as protocol_error:
-                    result = {
-                        "repl_error": str(protocol_error),
-                        "outcome_unknown": True,
-                    }
-                else:
-                    response = _without_process_handles(error.response)
-                    _adjust_line_numbers(response, -len(added_imports))
-                    result = response
             except ReplCommandError as error:
                 result = {"repl_error": str(error)}
             except ReplProtocolError as error:
@@ -826,6 +835,43 @@ class LeanRepl:
             if result is None:
                 raise RuntimeError("disposable Lean REPL call produced no result")
             return result
+
+    def _assert_project_current_before_dispatch(
+        self,
+        deadline: float,
+        project_identity: Path,
+        expected: ProjectFingerprint,
+    ) -> None:
+        """Reject a process started from a project generation that is already stale."""
+        if deadline - time.monotonic() <= 0:
+            raise TimeoutError("REPL command deadline exceeded before dispatch")
+        try:
+            current = lean_project_fingerprint(project_identity)
+        except OSError as error:
+            raise RuntimeError("Lean project changed before REPL dispatch") from error
+        if current != expected:
+            raise RuntimeError("Lean project changed before REPL dispatch")
+
+    def _assert_project_unchanged_after_dispatch(
+        self,
+        deadline: float,
+        project_identity: Path,
+        expected: ProjectFingerprint,
+        *,
+        allow_expired: bool = False,
+    ) -> None:
+        """Reject every response if its project generation changed in flight."""
+        try:
+            if not allow_expired and deadline - time.monotonic() <= 0:
+                raise TimeoutError("REPL command deadline exceeded after dispatch")
+            current = lean_project_fingerprint(project_identity)
+            if current != expected:
+                raise RuntimeError("Lean project changed after REPL dispatch")
+        except (OSError, TimeoutError, RuntimeError) as error:
+            raise ReplOutcomeUnknown(
+                "Lean project freshness changed while the requested command was "
+                "executing; its outcome is unknown"
+            ) from error
 
     def run(self, code: str, env_id: int | None = None, timeout: float | None = None) -> dict[str, Any]:
         """Send code to the REPL within one deadline across recovery attempts."""
