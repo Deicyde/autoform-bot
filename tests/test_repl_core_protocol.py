@@ -155,6 +155,64 @@ def test_close_kills_descendant_after_repl_wrapper_already_exited():
             pass
 
 
+def test_process_group_cleanup_reports_an_unreaped_parent(monkeypatch):
+    waits = []
+    killed = []
+
+    class Process:
+        def wait(self, timeout):
+            waits.append(timeout)
+            raise subprocess.TimeoutExpired("lean-repl", timeout)
+
+        def kill(self):
+            killed.append(True)
+
+    live = [True]
+    monkeypatch.setattr(
+        repl_core,
+        "_process_group_has_live_members",
+        lambda process_group_id: live.pop() if live else False,
+    )
+    monkeypatch.setattr(repl_core.os, "killpg", lambda *args: None)
+
+    with pytest.raises(RuntimeError, match="timed out reaping"):
+        repl_core._kill_subprocesses(Process(), 1234)
+
+    assert len(waits) == 2
+    assert killed == [True]
+
+
+def test_process_group_cleanup_waits_for_descendants_after_parent_exit(monkeypatch):
+    signals = []
+
+    class Process:
+        def wait(self, timeout):
+            return 0
+
+    monkeypatch.setattr(
+        repl_core,
+        "_process_group_has_live_members",
+        lambda process_group_id: True,
+    )
+    monkeypatch.setattr(
+        repl_core,
+        "_wait_for_live_process_group_exit",
+        lambda process_group_id, deadline: False,
+    )
+    monkeypatch.setattr(
+        repl_core.os,
+        "killpg",
+        lambda process_group_id, sent_signal: signals.append(
+            (process_group_id, sent_signal)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="process group"):
+        repl_core._kill_subprocesses(Process(), 1234)
+
+    assert signals == [(1234, signal.SIGTERM), (1234, signal.SIGKILL)]
+
+
 def test_close_retains_process_handle_until_cleanup_succeeds(monkeypatch):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
