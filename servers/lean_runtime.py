@@ -127,7 +127,7 @@ def _default_total_repl_workers() -> int:
 
 @dataclass(frozen=True)
 class LeanRuntimeConfig:
-    """Node-wide resource limits; the first starter owns these until stop."""
+    """Per-installation limits; the first runtime starter owns them until stop."""
 
     max_projects: int
     idle_seconds: float
@@ -1360,7 +1360,7 @@ class LeanRuntimeServices:
                 effective_timeout = float(timeout)
             if effective_timeout > self.config.max_repl_request_seconds:
                 raise ValueError(
-                    "timeout exceeds the node-wide limit of "
+                    "timeout exceeds the configured runtime limit of "
                     f"{self.config.max_repl_request_seconds:g} seconds"
                 )
             deadline = time.monotonic() + effective_timeout

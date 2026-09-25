@@ -68,8 +68,8 @@ supported stable release.
 
 The private socket lives below `$XDG_RUNTIME_DIR/autoform`, falling back to a
 uid-specific directory in `/tmp`; the rotating runtime log is beside it.
-`AUTOFORM_RUNTIME_DIR` overrides that location. Node-wide limits are controlled
-by `AUTOFORM_REPL_TOTAL_WORKERS`, `AUTOFORM_REPL_WORKERS_PER_PROJECT`,
+`AUTOFORM_RUNTIME_DIR` overrides that location. Per-installation runtime limits
+are controlled by `AUTOFORM_REPL_TOTAL_WORKERS`, `AUTOFORM_REPL_WORKERS_PER_PROJECT`,
 `AUTOFORM_MAX_LEAN_PROJECTS`, and `AUTOFORM_LEAN_IDLE_SECONDS`. The first
 process to start the runtime supplies those settings until it is stopped.
 `get_repl_status` reports a project pool as `warm` when its admission slots are
