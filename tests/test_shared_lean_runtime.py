@@ -219,6 +219,65 @@ def test_daemon_fails_closed_if_an_inherited_lock_is_not_owned(
     assert not paths.socket.exists()
 
 
+@pytest.mark.daemon
+@pytest.mark.parametrize("closed_descriptor", [0, 1, 2])
+def test_daemon_bootstrap_survives_a_closed_standard_descriptor(
+    closed_descriptor,
+    runtime_dir,
+    repo_root,
+):
+    socket_path = runtime_dir / f"closed-fd-{closed_descriptor}.sock"
+    result_path = runtime_dir / f"closed-fd-{closed_descriptor}.json"
+    helper_code = """
+import json
+import os
+import sys
+from pathlib import Path
+
+from servers.lean_client import LeanRuntimeClient
+
+descriptor = int(sys.argv[1])
+socket_path = Path(sys.argv[2])
+result_path = Path(sys.argv[3])
+os.close(descriptor)
+client = LeanRuntimeClient(socket_path=socket_path, startup_timeout=15)
+try:
+    status = client.ensure_running()
+    client.stop()
+except BaseException as error:
+    result = {"error": type(error).__name__, "message": str(error)}
+else:
+    result = {"pid": status["pid"]}
+result_path.write_text(json.dumps(result), encoding="utf-8")
+"""
+
+    helper = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            helper_code,
+            str(closed_descriptor),
+            str(socket_path),
+            str(result_path),
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        timeout=30,
+    )
+
+    try:
+        assert helper.returncode == 0
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        assert set(result) == {"pid"}
+        assert isinstance(result["pid"], int)
+    finally:
+        client = LeanRuntimeClient(socket_path=socket_path, autostart=False)
+        try:
+            client.stop(deadline=time.monotonic() + 5)
+        except LeanRuntimeUnavailable:
+            pass
+
+
 def runtime_config(**overrides):
     values = {
         "max_projects": 2,

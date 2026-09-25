@@ -428,13 +428,36 @@ class LeanRuntimeClient:
             time.sleep(min(delay, wait))
             delay = min(delay * 1.7, 0.25)
 
+    @staticmethod
+    def _open_runtime_lock(path: Path) -> int:
+        """Open a lock above the standard descriptors passed to the daemon."""
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        if descriptor >= 3:
+            return descriptor
+
+        import fcntl
+
+        duplicate: int | None = None
+        try:
+            command = getattr(fcntl, "F_DUPFD_CLOEXEC", fcntl.F_DUPFD)
+            duplicate = fcntl.fcntl(descriptor, command, 3)
+            if command == fcntl.F_DUPFD:
+                os.set_inheritable(duplicate, False)
+            return duplicate
+        except BaseException:
+            if duplicate is not None:
+                os.close(duplicate)
+            raise
+        finally:
+            os.close(descriptor)
+
     def _acquire_bootstrap_locks(self, deadline: float) -> list[int]:
         """Hold stable and pre-stable startup locks during lifecycle changes."""
         lock_paths = (self.paths.lock, *self.paths.compatibility_locks)
         lock_fds: list[int] = []
         try:
             for lock_path in dict.fromkeys(lock_paths):
-                lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                lock_fd = self._open_runtime_lock(lock_path)
                 lock_fds.append(lock_fd)
                 self._acquire_file_lock(
                     lock_fd,
@@ -461,7 +484,7 @@ class LeanRuntimeClient:
         lock_fds: list[int] = []
         try:
             for lock_path in self._lifetime_lock_paths():
-                lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                lock_fd = self._open_runtime_lock(lock_path)
                 lock_fds.append(lock_fd)
                 self._acquire_file_lock(
                     lock_fd,
