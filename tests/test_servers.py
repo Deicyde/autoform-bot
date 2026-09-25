@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -114,7 +115,7 @@ class TestProjectResolution:
         assert poisoned.isdisjoint(environment)
         assert environment["AUTOFORM_SENTINEL"] == "kept"
 
-    def test_lake_environment_uses_the_effective_project_toolchain(
+    def test_lake_environment_defers_project_toolchain_selection_to_elan(
         self, tmp_path, monkeypatch
     ):
         from servers import clean_lake_environment
@@ -125,9 +126,12 @@ class TestProjectResolution:
         project = make_lake_project(workspace)
         monkeypatch.setenv("ELAN_TOOLCHAIN", "leanprover/lean4:v4.34.0")
 
-        environment = clean_lake_environment(project)
+        environment = clean_lake_environment(
+            project,
+            overrides={"PATH": os.defpath},
+        )
 
-        assert environment["ELAN_TOOLCHAIN"] == "leanprover/lean4:v4.32.0"
+        assert "ELAN_TOOLCHAIN" not in environment
 
     def test_lake_environment_does_not_trust_lean_sysroot_to_filter_path(
         self, tmp_path, monkeypatch
@@ -141,7 +145,278 @@ class TestProjectResolution:
         environment = clean_lake_environment()
 
         assert "LEAN_SYSROOT" not in environment
-        assert environment["PATH"] == os.pathsep.join(("/usr/bin", "/bin"))
+        assert environment["PATH"].split(os.pathsep) == [
+            str(path)
+            for path in dict.fromkeys(
+                (Path("/usr/bin").resolve(), Path("/bin").resolve())
+            )
+        ]
+
+    def test_lake_environment_absolutizes_and_deduplicates_ambient_path(
+        self, tmp_path, monkeypatch
+    ):
+        daemon_cwd = tmp_path / "daemon"
+        relative_bin = daemon_cwd / "bin"
+        relative_bin.mkdir(parents=True)
+        monkeypatch.chdir(daemon_cwd)
+        monkeypatch.setenv("ELAN_HOME", str(tmp_path / "missing-elan"))
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join(("", ".", "bin", str(relative_bin))),
+        )
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment()
+
+        assert environment["PATH"].split(os.pathsep) == [
+            str(daemon_cwd.resolve()),
+            str(relative_bin.resolve()),
+        ]
+
+    def test_lake_environment_does_not_shell_expand_path_entries(
+        self, tmp_path, monkeypatch
+    ):
+        daemon_cwd = tmp_path / "daemon"
+        daemon_cwd.mkdir()
+        monkeypatch.chdir(daemon_cwd)
+        monkeypatch.setenv("ELAN_HOME", str(tmp_path / "missing-elan"))
+        monkeypatch.setenv("PATH", "~/bin")
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment()
+
+        assert environment["PATH"] == str((daemon_cwd / "~" / "bin").resolve())
+
+    def test_lake_environment_absolutizes_elan_home(self, tmp_path, monkeypatch):
+        daemon_cwd = tmp_path / "daemon"
+        proxy_bin = daemon_cwd / "elan" / "bin"
+        proxy_bin.mkdir(parents=True)
+        elan = proxy_bin / "elan"
+        elan.write_text("proxy")
+        elan.chmod(0o755)
+        os.link(elan, proxy_bin / "lake")
+        monkeypatch.chdir(daemon_cwd)
+        monkeypatch.setenv("ELAN_HOME", "elan")
+        monkeypatch.delenv("PATH", raising=False)
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment()
+
+        assert environment["ELAN_HOME"] == str((daemon_cwd / "elan").resolve())
+
+    def test_lake_environment_rejects_a_symlinked_project_build_path(
+        self, tmp_path, monkeypatch
+    ):
+        project = tmp_path / "project"
+        cache_build = tmp_path / "cache" / "build"
+        project.joinpath(".lake").mkdir(parents=True)
+        cache_build.joinpath("bin").mkdir(parents=True)
+        project.joinpath(".lake", "build").symlink_to(
+            cache_build,
+            target_is_directory=True,
+        )
+        direct_bin = tmp_path / "direct"
+        direct_bin.mkdir()
+        monkeypatch.setenv("ELAN_HOME", str(tmp_path / "missing-elan"))
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join(
+                (str(project / ".lake" / "build" / "bin"), str(direct_bin))
+            ),
+        )
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment()
+
+        assert environment["PATH"].split(os.pathsep) == [str(direct_bin.resolve())]
+
+    @pytest.mark.skipif(os.name != "posix", reason="executable probe uses POSIX scripts")
+    def test_lake_environment_preserves_direct_toolchain_without_elan_proxy(
+        self, tmp_path, monkeypatch
+    ):
+        elan_home = tmp_path / "elan"
+        toolchain_bin = elan_home / "toolchains" / "local" / "bin"
+        toolchain_bin.mkdir(parents=True)
+        lake = toolchain_bin / "lake"
+        lake.write_text("#!/bin/sh\nprintf direct\n")
+        lake.chmod(0o755)
+        original_path = str(toolchain_bin)
+        monkeypatch.setenv("ELAN_HOME", str(elan_home))
+        monkeypatch.setenv("PATH", original_path)
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment()
+
+        assert environment["PATH"] == original_path
+        completed = subprocess.run(
+            ["lake"],
+            check=True,
+            capture_output=True,
+            env=environment,
+            text=True,
+        )
+        assert completed.stdout == "direct"
+
+    @pytest.mark.skipif(os.name != "posix", reason="executable probe uses POSIX scripts")
+    def test_lake_environment_rejects_direct_lake_for_a_pinned_project(
+        self, tmp_path, monkeypatch
+    ):
+        project = make_lake_project(tmp_path)
+        (project / "lean-toolchain").write_text("leanprover/lean4:v4.32.0\n")
+        direct_bin = tmp_path / "direct"
+        direct_bin.mkdir()
+        lake = direct_bin / "lake"
+        lake.write_text("#!/bin/sh\nprintf direct\n")
+        lake.chmod(0o755)
+        monkeypatch.setenv("ELAN_HOME", str(tmp_path / "missing-elan"))
+        monkeypatch.setenv("PATH", str(direct_bin))
+
+        from servers import clean_lake_environment
+
+        with pytest.raises(ValueError, match="Elan proxy"):
+            clean_lake_environment(project, require_elan_proxy=True)
+
+    def test_lake_environment_allows_explicit_provider_for_a_pinned_project(
+        self, tmp_path, monkeypatch
+    ):
+        project = make_lake_project(tmp_path)
+        (project / "lean-toolchain").write_text("leanprover/lean4:v4.32.0\n")
+        monkeypatch.setenv("ELAN_HOME", str(tmp_path / "missing-elan"))
+        monkeypatch.setenv("PATH", "/ambient/direct")
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment(
+            project,
+            overrides={"PATH": "/trusted/provider"},
+            require_elan_proxy=True,
+        )
+
+        assert environment["PATH"] == "/trusted/provider"
+        assert "ELAN_TOOLCHAIN" not in environment
+
+    @pytest.mark.skipif(os.name != "posix", reason="executable probe uses POSIX scripts")
+    def test_lake_environment_adds_known_elan_proxy_when_path_is_absent(
+        self, tmp_path, monkeypatch
+    ):
+        elan_home = tmp_path / "elan"
+        proxy_bin = elan_home / "bin"
+        proxy_bin.mkdir(parents=True)
+        elan = proxy_bin / "elan"
+        elan.write_text("#!/bin/sh\nprintf proxy\n")
+        elan.chmod(0o755)
+        os.link(elan, proxy_bin / "lake")
+        monkeypatch.setenv("ELAN_HOME", str(elan_home))
+        monkeypatch.delenv("PATH", raising=False)
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment()
+
+        assert environment["PATH"].split(os.pathsep)[0] == str(proxy_bin)
+        completed = subprocess.run(
+            ["lake"],
+            check=True,
+            capture_output=True,
+            env=environment,
+            text=True,
+        )
+        assert completed.stdout == "proxy"
+
+    @pytest.mark.skipif(os.name != "posix", reason="executable probe uses POSIX scripts")
+    def test_lake_environment_ignores_fake_proxy_in_project_build_path(
+        self, tmp_path, monkeypatch
+    ):
+        stale_bin = tmp_path / "project" / ".lake" / "build" / "bin"
+        proxy_bin = tmp_path / "proxy"
+        stale_bin.mkdir(parents=True)
+        proxy_bin.mkdir()
+        for directory, output in ((stale_bin, "stale"), (proxy_bin, "proxy")):
+            elan = directory / "elan"
+            elan.write_text(f"#!/bin/sh\nprintf {output}\n")
+            elan.chmod(0o755)
+            os.link(elan, directory / "lake")
+        monkeypatch.setenv("ELAN_HOME", str(tmp_path / "missing-elan"))
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(stale_bin), str(proxy_bin))),
+        )
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment()
+
+        assert environment["PATH"].split(os.pathsep) == [str(proxy_bin)]
+        completed = subprocess.run(
+            ["lake"],
+            check=True,
+            capture_output=True,
+            env=environment,
+            text=True,
+        )
+        assert completed.stdout == "proxy"
+
+    @pytest.mark.skipif(os.name != "posix", reason="executable probe uses POSIX scripts")
+    def test_lake_environment_removes_project_build_path_without_elan_proxy(
+        self, tmp_path, monkeypatch
+    ):
+        stale_bin = tmp_path / "project" / ".lake" / "build" / "bin"
+        direct_bin = tmp_path / "direct"
+        stale_bin.mkdir(parents=True)
+        direct_bin.mkdir()
+        for directory, output in ((stale_bin, "stale"), (direct_bin, "direct")):
+            lake = directory / "lake"
+            lake.write_text(f"#!/bin/sh\nprintf {output}\n")
+            lake.chmod(0o755)
+        monkeypatch.setenv("ELAN_HOME", str(tmp_path / "missing-elan"))
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(stale_bin), str(direct_bin))),
+        )
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment()
+
+        assert environment["PATH"].split(os.pathsep) == [str(direct_bin)]
+        completed = subprocess.run(
+            ["lake"],
+            check=True,
+            capture_output=True,
+            env=environment,
+            text=True,
+        )
+        assert completed.stdout == "direct"
+
+    @pytest.mark.skipif(os.name != "posix", reason="executable probe uses POSIX scripts")
+    def test_lake_environment_uses_explicit_elan_home_for_proxy_discovery(
+        self, tmp_path, monkeypatch
+    ):
+        ambient_home = tmp_path / "ambient-elan"
+        explicit_home = tmp_path / "explicit-elan"
+        for home, output in ((ambient_home, "ambient"), (explicit_home, "explicit")):
+            binary = home / "bin"
+            binary.mkdir(parents=True)
+            elan = binary / "elan"
+            elan.write_text(f"#!/bin/sh\nprintf {output}\n")
+            elan.chmod(0o755)
+            os.link(elan, binary / "lake")
+        monkeypatch.setenv("ELAN_HOME", str(ambient_home))
+        monkeypatch.setenv("PATH", str(ambient_home / "bin"))
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment(
+            overrides={"ELAN_HOME": str(explicit_home)}
+        )
+
+        assert environment["ELAN_HOME"] == str(explicit_home)
+        assert environment["PATH"].split(os.pathsep)[0] == str(explicit_home / "bin")
 
     @pytest.mark.skipif(os.name != "posix", reason="executable probe uses POSIX scripts")
     def test_lake_environment_routes_bare_lake_through_the_elan_proxy(
@@ -153,24 +428,29 @@ class TestProjectResolution:
         project_bin = tmp_path / "project" / ".lake" / "build" / "bin"
         for directory in (proxy_bin, wrong_bin, project_bin):
             directory.mkdir(parents=True)
-        for executable in (proxy_bin / "elan", proxy_bin / "lake"):
-            executable.write_text("#!/bin/sh\nprintf 'proxy:%s' \"$ELAN_TOOLCHAIN\"\n")
-            executable.chmod(0o755)
+        elan = proxy_bin / "elan"
+        elan.write_text("#!/bin/sh\nprintf 'proxy:%s' \"$ELAN_TOOLCHAIN\"\n")
+        elan.chmod(0o755)
+        os.link(elan, proxy_bin / "lake")
         for executable in (wrong_bin / "lake", project_bin / "lake"):
             executable.write_text("#!/bin/sh\nprintf 'wrong'\n")
             executable.chmod(0o755)
+        wrong_alias = tmp_path / "wrong-toolchain-bin"
+        wrong_alias.symlink_to(wrong_bin, target_is_directory=True)
 
         monkeypatch.setenv("ELAN_HOME", str(elan_home))
         project = tmp_path / "project"
         (project / "lean-toolchain").write_text("leanprover/lean4:v4.32.0\n")
         monkeypatch.setenv(
             "PATH",
-            os.pathsep.join((str(wrong_bin), str(project_bin), str(proxy_bin))),
+            os.pathsep.join(
+                (str(wrong_alias), str(project_bin), str(proxy_bin))
+            ),
         )
 
         from servers import clean_lake_environment
 
-        environment = clean_lake_environment(project)
+        environment = clean_lake_environment(project, require_elan_proxy=True)
 
         assert environment["PATH"].split(os.pathsep) == [str(proxy_bin)]
         completed = subprocess.run(
@@ -180,7 +460,52 @@ class TestProjectResolution:
             env=environment,
             text=True,
         )
-        assert completed.stdout == "proxy:leanprover/lean4:v4.32.0"
+        assert completed.stdout == "proxy:"
+
+    def test_lake_environment_rejects_a_sibling_nonproxy_lake(
+        self, tmp_path, monkeypatch
+    ):
+        project = make_lake_project(tmp_path)
+        (project / "lean-toolchain").write_text("leanprover/lean4:v4.32.0\n")
+        fake_bin = tmp_path / "fake-bin"
+        fake_bin.mkdir()
+        for name in ("elan", "lake"):
+            executable = fake_bin / name
+            executable.write_text(f"#!/bin/sh\nprintf {name}\n")
+            executable.chmod(0o755)
+        monkeypatch.setenv("ELAN_HOME", str(tmp_path / "missing-elan"))
+        monkeypatch.setenv("PATH", str(fake_bin))
+
+        from servers import clean_lake_environment
+
+        with pytest.raises(ValueError, match="Elan proxy"):
+            clean_lake_environment(project, require_elan_proxy=True)
+
+    def test_lake_environment_skips_an_orphan_elan_before_a_valid_proxy(
+        self, tmp_path, monkeypatch
+    ):
+        orphan_bin = tmp_path / "orphan"
+        proxy_bin = tmp_path / "proxy"
+        orphan_bin.mkdir()
+        proxy_bin.mkdir()
+        orphan = orphan_bin / "elan"
+        orphan.write_text("#!/bin/sh\nprintf orphan\n")
+        orphan.chmod(0o755)
+        elan = proxy_bin / "elan"
+        elan.write_text("#!/bin/sh\nprintf proxy\n")
+        elan.chmod(0o755)
+        os.link(elan, proxy_bin / "lake")
+        monkeypatch.setenv("ELAN_HOME", str(tmp_path / "missing-elan"))
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(orphan_bin), str(proxy_bin))),
+        )
+
+        from servers import clean_lake_environment
+
+        environment = clean_lake_environment()
+
+        assert environment["PATH"].split(os.pathsep)[0] == str(proxy_bin)
 
     def test_project_fingerprint_tracks_root_and_config_identity(self, tmp_path):
         from servers import lean_project_fingerprint
@@ -226,6 +551,112 @@ class TestProjectResolution:
         assert changed_parent != inherited
         assert lean_project_fingerprint(project) != changed_parent
 
+    def test_project_fingerprint_uses_an_explicit_toolchain_instead_of_the_file(
+        self, tmp_path
+    ):
+        from servers import lean_project_fingerprint
+
+        project = make_lake_project(tmp_path)
+        toolchain = project / "lean-toolchain"
+        toolchain.symlink_to(project / "missing-toolchain")
+
+        first = lean_project_fingerprint(
+            project,
+            environment_overrides={"ELAN_TOOLCHAIN": "leanprover/lean4:v4.32.0"},
+        )
+        second = lean_project_fingerprint(
+            project,
+            environment_overrides={"ELAN_TOOLCHAIN": "leanprover/lean4:v4.33.0"},
+        )
+
+        assert first != second
+
+    def test_empty_explicit_toolchain_falls_back_to_the_project_file(
+        self, tmp_path, monkeypatch
+    ):
+        from servers import clean_lake_environment, lean_project_fingerprint
+
+        project = make_lake_project(tmp_path)
+        toolchain = project / "lean-toolchain"
+        toolchain.write_text("leanprover/lean4:v4.32.0\n")
+        overrides = {"ELAN_TOOLCHAIN": "", "PATH": "/trusted/provider"}
+
+        environment = clean_lake_environment(project, overrides=overrides)
+        before = lean_project_fingerprint(
+            project,
+            environment_overrides=overrides,
+        )
+        toolchain.write_text("leanprover/lean4:v4.33.0\n")
+
+        assert "ELAN_TOOLCHAIN" not in environment
+        assert before != lean_project_fingerprint(
+            project,
+            environment_overrides=overrides,
+        )
+
+    @pytest.mark.skipif(os.name != "posix", reason="FIFO metadata requires POSIX")
+    def test_lake_environment_rejects_nonregular_toolchain_without_reading_it(
+        self, tmp_path
+    ):
+        from servers import clean_lake_environment
+
+        project = make_lake_project(tmp_path)
+        os.mkfifo(project / "lean-toolchain")
+
+        with pytest.raises(ValueError, match="regular file"):
+            clean_lake_environment(project)
+
+    def test_lake_environment_rejects_oversized_toolchain(self, tmp_path):
+        from servers import clean_lake_environment
+
+        project = make_lake_project(tmp_path)
+        (project / "lean-toolchain").write_text("x" * 4_097)
+
+        with pytest.raises(ValueError, match="too large"):
+            clean_lake_environment(project)
+
+    def test_lake_environment_reads_toolchain_until_eof(self, tmp_path, monkeypatch):
+        import servers
+
+        toolchain = tmp_path / "lean-toolchain"
+        expected = b"leanprover/lean4:v4.32.0\n"
+        toolchain.write_bytes(expected)
+        original_read = servers.os.read
+
+        def short_read(descriptor, count):
+            return original_read(descriptor, min(count, 1))
+
+        monkeypatch.setattr(servers.os, "read", short_read)
+
+        assert servers._read_lean_toolchain(toolchain) == expected.decode().strip()
+
+    def test_lake_environment_uses_only_the_first_toolchain_line(self, tmp_path):
+        import servers
+
+        toolchain = tmp_path / "lean-toolchain"
+        toolchain.write_text("leanprover/lean4:v4.32.0\nignored\n")
+
+        assert servers._read_lean_toolchain(toolchain) == (
+            "leanprover/lean4:v4.32.0"
+        )
+
+    def test_lake_environment_leaves_relative_toolchain_resolution_to_elan(
+        self, tmp_path
+    ):
+        from servers import clean_lake_environment
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "lean-toolchain").write_text("./toolchain\n")
+        project = make_lake_project(workspace)
+
+        environment = clean_lake_environment(
+            project,
+            overrides={"PATH": "/trusted/provider"},
+        )
+
+        assert "ELAN_TOOLCHAIN" not in environment
+
     def test_only_initial_manifest_materialization_is_an_accepted_transition(
         self, tmp_path
     ):
@@ -253,6 +684,17 @@ class TestProjectResolution:
         )
 
         manifest.rmdir()
+        manifest_target = tmp_path / "manifest-target.json"
+        manifest_target.write_text('{"version": "1.1.0"}\n')
+        manifest.symlink_to(manifest_target)
+        assert (
+            is_initial_manifest_materialization(
+                before, lean_project_fingerprint(project)
+            )
+            is False
+        )
+
+        manifest.unlink()
         manifest.write_text('{"version": "1.1.0"}\n')
         (project / "lakefile.toml").write_text('[package]\nname = "Changed"\n')
 

@@ -20,8 +20,8 @@ Ensure future agents need less steering.
 Preserve the insight, not the transcript.
 Add a focused test and acceptance assertion in `tests/test_skill_examples.py`.
 
-Implement reusable behavior. Keep Cabannes-specific facts in examples; avoid
-special cases.
+Implement reusable plugin behavior. Keep Cabannes-specific facts in the example
+and references; demonstrate outcomes without special-casing them.
 
 Fence every dispatched REPL response against the project configuration generation;
 scrub ambient Lean/Lake overrides and permit only initial manifest materialization.
@@ -29,7 +29,7 @@ scrub ambient Lean/Lake overrides and permit only initial manifest materializati
 Keep plugin and formalization roots distinct. Agents can infer routine details;
 keep skills to non-obvious constraints and fragile domain steps.
 
-Run focused checks, then normally run:
+Run focused checks, then run:
 
 ```bash
 make lint

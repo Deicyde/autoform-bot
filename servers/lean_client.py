@@ -34,6 +34,15 @@ DEFAULT_REPL_REQUEST_TIMEOUT = 180.0
 # The daemon reserves two seconds for verified process cleanup and thirty
 # seconds for response/retirement overhead after the public operation deadline.
 REPL_RESPONSE_GRACE_SECONDS = 32.0
+_RUNTIME_RESULT_TYPES: dict[str, type[Any]] = {
+    "daemon.ping": dict,
+    "daemon.shutdown": dict,
+    "daemon.status": dict,
+    "lsp.diagnostics": str,
+    "lsp.hover": str,
+    "repl.run": str,
+    "repl.status": dict,
+}
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_PATH_ID = hashlib.sha256(os.fsencode(PACKAGE_ROOT)).hexdigest()[:10]
 
@@ -60,6 +69,7 @@ def _build_id() -> str:
 def _build_generation() -> int:
     """Order in-place builds so an older live wrapper cannot replace a newer one."""
     candidates = (
+        PACKAGE_ROOT / "servers" / "__init__.py",
         Path(__file__).resolve(),
         PACKAGE_ROOT / "servers" / "lean_runtime.py",
         PACKAGE_ROOT / "servers" / "lsp" / "server.py",
@@ -119,13 +129,22 @@ def _decode_runtime_response(raw: str) -> Any:
             result[key] = value
         return result
 
+    def parse_finite_float(value: str) -> float:
+        result = float(value)
+        if not math.isfinite(result):
+            raise LeanRuntimeProtocolError(
+                f"Lean runtime returned non-finite JSON number {value!r}"
+            )
+        return result
+
     try:
         return json.loads(
             raw,
             parse_constant=reject_constant,
+            parse_float=parse_finite_float,
             object_pairs_hook=reject_duplicate_keys,
         )
-    except json.JSONDecodeError as error:
+    except (ValueError, RecursionError) as error:
         raise LeanRuntimeProtocolError("Lean runtime returned invalid JSON") from error
 
 
@@ -303,8 +322,43 @@ class LeanRuntimeClient:
     ) -> Any:
         """Call a runtime method, starting the daemon only before dispatch."""
         request_params = params or {}
-        if method == "repl.run" and deadline is None:
-            deadline = time.monotonic() + _repl_timeout_from_params(request_params)
+        if method == "repl.run":
+            now = time.monotonic()
+            if deadline is not None and (
+                isinstance(deadline, bool)
+                or not isinstance(deadline, (int, float))
+                or not math.isfinite(deadline)
+            ):
+                raise LeanRuntimeError(
+                    "Lean runtime request deadline must be a finite number"
+                )
+            if deadline is None:
+                operation_budget = _repl_timeout_from_params(request_params)
+                deadline = now + operation_budget
+            else:
+                operation_budget = max(0.0, deadline - now)
+            configured_response_timeout = (
+                self.response_timeout
+                if response_timeout is None
+                else response_timeout
+            )
+            if (
+                isinstance(configured_response_timeout, bool)
+                or not isinstance(configured_response_timeout, (int, float))
+                or not math.isfinite(configured_response_timeout)
+                or configured_response_timeout <= 0
+            ):
+                raise LeanRuntimeError(
+                    "Lean runtime response timeout must be a finite positive number"
+                )
+            if (
+                configured_response_timeout
+                <= operation_budget + REPL_RESPONSE_GRACE_SECONDS
+            ):
+                raise LeanRuntimeError(
+                    "Lean runtime response timeout must exceed the REPL operation "
+                    "timeout plus cleanup grace"
+                )
         should_start = self.autostart if autostart is None else autostart
         try:
             return self._request_once(
@@ -648,10 +702,16 @@ class LeanRuntimeClient:
                 if method == "repl.run" and deadline is not None
                 else 0.0
             )
-            connection.settimeout(
-                bounded_timeout(configured_response_timeout, grace=response_grace)
+            configured_response_deadline = (
+                time.monotonic() + configured_response_timeout
             )
-            raw = self._read_line(connection)
+            response_deadline = configured_response_deadline
+            if deadline is not None:
+                response_deadline = min(
+                    response_deadline,
+                    deadline + response_grace,
+                )
+            raw = self._read_line(connection, deadline=response_deadline)
         except socket.timeout as error:
             if dispatched:
                 raise outcome_unknown() from error
@@ -699,7 +759,17 @@ class LeanRuntimeClient:
                     "Lean runtime response has an invalid envelope"
                 )
             if ok:
-                return response["result"]
+                expected_result_type = _RUNTIME_RESULT_TYPES.get(method)
+                if expected_result_type is None:
+                    raise LeanRuntimeProtocolError(
+                        f"Lean runtime returned success for unknown method {method!r}"
+                    )
+                result = response["result"]
+                if not isinstance(result, expected_result_type):
+                    raise LeanRuntimeProtocolError(
+                        f"Lean runtime {method} returned an invalid result type"
+                    )
+                return result
             remote_error = response["error"]
             if not isinstance(remote_error, dict) or set(remote_error) != {
                 "type",
@@ -715,13 +785,23 @@ class LeanRuntimeClient:
         raise LeanRuntimeRemoteError(f"{error_type}: {message}")
 
     @staticmethod
-    def _read_line(connection: socket.socket) -> str:
+    def _read_line(connection: socket.socket, *, deadline: float) -> str:
         data = bytearray()
         while len(data) <= MAX_MESSAGE_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("Lean runtime response deadline expired")
+            connection.settimeout(remaining)
             chunk = connection.recv(min(65536, MAX_MESSAGE_BYTES + 1 - len(data)))
+            if time.monotonic() >= deadline:
+                raise socket.timeout("Lean runtime response deadline expired")
             if not chunk:
                 raise LeanRuntimeProtocolError("Lean runtime closed without a response")
             data.extend(chunk)
+            if len(data) > MAX_MESSAGE_BYTES:
+                raise LeanRuntimeProtocolError(
+                    "Lean runtime response exceeds the message limit"
+                )
             newline = data.find(b"\n")
             if newline >= 0:
                 if data[newline + 1 :]:

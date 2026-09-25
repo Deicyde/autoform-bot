@@ -34,10 +34,12 @@ from servers import (
 )
 from servers.lean_client import (
     BUILD_GENERATION,
+    DEFAULT_REPL_REQUEST_TIMEOUT,
     INSTALL_ID,
     MAX_MESSAGE_BYTES,
     PROTOCOL_VERSION,
     DEFAULT_RESPONSE_TIMEOUT,
+    REPL_RESPONSE_GRACE_SECONDS,
     LeanRuntimeClient,
     LeanRuntimeError,
     LeanRuntimeUnavailable,
@@ -54,10 +56,11 @@ from servers.lsp.server import (
 )
 from servers.repl.core import format_repl_response
 from servers.repl.pool import (
-    DEFAULT_POOL_CLEANUP_SECONDS,
     DEFAULT_RAM_FRACTION,
     LeanReplPool,
     LeanReplPoolConfig,
+    ReplPoolBusyError,
+    ReplPoolUnavailableError,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,13 +71,13 @@ DEFAULT_MAX_PROJECTS = 4
 DEFAULT_IDLE_SECONDS = 30 * 60
 DEFAULT_LSP_TIMEOUT = 60.0
 DEFAULT_MAX_LSP_REQUEST_SECONDS = 600.0
-DEFAULT_REPL_REQUEST_TIMEOUT = 180.0
 DEFAULT_MAX_REPL_REQUEST_SECONDS = 240.0
 DEFAULT_RPC_READ_TIMEOUT = 10.0
 DEFAULT_MAX_CONNECTIONS = 64
 RUNTIME_SAFETY_SECONDS = 30.0
 TERMINAL_CLEANUP_RETRY_SECONDS = 0.05
 MAX_TERMINAL_CLEANUP_RETRY_SECONDS = 1.0
+MAX_REQUEST_ID_CHARS = 128
 # Conservative bounds for cleanup/startup work that surrounds one LSP call.
 # They keep the daemon's work inside the client's response deadline even when
 # an inactive project must be replaced first.
@@ -84,6 +87,37 @@ LSP_CLOSE_BUDGET = 65.0
 
 class ProjectResourceBusyError(TimeoutError):
     """A shared project slot could not be admitted within the RPC budget."""
+
+
+def _decode_runtime_request(raw: bytes) -> Any:
+    """Decode strict JSON for the runtime's private request boundary."""
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"request contains nonstandard JSON constant {value!r}")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"request contains duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def parse_finite_float(value: str) -> float:
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"request contains non-finite JSON number {value!r}")
+        return result
+
+    try:
+        return json.loads(
+            raw,
+            parse_constant=reject_constant,
+            parse_float=parse_finite_float,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        raise ValueError("request is not valid strict JSON") from error
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -209,8 +243,7 @@ class LeanRuntimeConfig:
         )
         if (
             max_repl_request_seconds
-            + DEFAULT_POOL_CLEANUP_SECONDS
-            + RUNTIME_SAFETY_SECONDS
+            + REPL_RESPONSE_GRACE_SECONDS
             >= response_timeout
         ):
             raise ValueError(
@@ -661,27 +694,29 @@ class ProjectResourceCache(Generic[T]):
                 self._condition.notify_all()
             raise
 
+        skip_generation_probe = deadline is not None and self._clock() >= deadline
         startup_error: ProjectResourceBusyError | None = None
-        try:
-            created_fingerprint = lean_project_fingerprint(root)
-        except OSError as error:
-            created_fingerprint = fingerprint
-            startup_error = ProjectResourceBusyError(
-                f"shared Lean project changed during startup: {root}"
-            )
-            startup_error.__cause__ = error
-        if (
-            startup_error is None
-            and created_fingerprint != fingerprint
-            and not is_initial_manifest_materialization(
-                fingerprint, created_fingerprint
-            )
-        ):
-            startup_error = ProjectResourceBusyError(
-                f"shared Lean project changed during startup: {root}"
-            )
+        created_fingerprint = fingerprint
+        if not skip_generation_probe:
+            try:
+                created_fingerprint = lean_project_fingerprint(root)
+            except OSError as error:
+                startup_error = ProjectResourceBusyError(
+                    f"shared Lean project changed during startup: {root}"
+                )
+                startup_error.__cause__ = error
+            if (
+                startup_error is None
+                and created_fingerprint != fingerprint
+                and not is_initial_manifest_materialization(
+                    fingerprint, created_fingerprint
+                )
+            ):
+                startup_error = ProjectResourceBusyError(
+                    f"shared Lean project changed during startup: {root}"
+                )
 
-        close_created = startup_error is not None
+        close_created = startup_error is not None or skip_generation_probe
         startup_expired = False
         with self._condition:
             self._creating.discard(root)
@@ -689,7 +724,9 @@ class ProjectResourceCache(Generic[T]):
                 close_created = True
             elif startup_error is not None:
                 pass
-            elif deadline is not None and self._clock() >= deadline:
+            elif skip_generation_probe or (
+                deadline is not None and self._clock() >= deadline
+            ):
                 close_created = True
                 startup_expired = True
             else:
@@ -898,18 +935,55 @@ class LeanRuntimeServices:
                 raise ProjectResourceBusyError(
                     "Lean REPL request deadline expired before admission"
                 )
-            with self.repl_projects.lease(
-                project_dir,
-                deadline=deadline,
-                creation_budget=0.0,
-            ) as pool:
-                assert pool is not None
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ProjectResourceBusyError(
-                        "Lean REPL request deadline expired before execution"
-                    )
-                return format_repl_response(pool.run(code, timeout=remaining))
+            repl_result: Any = None
+            repl_attempted = False
+            repl_completed = False
+            try:
+                with self.repl_projects.lease(
+                    project_dir,
+                    deadline=deadline,
+                    creation_budget=0.0,
+                ) as pool:
+                    assert pool is not None
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ProjectResourceBusyError(
+                            "Lean REPL request deadline expired before execution"
+                        )
+                    repl_attempted = True
+                    repl_result = pool.run(code, deadline=deadline)
+                    repl_completed = True
+            except (ReplPoolBusyError, ReplPoolUnavailableError):
+                raise
+            except Exception as error:
+                if not repl_attempted:
+                    raise
+                phase = (
+                    "project resource release"
+                    if repl_completed
+                    else "REPL execution"
+                )
+                return format_repl_response(
+                    {
+                        "repl_error": (
+                            f"Lean {phase} failed after the command may have been "
+                            f"dispatched: {error}. The request must not be replayed."
+                        ),
+                        "outcome_unknown": True,
+                    }
+                )
+            try:
+                return format_repl_response(repl_result)
+            except Exception as error:
+                return format_repl_response(
+                    {
+                        "repl_error": (
+                            "Lean REPL command produced an invalid result: "
+                            f"{error}. The request must not be replayed."
+                        ),
+                        "outcome_unknown": True,
+                    }
+                )
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")
             with self.repl_projects.lease(project_dir, create=False) as pool:
@@ -1094,38 +1168,81 @@ class LeanRuntimeRequestHandler(socketserver.StreamRequestHandler):
 
     server: LeanRuntimeServer
 
-    def setup(self) -> None:
-        self.request.settimeout(self.server.services.config.rpc_read_timeout)
-        super().setup()
+    def _read_request(self) -> bytes:
+        deadline = (
+            time.monotonic() + self.server.services.config.rpc_read_timeout
+        )
+        data = bytearray()
+        while len(data) <= MAX_MESSAGE_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("runtime request read deadline expired")
+            self.request.settimeout(remaining)
+            chunk = self.request.recv(
+                min(65536, MAX_MESSAGE_BYTES + 1 - len(data))
+            )
+            if time.monotonic() >= deadline:
+                raise TimeoutError("runtime request read deadline expired")
+            if not chunk:
+                raise ValueError("request is empty or unterminated")
+            data.extend(chunk)
+            newline = data.find(b"\n")
+            if newline >= 0:
+                if len(data) > MAX_MESSAGE_BYTES:
+                    raise ValueError("request exceeds the message limit")
+                if newline == 0:
+                    raise ValueError("request is empty")
+                if data[newline + 1 :]:
+                    raise ValueError("request contains trailing data")
+                return bytes(data[:newline])
+        raise ValueError("request exceeds the message limit")
 
     def handle(self) -> None:
         request_id: Any = None
+        method: Any = None
+        client_deadline: float | None = None
         shutdown = False
         try:
-            raw = self.rfile.readline(MAX_MESSAGE_BYTES + 1)
-            if not raw or len(raw) > MAX_MESSAGE_BYTES or not raw.endswith(b"\n"):
-                raise ValueError("request is empty, unterminated, or too large")
-            request = json.loads(raw)
+            raw = self._read_request()
+            request = _decode_runtime_request(raw)
             if not isinstance(request, dict):
                 raise ValueError("request must be a JSON object")
-            request_id = request.get("id")
-            if request.get("v") != PROTOCOL_VERSION:
+            candidate_id = request.get("id")
+            if (
+                type(candidate_id) is not str
+                or not candidate_id
+                or len(candidate_id) > MAX_REQUEST_ID_CHARS
+            ):
+                raise ValueError("id must be a bounded non-empty string")
+            request_id = candidate_id
+            version = request.get("v")
+            if type(version) is not int or version != PROTOCOL_VERSION:
                 raise ValueError(
-                    f"protocol mismatch: expected {PROTOCOL_VERSION}, got {request.get('v')!r}"
+                    f"protocol mismatch: expected {PROTOCOL_VERSION}, got {version!r}"
                 )
             method = request.get("method")
             params = request.get("params")
-            client_deadline = request.get("deadline")
             if not isinstance(method, str) or not method:
                 raise ValueError("method must be a non-empty string")
             if not isinstance(params, dict):
                 raise ValueError("params must be an object")
-            if client_deadline is not None and (
-                isinstance(client_deadline, bool)
-                or not isinstance(client_deadline, (int, float))
-                or not math.isfinite(client_deadline)
+            base_keys = {"v", "id", "method", "params"}
+            expected_keys = (
+                base_keys | {"deadline"}
+                if method == "repl.run" and "deadline" in request
+                else base_keys
+            )
+            if set(request) != expected_keys:
+                raise ValueError("request has an invalid envelope")
+            candidate_deadline = request.get("deadline")
+            if "deadline" in request and (
+                isinstance(candidate_deadline, bool)
+                or not isinstance(candidate_deadline, (int, float))
+                or not math.isfinite(candidate_deadline)
             ):
                 raise ValueError("deadline must be a finite number or null")
+            if candidate_deadline is not None:
+                client_deadline = float(candidate_deadline)
 
             if method == "daemon.shutdown":
                 result = {"stopping": True, "pid": os.getpid()}
@@ -1134,11 +1251,7 @@ class LeanRuntimeRequestHandler(socketserver.StreamRequestHandler):
                 result = self.server.services.dispatch(
                     method,
                     params,
-                    client_deadline=(
-                        None
-                        if client_deadline is None
-                        else float(client_deadline)
-                    ),
+                    client_deadline=client_deadline,
                 )
             response = {
                 "v": PROTOCOL_VERSION,
@@ -1160,8 +1273,19 @@ class LeanRuntimeRequestHandler(socketserver.StreamRequestHandler):
 
         encoded = json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n"
         if len(encoded) > MAX_MESSAGE_BYTES:
-            encoded = json.dumps(
-                {
+            if method == "repl.run" and response.get("ok") is True:
+                response = {
+                    "v": PROTOCOL_VERSION,
+                    "id": request_id,
+                    "ok": True,
+                    "result": (
+                        "REPL error (execution outcome unknown; request not retried): "
+                        "the completed response exceeded the runtime message limit; "
+                        "the request must not be replayed."
+                    ),
+                }
+            else:
+                response = {
                     "v": PROTOCOL_VERSION,
                     "id": request_id,
                     "ok": False,
@@ -1169,14 +1293,34 @@ class LeanRuntimeRequestHandler(socketserver.StreamRequestHandler):
                         "type": "ValueError",
                         "message": "response exceeds the message limit",
                     },
-                },
-                separators=(",", ":"),
-            ).encode("utf-8") + b"\n"
+                }
+            encoded = json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n"
+        write_timeout = min(
+            getattr(
+                self.server.services.config,
+                "response_timeout",
+                DEFAULT_RESPONSE_TIMEOUT,
+            ),
+            RUNTIME_SAFETY_SECONDS,
+        )
+        write_deadline = time.monotonic() + write_timeout
+        if method == "repl.run" and client_deadline is not None:
+            write_deadline = min(
+                write_deadline,
+                client_deadline + REPL_RESPONSE_GRACE_SECONDS,
+            )
         try:
+            remaining = write_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("runtime response write deadline expired")
+            self.request.settimeout(remaining)
             self.wfile.write(encoded)
             self.wfile.flush()
-        except BrokenPipeError:
-            logger.warning("Lean runtime client disconnected before receiving its response")
+        except (TimeoutError, OSError):
+            logger.warning(
+                "Lean runtime client disconnected before receiving its response",
+                exc_info=True,
+            )
         if shutdown:
             self.server.request_shutdown()
 

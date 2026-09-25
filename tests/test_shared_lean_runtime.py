@@ -19,6 +19,7 @@ from servers.lean_client import (
     INSTALL_PATH_ID,
     PROTOCOL_VERSION,
     LeanRuntimeClient,
+    LeanRuntimeError,
     LeanRuntimeOutcomeUnknown,
     LeanRuntimeProtocolError,
     LeanRuntimeRemoteError,
@@ -128,10 +129,11 @@ def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path):
         assert first == second == "Compiles successfully"
         assert len(pools) == 1
         assert [call[0] for call in pools[0].calls] == ["#check Nat", "#check Int"]
-        default_remaining = pools[0].calls[0][1]["timeout"]
-        explicit_remaining = pools[0].calls[1][1]["timeout"]
-        assert 0 < default_remaining <= 30.0
-        assert 0 < explicit_remaining <= 3.0
+        now = time.monotonic()
+        default_deadline = pools[0].calls[0][1]["deadline"]
+        explicit_deadline = pools[0].calls[1][1]["deadline"]
+        assert 0 < default_deadline - now <= 30.0
+        assert 0 < explicit_deadline - now <= 3.0
         warm = services.dispatch("repl.status", {"project_dir": str(project)})
         assert warm["state"] == "warm"
         assert warm["memory_usage_gb"] == 0.25
@@ -139,6 +141,95 @@ def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path):
         services.close()
 
     assert pools[0]._shutdown is True
+
+
+def test_repl_release_failure_after_result_is_outcome_unknown(tmp_path):
+    project = make_lake_project(tmp_path, "release-failure")
+    pools = []
+
+    class InvalidAfterRunPool(FakePool):
+        def is_usable(self):
+            if self.calls:
+                raise RuntimeError("post-result validation failed")
+            return True
+
+    def create_pool(root):
+        pool = InvalidAfterRunPool(root)
+        pools.append(pool)
+        return pool
+
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=create_pool,
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        response = services.dispatch(
+            "repl.run",
+            {"project_dir": str(project), "code": "#check Nat", "timeout": 3},
+        )
+    finally:
+        services.close()
+
+    assert pools[0].calls
+    assert "execution outcome unknown" in response
+    assert "must not be replayed" in response
+    assert "post-result validation failed" in response
+
+
+def test_unexpected_pool_failure_after_attempt_is_outcome_unknown(tmp_path):
+    project = make_lake_project(tmp_path, "pool-failure")
+    calls = []
+
+    class FailingPool(FakePool):
+        def run(self, code, **kwargs):
+            calls.append((code, kwargs))
+            raise RuntimeError("unexpected pool failure")
+
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=FailingPool,
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        response = services.dispatch(
+            "repl.run",
+            {"project_dir": str(project), "code": "#check Nat", "timeout": 3},
+        )
+    finally:
+        services.close()
+
+    assert calls
+    assert "execution outcome unknown" in response
+    assert "must not be replayed" in response
+    assert "unexpected pool failure" in response
+
+
+def test_pool_admission_failure_remains_retryable(tmp_path):
+    from servers.repl.pool import ReplPoolBusyError
+
+    project = make_lake_project(tmp_path, "pool-busy")
+
+    class BusyPool(FakePool):
+        def run(self, code, **kwargs):
+            raise ReplPoolBusyError("worker queue expired before dispatch")
+
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=BusyPool,
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        with pytest.raises(ReplPoolBusyError, match="before dispatch"):
+            services.dispatch(
+                "repl.run",
+                {"project_dir": str(project), "code": "#check Nat", "timeout": 3},
+            )
+    finally:
+        services.close()
 
 
 def test_status_reports_an_active_poisoned_pool_as_retiring(tmp_path):
@@ -288,6 +379,42 @@ def test_project_startup_that_misses_its_budget_is_discarded(tmp_path):
 
     assert closed == [project.resolve()]
     assert cache.state(str(project)) == "cold"
+    cache.close()
+
+
+def test_expired_project_startup_skips_generation_probe(tmp_path, monkeypatch):
+    from servers import lean_runtime
+
+    project = make_lake_project(tmp_path, "expired-before-fingerprint")
+    clock = {"now": 0.0}
+    closed = []
+    fingerprint_calls = []
+    real_fingerprint = lean_runtime.lean_project_fingerprint
+
+    def fingerprint(root):
+        fingerprint_calls.append(root)
+        return real_fingerprint(root)
+
+    def slow_factory(root):
+        clock["now"] = 2.0
+        return root
+
+    monkeypatch.setattr(lean_runtime, "lean_project_fingerprint", fingerprint)
+    cache = ProjectResourceCache(
+        slow_factory,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+        clock=lambda: clock["now"],
+    )
+
+    with pytest.raises(ProjectResourceBusyError, match="startup exceeded"):
+        with cache.lease(str(project), deadline=1.0):
+            pytest.fail("late project startup must never execute a tool request")
+
+    assert fingerprint_calls == [project.resolve()]
+    assert closed == [project.resolve()]
     cache.close()
 
 
@@ -723,6 +850,146 @@ def test_repl_wire_deadline_is_internal_and_response_allows_cleanup(
     ]
 
 
+def test_repl_response_budget_must_cover_operation_and_cleanup_before_dispatch(
+    runtime_dir,
+    monkeypatch,
+):
+    from servers import lean_client
+
+    monkeypatch.setattr(
+        lean_client.socket,
+        "socket",
+        lambda *args: pytest.fail("an invalid response budget must not connect"),
+    )
+    client = LeanRuntimeClient(
+        socket_path=runtime_dir / "short-response.sock",
+        response_timeout=36,
+    )
+
+    with pytest.raises(LeanRuntimeError, match="response timeout must exceed"):
+        client.request(
+            "repl.run",
+            {"project_dir": "/lean", "code": "#check Nat", "timeout": 5},
+        )
+
+
+@pytest.mark.parametrize("deadline", [True, "soon", float("nan"), float("inf")])
+def test_invalid_repl_client_deadline_never_connects(
+    runtime_dir,
+    monkeypatch,
+    deadline,
+):
+    from servers import lean_client
+
+    monkeypatch.setattr(
+        lean_client.socket,
+        "socket",
+        lambda *args: pytest.fail("an invalid deadline must not connect"),
+    )
+    client = LeanRuntimeClient(socket_path=runtime_dir / "invalid-deadline.sock")
+
+    with pytest.raises(LeanRuntimeError, match="deadline must be a finite number"):
+        client.request(
+            "repl.run",
+            {"project_dir": "/lean", "code": "#check Nat", "timeout": 5},
+            deadline=deadline,
+        )
+
+
+def test_repl_response_read_rechecks_one_absolute_deadline(
+    runtime_dir,
+    monkeypatch,
+):
+    from servers import lean_client
+
+    now = [100.0]
+    receives = []
+
+    class DribblingSocket:
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            pass
+
+        def recv(self, size):
+            receives.append(size)
+            now[0] = 134.0
+            return b"{"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lean_client.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        lean_client.socket,
+        "socket",
+        lambda *args: DribblingSocket(),
+    )
+    client = LeanRuntimeClient(socket_path=runtime_dir / "dribble.sock")
+
+    with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed"):
+        client.request(
+            "repl.run",
+            {"project_dir": "/lean", "code": "#check Nat", "timeout": 1},
+            autostart=False,
+        )
+
+    assert len(receives) == 1
+
+
+def test_repl_response_arriving_after_deadline_is_not_accepted(
+    runtime_dir,
+    monkeypatch,
+):
+    from servers import lean_client
+
+    now = [100.0]
+    sent = []
+
+    class LateResponseSocket:
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            sent.append(json.loads(payload))
+
+        def recv(self, size):
+            now[0] = 134.0
+            return json.dumps(
+                {
+                    "v": PROTOCOL_VERSION,
+                    "id": sent[0]["id"],
+                    "ok": True,
+                    "result": "late result",
+                }
+            ).encode() + b"\n"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lean_client.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        lean_client.socket,
+        "socket",
+        lambda *args: LateResponseSocket(),
+    )
+    client = LeanRuntimeClient(socket_path=runtime_dir / "late-response.sock")
+
+    with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed"):
+        client.request(
+            "repl.run",
+            {"project_dir": "/lean", "code": "#check Nat", "timeout": 1},
+            autostart=False,
+        )
+
+
 def test_expired_repl_deadline_is_not_dispatched_after_autostart(
     runtime_dir,
     monkeypatch,
@@ -780,10 +1047,10 @@ def test_expired_repl_deadline_is_not_dispatched_after_autostart(
 
 
 @pytest.mark.parametrize(
-    ("client_deadline", "server_timeout", "expected_deadline", "expected_remaining"),
+    ("client_deadline", "server_timeout", "expected_deadline"),
     [
-        (110.0, 30.0, 110.0, 7.0),
-        (200.0, 5.0, 105.0, 2.0),
+        (110.0, 30.0, 110.0),
+        (200.0, 5.0, 105.0),
     ],
 )
 def test_runtime_caps_client_deadline_and_spends_admission_time(
@@ -792,7 +1059,6 @@ def test_runtime_caps_client_deadline_and_spends_admission_time(
     client_deadline,
     server_timeout,
     expected_deadline,
-    expected_remaining,
 ):
     from servers import lean_runtime
 
@@ -839,7 +1105,7 @@ def test_runtime_caps_client_deadline_and_spends_admission_time(
 
     assert lease_deadlines == [expected_deadline]
     assert pool.calls == [
-        ("#check Nat", {"timeout": pytest.approx(expected_remaining)})
+        ("#check Nat", {"deadline": expected_deadline})
     ]
 
 
@@ -931,8 +1197,21 @@ def test_cache_does_not_start_a_resource_after_its_absolute_deadline(tmp_path):
     cache.close()
 
 
-@pytest.mark.parametrize("deadline", [None, 123.5])
-def test_runtime_wire_deadline_is_optional_and_outside_params(deadline):
+class _RuntimeRequestSocket:
+    def __init__(self, payload):
+        self.payload = payload
+        self.timeouts = []
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def recv(self, size):
+        payload, self.payload = self.payload, b""
+        return payload
+
+
+@pytest.mark.parametrize("include_deadline", [False, True])
+def test_runtime_wire_deadline_is_optional_and_outside_params(include_deadline):
     from servers.lean_runtime import LeanRuntimeRequestHandler
 
     calls = []
@@ -948,13 +1227,17 @@ def test_runtime_wire_deadline_is_optional_and_outside_params(deadline):
         "method": "repl.run",
         "params": {"project_dir": "/lean", "code": "#check Nat", "timeout": 5},
     }
-    if deadline is not None:
+    deadline = time.monotonic() + 60 if include_deadline else None
+    if include_deadline:
         request["deadline"] = deadline
     handler = object.__new__(LeanRuntimeRequestHandler)
-    handler.rfile = io.BytesIO(json.dumps(request).encode() + b"\n")
+    request_socket = _RuntimeRequestSocket(json.dumps(request).encode() + b"\n")
+    handler.request = request_socket
     handler.wfile = io.BytesIO()
+    services = Services()
+    services.config = SimpleNamespace(rpc_read_timeout=1.0)
     handler.server = SimpleNamespace(
-        services=Services(),
+        services=services,
         request_shutdown=lambda: None,
     )
 
@@ -963,6 +1246,185 @@ def test_runtime_wire_deadline_is_optional_and_outside_params(deadline):
     assert calls == [("repl.run", request["params"], deadline)]
     response = json.loads(handler.wfile.getvalue())
     assert response["ok"] is True
+    assert request_socket.timeouts[-1] > request_socket.timeouts[0]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"v":1,"v":1,"id":"request-id","method":"daemon.ping","params":{}}\n',
+        b'{"v":true,"id":"request-id","method":"daemon.ping","params":{}}\n',
+        b'{"v":1,"id":1,"method":"daemon.ping","params":{}}\n',
+        b'{"v":1,"id":"","method":"daemon.ping","params":{}}\n',
+        b'{"v":1,"id":"request-id","method":"daemon.ping","params":{},"extra":1}\n',
+        b'{"v":1,"id":"request-id","method":"daemon.ping","params":{},"deadline":1}\n',
+        b'{"v":1,"id":"request-id","method":"repl.run","params":{},"deadline":NaN}\n',
+    ],
+)
+def test_runtime_server_rejects_malformed_request_envelopes(raw):
+    from servers.lean_runtime import LeanRuntimeRequestHandler
+
+    class Services:
+        config = SimpleNamespace(rpc_read_timeout=1.0)
+
+        def dispatch(self, *args, **kwargs):
+            pytest.fail("a malformed request must not be dispatched")
+
+    handler = object.__new__(LeanRuntimeRequestHandler)
+    handler.request = _RuntimeRequestSocket(raw)
+    handler.wfile = io.BytesIO()
+    handler.server = SimpleNamespace(
+        services=Services(),
+        request_shutdown=lambda: None,
+    )
+
+    handler.handle()
+
+    response = json.loads(handler.wfile.getvalue())
+    assert response["ok"] is False
+    assert response["error"]["type"] == "ValueError"
+
+
+def test_oversized_repl_result_preserves_unknown_outcome(
+    monkeypatch,
+):
+    from servers import lean_runtime
+
+    class Services:
+        config = SimpleNamespace(rpc_read_timeout=1.0)
+
+        def dispatch(self, method, params, *, client_deadline=None):
+            return "x" * 1_000
+
+    request = {
+        "v": PROTOCOL_VERSION,
+        "id": "request-id",
+        "method": "repl.run",
+        "params": {"project_dir": "/lean", "code": "#check Nat"},
+    }
+    handler = object.__new__(lean_runtime.LeanRuntimeRequestHandler)
+    handler.request = _RuntimeRequestSocket(json.dumps(request).encode() + b"\n")
+    handler.wfile = io.BytesIO()
+    handler.server = SimpleNamespace(
+        services=Services(),
+        request_shutdown=lambda: None,
+    )
+    monkeypatch.setattr(lean_runtime, "MAX_MESSAGE_BYTES", 512)
+
+    handler.handle()
+
+    response = json.loads(handler.wfile.getvalue())
+    assert response["ok"] is True
+    assert "execution outcome unknown" in response["result"]
+    assert "must not be replayed" in response["result"]
+
+
+def test_runtime_server_request_read_rechecks_one_absolute_deadline(monkeypatch):
+    from servers import lean_runtime
+
+    now = [100.0]
+    receives = []
+
+    class DribblingRequest:
+        def settimeout(self, timeout):
+            pass
+
+        def recv(self, size):
+            receives.append(size)
+            now[0] = 101.0
+            return b"{"
+
+    handler = object.__new__(lean_runtime.LeanRuntimeRequestHandler)
+    handler.request = DribblingRequest()
+    handler.server = SimpleNamespace(
+        services=SimpleNamespace(
+            config=SimpleNamespace(rpc_read_timeout=0.5)
+        )
+    )
+    monkeypatch.setattr(lean_runtime.time, "monotonic", lambda: now[0])
+
+    with pytest.raises(TimeoutError, match="read deadline expired"):
+        handler._read_request()
+
+    assert len(receives) == 1
+
+
+def test_runtime_server_resets_write_timeout_after_a_dribbling_request(
+    monkeypatch,
+    caplog,
+):
+    from servers import lean_runtime
+
+    now = [100.0]
+    request = json.dumps(
+        {
+            "v": PROTOCOL_VERSION,
+            "id": "request-id",
+            "method": "daemon.ping",
+            "params": {},
+        }
+    ).encode() + b"\n"
+
+    class DribblingRequest:
+        def __init__(self):
+            self.chunks = [request[:1], request[1:]]
+            self.timeouts = []
+
+        def settimeout(self, timeout):
+            self.timeouts.append(timeout)
+
+        def recv(self, size):
+            chunk = self.chunks.pop(0)
+            if self.chunks:
+                now[0] = 100.99
+            return chunk
+
+    class TimingOutWriter:
+        def __init__(self, request_socket):
+            self.request_socket = request_socket
+            self.response = None
+            self.write_timeout = None
+
+        def write(self, encoded):
+            self.response = json.loads(encoded)
+            self.write_timeout = self.request_socket.timeouts[-1]
+            raise socket.timeout("blocked")
+
+        def flush(self):
+            pytest.fail("flush must not run after a failed write")
+
+    calls = []
+
+    class Services:
+        config = SimpleNamespace(rpc_read_timeout=1.0, response_timeout=900.0)
+
+        def dispatch(self, method, params, *, client_deadline=None):
+            calls.append((method, params, client_deadline))
+            return {"pid": 1}
+
+    request_socket = DribblingRequest()
+    writer = TimingOutWriter(request_socket)
+    handler = object.__new__(lean_runtime.LeanRuntimeRequestHandler)
+    handler.request = request_socket
+    handler.wfile = writer
+    handler.server = SimpleNamespace(
+        services=Services(),
+        request_shutdown=lambda: None,
+    )
+    monkeypatch.setattr(lean_runtime.time, "monotonic", lambda: now[0])
+
+    handler.handle()
+
+    assert calls == [("daemon.ping", {}, None)]
+    assert request_socket.timeouts[-2] == pytest.approx(0.01)
+    assert writer.write_timeout == pytest.approx(lean_runtime.RUNTIME_SAFETY_SECONDS)
+    assert writer.response == {
+        "v": PROTOCOL_VERSION,
+        "id": "request-id",
+        "ok": True,
+        "result": {"pid": 1},
+    }
+    assert "disconnected before receiving" in caplog.text
 
 
 def test_lsp_diagnostic_formatting_remains_stable():
@@ -1063,6 +1525,21 @@ def test_previous_build_shutdown_uses_the_startup_deadline(runtime_dir, monkeypa
 
     assert client._stop_previous_builds(deadline=123.0) == [7]
     assert calls == [("daemon.ping", 123.0), ("stop", 123.0)]
+
+
+def test_build_generation_includes_shared_environment_code(monkeypatch):
+    from servers import lean_client
+
+    environment_module = lean_client.PACKAGE_ROOT / "servers" / "__init__.py"
+
+    def fake_stat(path):
+        return SimpleNamespace(
+            st_mtime_ns=2 if path == environment_module else 1
+        )
+
+    monkeypatch.setattr(lean_client.Path, "stat", fake_stat)
+
+    assert lean_client._build_generation() == 2
 
 
 def test_failed_start_never_hard_kills_a_daemon_that_may_own_work(runtime_dir):
@@ -1388,7 +1865,20 @@ class _RuntimeResponseSocket:
         pass
 
 
-def _runtime_response(client, monkeypatch, response):
+def test_runtime_response_limit_counts_the_frame_delimiter(monkeypatch):
+    from servers import lean_client
+
+    monkeypatch.setattr(lean_client, "MAX_MESSAGE_BYTES", 8)
+    connection = _RuntimeResponseSocket(b"12345678\n")
+
+    with pytest.raises(LeanRuntimeProtocolError, match="message limit"):
+        LeanRuntimeClient._read_line(
+            connection,
+            deadline=time.monotonic() + 1,
+        )
+
+
+def _runtime_response(client, monkeypatch, response, *, method="repl.run"):
     from servers import lean_client
 
     monkeypatch.setattr(lean_client.uuid, "uuid4", lambda: type("UUID", (), {"hex": "request-id"})())
@@ -1397,23 +1887,25 @@ def _runtime_response(client, monkeypatch, response):
         "socket",
         lambda *args: _RuntimeResponseSocket(response),
     )
-    return client.request("repl.run", {"project_dir": "/lean", "code": "#check Nat"})
+    return client.request(method, {"project_dir": "/lean", "code": "#check Nat"})
 
 
 @pytest.mark.parametrize(
-    ("encoded_result", "expected"),
+    ("method", "encoded_result", "expected"),
     [
-        (b"null", None),
-        (b"false", False),
-        (b"0", 0),
-        (b'"value"', "value"),
-        (b"[1,2]", [1, 2]),
-        (b'{"nested":true}', {"nested": True}),
+        ("repl.run", b'"Compiles successfully"', "Compiles successfully"),
+        ("lsp.diagnostics", b'"No diagnostics"', "No diagnostics"),
+        ("lsp.hover", b'"Nat"', "Nat"),
+        ("daemon.ping", b'{"running":true}', {"running": True}),
+        ("daemon.status", b'{"running":true}', {"running": True}),
+        ("daemon.shutdown", b'{"stopping":true}', {"stopping": True}),
+        ("repl.status", b'{"state":"cold"}', {"state": "cold"}),
     ],
 )
-def test_runtime_response_accepts_unconstrained_success_result(
+def test_runtime_response_accepts_declared_method_result(
     runtime_dir,
     monkeypatch,
+    method,
     encoded_result,
     expected,
 ):
@@ -1425,7 +1917,37 @@ def test_runtime_response_accepts_unconstrained_success_result(
         + b"}\n"
     )
 
-    assert _runtime_response(client, monkeypatch, response) == expected
+    assert _runtime_response(client, monkeypatch, response, method=method) == expected
+
+
+@pytest.mark.parametrize(
+    ("method", "encoded_result"),
+    [
+        ("repl.run", b"null"),
+        ("repl.run", b"false"),
+        ("repl.run", b"0"),
+        ("repl.run", b"[1,2]"),
+        ("repl.run", b'{"nested":true}'),
+        ("daemon.ping", b'"running"'),
+    ],
+)
+def test_runtime_response_rejects_wrong_method_result_type(
+    runtime_dir,
+    monkeypatch,
+    method,
+    encoded_result,
+):
+    client = LeanRuntimeClient(socket_path=runtime_dir / "fake.sock")
+    response = (
+        b'{"v":1,"id":"request-id","ok":true,"result":'
+        + encoded_result
+        + b"}\n"
+    )
+
+    with pytest.raises(LeanRuntimeOutcomeUnknown, match="must not be replayed") as caught:
+        _runtime_response(client, monkeypatch, response, method=method)
+
+    assert isinstance(caught.value.__cause__, LeanRuntimeProtocolError)
 
 
 def test_runtime_response_accepts_exact_error_envelope(runtime_dir, monkeypatch):
@@ -1480,6 +2002,15 @@ def test_runtime_response_rejects_malformed_envelopes(
     [
         b'{"v":1,"v":1,"id":"request-id","ok":true,"result":null}\n',
         b'{"v":1,"id":"request-id","ok":true,"result":NaN}\n',
+        b'{"v":1,"id":"request-id","ok":true,"result":1e100000}\n',
+        b'{"v":1,"id":"request-id","ok":true,"result":'
+        + b"9" * 4_301
+        + b"}\n",
+        b'{"v":1,"id":"request-id","ok":true,"result":'
+        + b"[" * 2_000
+        + b"0"
+        + b"]" * 2_000
+        + b"}\n",
     ],
 )
 def test_runtime_response_rejects_noncanonical_json(
@@ -1539,6 +2070,15 @@ def test_response_budget_does_not_scale_with_cold_repl_pool_size(monkeypatch):
 
     assert config.repl_workers_per_project == 3
     assert config.response_timeout == 860
+
+
+def test_client_repl_response_grace_matches_daemon_cleanup_reserve():
+    from servers import lean_client, lean_runtime
+    from servers.repl.pool import DEFAULT_POOL_CLEANUP_SECONDS
+
+    assert lean_client.REPL_RESPONSE_GRACE_SECONDS == (
+        DEFAULT_POOL_CLEANUP_SECONDS + lean_runtime.RUNTIME_SAFETY_SECONDS
+    )
 
 
 def test_response_budget_must_leave_room_for_repl_cleanup(monkeypatch):

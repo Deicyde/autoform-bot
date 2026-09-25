@@ -24,6 +24,14 @@ DEFAULT_STARTUP_STAGGER_SECONDS = 2.0
 DEFAULT_POOL_CLEANUP_SECONDS = DEFAULT_REPL_CLEANUP_SECONDS
 
 
+class ReplPoolBusyError(TimeoutError):
+    """A REPL request expired before any worker could receive it."""
+
+
+class ReplPoolUnavailableError(RuntimeError):
+    """A REPL pool stopped before any worker could receive the request."""
+
+
 @dataclass
 class LeanReplPoolConfig(LeanReplConfig):
     """Configuration for a pool of Lean REPL instances."""
@@ -106,13 +114,18 @@ class LeanReplPool:
     def run(self, code: str, **kwargs: Any) -> dict[str, Any]:
         """Run code on an idle REPL within one queue-and-execution timeout."""
         timeout = kwargs.pop("timeout", None)
+        deadline = kwargs.pop("deadline", None)
         if kwargs:
             names = ", ".join(sorted(kwargs))
             raise TypeError(f"unsupported Lean REPL pool arguments: {names}")
-        deadline = time.monotonic() + timeout if timeout is not None else None
+        if timeout is not None and deadline is not None:
+            raise TypeError("pass timeout or deadline, not both")
+        if deadline is None and timeout is not None:
+            deadline = time.monotonic() + timeout
+        timeout_description = f" after {timeout:g}s" if timeout is not None else ""
         with self._condition:
             if self._shutdown:
-                raise RuntimeError("Lean REPL pool is shut down")
+                raise ReplPoolUnavailableError("Lean REPL pool is shut down")
             self._active_calls += 1
         repl: LeanRepl | None = None
 
@@ -120,10 +133,10 @@ class LeanReplPool:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(
-                        f"timed out after {timeout:g}s waiting for an idle Lean REPL"
+                    raise ReplPoolBusyError(
+                        f"timed out{timeout_description} waiting for an idle Lean REPL"
                     )
-                return repl.run_disposable(code, timeout=remaining)
+                return repl.run_disposable(code, deadline=deadline)
             return repl.run_disposable(code)
 
         result: dict[str, Any] | None = None
@@ -132,13 +145,13 @@ class LeanReplPool:
             while repl is None:
                 with self._condition:
                     if self._shutdown:
-                        raise RuntimeError("Lean REPL pool is shut down")
+                        raise ReplPoolUnavailableError("Lean REPL pool is shut down")
                 wait = 0.1
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError(
-                            f"timed out after {timeout:g}s waiting for an idle Lean REPL"
+                        raise ReplPoolBusyError(
+                            f"timed out{timeout_description} waiting for an idle Lean REPL"
                         )
                     wait = min(wait, remaining)
                 try:
@@ -147,7 +160,7 @@ class LeanReplPool:
                     continue
             with self._condition:
                 if self._shutdown:
-                    raise RuntimeError("Lean REPL pool is shut down")
+                    raise ReplPoolUnavailableError("Lean REPL pool is shut down")
             result = run_once()
         except BaseException as error:
             request_error = error

@@ -198,6 +198,36 @@ def test_pool_reserves_cleanup_time_after_request_deadline(monkeypatch):
         pool.shutdown()
 
 
+def test_pool_forwards_absolute_deadline_without_resetting_it(monkeypatch):
+    now = [100.0]
+    observed = []
+
+    class FakeRepl:
+        def __init__(self, config):
+            pass
+
+        def run_disposable(self, code, **kwargs):
+            now[0] = 104.0
+            observed.append(kwargs)
+            return {"messages": []}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(repl_pool.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
+    pool = repl_pool.LeanReplPool(
+        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+    )
+
+    try:
+        assert pool.run("#check Nat", deadline=105.0) == {"messages": []}
+    finally:
+        pool.shutdown()
+
+    assert observed == [{"deadline": 105.0}]
+
+
 def test_pool_never_requeues_a_worker_that_failed_to_close(monkeypatch):
     workers = []
 

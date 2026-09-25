@@ -67,7 +67,10 @@ class LeanLspSession:
             cwd=self.config.cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            env=clean_lake_environment(self.config.cwd),
+            env=clean_lake_environment(
+                self.config.cwd,
+                require_elan_proxy=self.config.lake_command[0] == "lake",
+            ),
         )
 
         try:
