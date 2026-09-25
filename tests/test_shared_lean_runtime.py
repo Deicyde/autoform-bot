@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 import subprocess
@@ -11,6 +12,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -2407,6 +2409,55 @@ def test_silent_connection_cannot_block_graceful_stop(runtime_dir, monkeypatch):
         silent.close()
         if thread.is_alive():
             thread.join(timeout=3)
+
+
+def test_server_close_waits_for_an_admitted_request(runtime_dir):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingServices:
+        config = SimpleNamespace(max_connections=2, rpc_read_timeout=1.0)
+
+        def dispatch(self, method, params):
+            entered.set()
+            assert release.wait(timeout=2)
+            return {"finished": True}
+
+    socket_path = runtime_dir / "drain.sock"
+    server = lean_runtime.LeanRuntimeServer(socket_path, BlockingServices())
+    serving = threading.Thread(target=server.serve_forever)
+    serving.start()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(2)
+    client.connect(str(socket_path))
+    client.sendall(b'{"v":1,"id":"slow","method":"repl.run","params":{}}\n')
+    assert entered.wait(timeout=1)
+
+    server.shutdown()
+    closing = threading.Thread(target=server.server_close)
+    closing.start()
+    try:
+        closing.join(timeout=0.05)
+        assert closing.is_alive()
+        release.set()
+        response = b""
+        while not response.endswith(b"\n"):
+            response += client.recv(4096)
+        assert json.loads(response) == {
+            "v": PROTOCOL_VERSION,
+            "id": "slow",
+            "ok": True,
+            "result": {"finished": True},
+        }
+        closing.join(timeout=1)
+        serving.join(timeout=1)
+        assert not closing.is_alive()
+        assert not serving.is_alive()
+    finally:
+        release.set()
+        client.close()
+        server.server_close()
+        serving.join(timeout=1)
 
 
 def test_connected_send_failure_is_never_retried(runtime_dir, monkeypatch):
