@@ -392,6 +392,7 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "Autoform's adapter responsible for policy",
         "Test\nthat boundary as a contract",
         "OS-held lifetime fence",
+        "continuously across process handoffs",
         "crash-orphan overlap",
         "first manifest creation",
         "general freshness exception",

@@ -22,8 +22,8 @@ framing, server requests, encoding, and synchronization barriers. Keep
 Autoform's adapter responsible for policy: startup, absolute deadlines,
 ownership, limits, and error translation. Test
 that boundary as a contract; duplicate wire protocol only when necessary.
-Persistent subprocesses need an OS-held lifetime fence that survives owner
-death; daemon cleanup cannot prevent crash-orphan overlap.
+Transfer an OS-held lifetime fence continuously across process handoffs;
+cleanup cannot prevent crash-orphan overlap after ownership gaps.
 Treat Lake's first manifest creation as a narrow startup transition, never a
 general freshness exception.
 
