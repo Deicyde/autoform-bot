@@ -20,11 +20,11 @@ protocol is explicitly stateful. Closing the session that started the runtime
 does not stop it; after a crash, the next tool call starts it again. Runtime
 sockets include a code fingerprint, so an in-place upgrade gracefully replaces
 the older build. The fingerprint includes the packaged server modules, Python
-runtime, and installed dependency closure. Stable daemon-lifetime locks plus
-the released v1 lock names serialize in-place upgrades. A separate shared
-child-lifetime fence is inherited by each Lean launcher and its watchdog, so a
-daemon crash cannot let a replacement start before surviving child groups are
-reaped.
+runtime, and installed dependency closure. Stable lifetime locks, including
+the released v1 lock names, are taken exclusively during startup and retained
+shared by the daemon, every Lean launcher, and its watchdog. Old and new
+clients therefore cannot start a replacement after a daemon crash until its
+surviving child groups are gone.
 
 Lean subprocesses remain lazy. A REPL call stays pending while its fresh child
 starts, and the first LSP call stays pending while its session starts, so no
