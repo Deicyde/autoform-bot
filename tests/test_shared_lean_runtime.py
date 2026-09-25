@@ -1027,6 +1027,38 @@ def test_project_change_during_startup_discards_the_new_resource(tmp_path):
     assert cache.state(str(project)) == "cold"
 
 
+def test_project_change_between_settlement_and_claim_retires_idle_resource(
+    tmp_path, monkeypatch
+):
+    from servers import lean_runtime as lean_runtime_module
+
+    project = make_lake_project(tmp_path, "changed-before-claim")
+    resource = object()
+    closed = []
+    stable = lean_runtime_module.lean_project_fingerprint(project.resolve())
+    fingerprints = iter((stable, stable, stable, object()))
+    monkeypatch.setattr(
+        lean_runtime_module,
+        "lean_project_fingerprint",
+        lambda root: next(fingerprints),
+    )
+    cache = ProjectResourceCache(
+        lambda root: resource,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    with pytest.raises(ProjectResourceBusyError, match="changed during startup"):
+        with cache.lease(str(project)):
+            pytest.fail("changed project must not reach the request")
+
+    assert closed == [resource]
+    assert cache.state(str(project)) == "cold"
+    cache.close()
+
+
 def test_required_project_fingerprint_rejects_pre_start_change(tmp_path):
     from servers import lean_project_fingerprint
 

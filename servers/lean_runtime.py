@@ -956,10 +956,18 @@ class ProjectResourceCache(Generic[T]):
         except OSError:
             current_fingerprint = None
         if current_fingerprint != fingerprint:
-            self.invalidate(str(root), resource)
-            raise ProjectResourceBusyError(
+            error = ProjectResourceBusyError(
                 f"shared Lean project changed during startup: {root}"
             )
+            try:
+                self._invalidate_and_retire_if_idle(
+                    root,
+                    resource,
+                    deadline=deadline,
+                )
+            except BaseException as cleanup_error:
+                self._add_cleanup_note(error, cleanup_error)
+            raise error
 
         try:
             with self._condition:
@@ -994,6 +1002,27 @@ class ProjectResourceCache(Generic[T]):
                 except BaseException as cleanup_error:
                     self._add_cleanup_note(error, cleanup_error)
             raise error.with_traceback(error.__traceback__)
+
+    def _invalidate_and_retire_if_idle(
+        self,
+        root: Path,
+        resource: T,
+        *,
+        deadline: float | None,
+    ) -> None:
+        retirement: tuple[Path, T] | None = None
+        with self._condition:
+            entry = self._entries.get(root)
+            if entry is None or entry.resource is not resource:
+                return
+            entry.invalid = True
+            if not entry.active:
+                self._entries.pop(root)
+                self._retiring[root] = resource
+                retirement = (root, resource)
+            self._condition.notify_all()
+        if retirement is not None:
+            self._retire_until_deadline(*retirement, deadline=deadline)
 
     @staticmethod
     def _add_cleanup_note(error: BaseException, cleanup_error: BaseException) -> None:
