@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import select
@@ -255,6 +256,28 @@ def test_malformed_body_response_is_not_retried(monkeypatch, raw_response):
     assert retired == [True]
 
 
+def test_env_scoped_malformed_response_reports_the_lost_environment(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+    process = object()
+    repl.process = process
+    retired = []
+    monkeypatch.setattr(repl, "is_alive", lambda: True)
+    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+    monkeypatch.setattr(repl, "_run", lambda code, env_id, timeout: {})
+    monkeypatch.setattr(repl, "close", lambda: retired.append(True))
+
+    with pytest.raises(repl_core.ReplProcessRestarted) as error:
+        repl.run("#check Nat", env_id=7, timeout=1)
+
+    assert isinstance(error.value.__cause__, repl_core.ReplProtocolError)
+    assert retired == [True]
+
+
 @pytest.mark.parametrize("raw_response", [[], {"sorries": [{"goal": "False"}]}])
 def test_malformed_backlog_response_is_reported_as_unknown(
     monkeypatch, raw_response
@@ -468,6 +491,28 @@ def test_response_timeout_after_full_write_is_not_retried(monkeypatch):
     assert repl.process is None
 
 
+@pytest.mark.parametrize("request_sent", [False, True])
+def test_run_closes_and_reraises_cancellation(monkeypatch, request_sent):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    repl.process = object()
+    retired = []
+
+    def cancel(code, env_id, timeout, mark_sent):
+        if request_sent:
+            mark_sent()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(repl, "_run_io", cancel)
+    monkeypatch.setattr(repl, "close", lambda: retired.append(True))
+
+    with pytest.raises(asyncio.CancelledError):
+        repl._run("#check Nat", env_id=None, timeout=1)
+
+    assert retired == [True]
+
+
 def test_wire_protocol_accepts_response_split_across_reads(monkeypatch):
     with ExitStack() as stack:
         process = _PipeProcess(stack, [b'{"messages":', b" []}\n", b"\n"])
@@ -478,6 +523,63 @@ def test_wire_protocol_accepts_response_split_across_reads(monkeypatch):
 
         request = process._stdin_read.read(4096)
         assert json.loads(request.decode().strip()) == {"cmd": "#check Nat", "env": 3}
+
+
+def test_wire_protocol_rechecks_deadline_before_dispatch_delimiter(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [])
+        repl = _repl_with_process(process)
+        now = 0.0
+        write_waits = 0
+        sent = []
+
+        def fake_select(readable, writable, exceptional, timeout=None):
+            nonlocal now, write_waits
+            if writable:
+                write_waits += 1
+                if write_waits == 2:
+                    now = 2.0
+                return [], writable, []
+            return [], [], []
+
+        monkeypatch.setattr(repl_core.select, "select", fake_select)
+        monkeypatch.setattr(repl_core.time, "monotonic", lambda: now)
+
+        with pytest.raises(TimeoutError, match="while writing"):
+            repl._run_io(
+                "#check Nat",
+                env_id=None,
+                timeout=1,
+                mark_sent=lambda: sent.append(True),
+            )
+
+        request = os.read(process._stdin_read.fileno(), 4096)
+        assert request.endswith(b"\n") and not request.endswith(b"\n\n")
+        assert sent == []
+
+
+def test_final_delimiter_write_failure_has_unknown_outcome(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [])
+        repl = _repl_with_process(process)
+        real_write = repl_core.os.write
+        retired = []
+
+        def fail_final_delimiter(fd: int, data) -> int:
+            if fd == process.stdin.fileno() and bytes(data) == b"\n":
+                raise OSError("ambiguous delimiter write")
+            return real_write(fd, data)
+
+        monkeypatch.setattr(repl_core.os, "write", fail_final_delimiter)
+        monkeypatch.setattr(repl_core.select, "select", lambda r, w, x, timeout=None: ([], w, []))
+        monkeypatch.setattr(repl, "close", lambda: retired.append(True))
+
+        with pytest.raises(repl_core.ReplOutcomeUnknown, match="fully sent"):
+            repl._run("#check Nat", env_id=None, timeout=1)
+
+        request = os.read(process._stdin_read.fileno(), 4096)
+        assert request.endswith(b"\n") and not request.endswith(b"\n\n")
+        assert retired == [True]
 
 
 def test_wire_protocol_retires_process_on_unsolicited_second_frame(monkeypatch):
@@ -564,8 +666,8 @@ def test_wire_protocol_preserves_utf8_split_across_reads(monkeypatch):
     assert result["messages"][0]["data"] == "Nat → Nat"
 
 
-def test_wire_protocol_reports_complete_stderr_on_premature_eof(monkeypatch):
-    stderr = (b"x" * 5000) + b"lean crashed"
+def test_wire_protocol_reports_a_bounded_stderr_tail_on_premature_eof(monkeypatch):
+    stderr = b"discarded-prefix" + (b"x" * 5000) + b"lean crashed"
     with ExitStack() as stack:
         process = _PipeProcess(stack, [b""], stderr=stderr)
         repl = _repl_with_process(process, max_buffer_bytes=len(stderr))
@@ -574,7 +676,8 @@ def test_wire_protocol_reports_complete_stderr_on_premature_eof(monkeypatch):
         with pytest.raises(repl_core.ReplOutcomeUnknown) as error:
             repl._run("#check Nat", env_id=None, timeout=1)
 
-    assert str(error.value).endswith(stderr.decode())
+    assert str(error.value).endswith(stderr[-repl_core._STDERR_TAIL_BYTES :].decode())
+    assert "discarded-prefix" not in str(error.value)
 
 
 def test_wire_protocol_services_stdout_while_stderr_remains_readable(monkeypatch):
@@ -716,6 +819,61 @@ def test_wire_protocol_retires_a_process_with_closed_stderr_before_writing():
         assert repl.process is None
 
 
+def test_stdout_eof_keeps_only_a_fixed_stderr_tail(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(
+            stack,
+            [b""],
+            stderr=b"a" * 100 + b"b" * repl_core._STDERR_TAIL_BYTES,
+        )
+        repl = _repl_with_process(
+            process,
+            chunk_size=512,
+            max_buffer_bytes=1024,
+        )
+        _patch_pipe_reads(monkeypatch, process)
+
+        with pytest.raises(repl_core.ReplProcessExited) as error:
+            repl._run_io("#check Nat", env_id=None, timeout=1, mark_sent=lambda: None)
+
+        assert len(repl._stderr_tail) == repl_core._STDERR_TAIL_BYTES
+        assert bytes(repl._stderr_tail) == b"b" * repl_core._STDERR_TAIL_BYTES
+        assert "a" * 100 not in str(error.value)
+
+
+def test_stdout_eof_takes_one_final_stderr_read_after_deadline(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b""])
+        repl = _repl_with_process(process, chunk_size=8)
+        now = 0.0
+        stderr_reads = 0
+        real_read = repl_core.os.read
+
+        def fake_read(fd: int, size: int) -> bytes:
+            nonlocal now, stderr_reads
+            if fd == process.stdout.fileno():
+                now = 2.0
+                return b""
+            if fd == process.stderr.fileno():
+                stderr_reads += 1
+                return b"diagnost"[:size]
+            return real_read(fd, size)
+
+        def fake_select(readable, writable, exceptional, timeout=None):
+            if writable:
+                return [], writable, []
+            return [process.stderr.fileno(), process.stdout.fileno()], [], []
+
+        monkeypatch.setattr(repl_core.os, "read", fake_read)
+        monkeypatch.setattr(repl_core.time, "monotonic", lambda: now)
+        monkeypatch.setattr(repl_core.select, "select", fake_select)
+
+        with pytest.raises(repl_core.ReplProcessExited, match="diagnostdiagnost"):
+            repl._run_io("#check Nat", env_id=None, timeout=1, mark_sent=lambda: None)
+
+        assert stderr_reads == 2
+
+
 def test_wire_protocol_drains_queued_stderr_after_the_response_frame_completes(monkeypatch):
     # One stdout read completes the frame while stderr still holds several chunks.
     with ExitStack() as stack:
@@ -791,7 +949,7 @@ def test_wire_protocol_keeps_the_response_when_the_deadline_ends_the_stderr_drai
 
         def fake_monotonic() -> float:
             nonlocal now
-            now += 0.25
+            now += 0.125
             return now
 
         monkeypatch.setattr(repl_core.os, "read", fake_read)

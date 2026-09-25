@@ -30,6 +30,11 @@ uv run autoform-lean-runtime stop
 `stop` is graceful: it waits for admitted tool calls and Lean children to
 finish shutting down before a subsequent `start` can replace the runtime.
 
+REPL transport retries are limited to failures detected before the complete
+request frame is dispatched. Once the final frame delimiter may have reached
+Lean, replay could execute the command twice, so Autoform retires the process
+and reports that the outcome is unknown instead of retrying.
+
 The private socket lives below `$XDG_RUNTIME_DIR/autoform`, falling back to a
 uid-specific directory in `/tmp`; the rotating runtime log is beside it.
 `AUTOFORM_RUNTIME_DIR` overrides that location. Node-wide limits are controlled

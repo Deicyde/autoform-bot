@@ -26,6 +26,7 @@ DEFAULT_REPL_STARTUP_TIMEOUT = 180.0
 ALLOWED_IMPORTS = frozenset({"Mathlib", "Aesop", "Batteries", "LeanSearchClient"})
 WARMUP_IMPORTS = frozenset({"Mathlib"})
 _VALID_DIAGNOSTIC_SEVERITIES = frozenset({"trace", "info", "warning", "error"})
+_STDERR_TAIL_BYTES = 200
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +636,8 @@ class LeanRepl:
                 except ReplProtocolError as e:
                     logger.error("%s", e)
                     self.close()
+                    if run_from_env:
+                        raise ReplProcessRestarted(str(e)) from e
                     return {"repl_error": str(e), "outcome_unknown": True}
                 except ReplProcessExited as e:
                     last_exception = e
@@ -704,6 +707,9 @@ class LeanRepl:
                     f"{error}"
                 ) from error
             raise
+        except BaseException:
+            self.close()
+            raise
 
     def _run_io(
         self,
@@ -742,7 +748,7 @@ class LeanRepl:
 
         def stderr_details() -> tuple[int, str]:
             stderr_bytes = self._stderr_bytes
-            stderr_tail = bytes(self._stderr_tail[-200:]).decode("utf-8", errors="replace")
+            stderr_tail = bytes(self._stderr_tail).decode("utf-8", errors="replace")
             return stderr_bytes, stderr_tail
 
         def raise_unknown_stderr_outcome() -> None:
@@ -833,15 +839,13 @@ class LeanRepl:
                     stderr_poison_reason = "stderr closed unexpectedly"
                     return False
                 self._stderr_bytes += len(chunk)
-                tail_limit = max(0, max_buffer)
-                if tail_limit:
-                    if len(chunk) >= tail_limit:
-                        self._stderr_tail[:] = chunk[-tail_limit:]
-                    else:
-                        overflow = len(self._stderr_tail) + len(chunk) - tail_limit
-                        if overflow > 0:
-                            del self._stderr_tail[:overflow]
-                        self._stderr_tail.extend(chunk)
+                if len(chunk) >= _STDERR_TAIL_BYTES:
+                    self._stderr_tail[:] = chunk[-_STDERR_TAIL_BYTES:]
+                else:
+                    overflow = len(self._stderr_tail) + len(chunk) - _STDERR_TAIL_BYTES
+                    if overflow > 0:
+                        del self._stderr_tail[:overflow]
+                    self._stderr_tail.extend(chunk)
                 reads += 1
                 logger.debug(
                     "Lean REPL stderr: %s",
@@ -900,6 +904,18 @@ class LeanRepl:
                 reject_unsolicited_stdout()
             if stdin_fd not in writable:
                 continue
+            dispatching = payload_index == len(payloads) - 1
+            if dispatching:
+                remaining = end_time - time.monotonic()
+                if remaining <= 0:
+                    if stderr_poison_reason is not None:
+                        retire_before_request()
+                    raise TimeoutError(
+                        f"REPL command timed out after {timeout} seconds while writing"
+                    )
+                # Once writing the final delimiter is attempted, the REPL may
+                # dispatch the request even if the write reports an error.
+                mark_sent()
             try:
                 written = os.write(stdin_fd, payload[offset:])
             except BlockingIOError:
@@ -916,8 +932,6 @@ class LeanRepl:
                 if payload_index < len(payloads):
                     payload = payloads[payload_index]
                     offset = 0
-
-        mark_sent()
         while True:
             remaining = end_time - time.monotonic()
             if remaining <= 0:
@@ -946,7 +960,9 @@ class LeanRepl:
                     continue
                 if not chunk:
                     if stderr_open:
-                        drain_stderr()
+                        # Capture one final diagnostic chunk without waiting past
+                        # the command deadline or spinning on a noisy process.
+                        drain_stderr(max_reads=1)
                     if stderr_poison_reason is not None:
                         raise_unknown_stderr_outcome()
                     stderr_text = self._stderr_tail.decode("utf-8", errors="replace")
@@ -981,8 +997,7 @@ class LeanRepl:
                     break
 
         if not stderr_drained:
-            stderr_bytes = self._stderr_bytes
-            stderr_tail = bytes(self._stderr_tail[-200:]).decode("utf-8", errors="replace")
+            stderr_bytes, stderr_tail = stderr_details()
             stderr_reason = stderr_poison_reason or "stderr could not be drained"
             # stderr is accounted to the process generation, never to whichever
             # command happened to observe it. Once that generation exceeds its
