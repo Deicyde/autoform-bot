@@ -122,10 +122,9 @@ def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path):
 
         assert first == second == "Compiles successfully"
         assert len(pools) == 1
-        assert pools[0].calls == [
-            ("#check Nat", {"timeout": 30.0}),
-            ("#check Int", {"timeout": 3.0}),
-        ]
+        assert [call[0] for call in pools[0].calls] == ["#check Nat", "#check Int"]
+        assert 0 < pools[0].calls[0][1]["timeout"] <= 30.0
+        assert 0 < pools[0].calls[1][1]["timeout"] <= 3.0
         warm = services.dispatch("repl.status", {"project_dir": str(project)})
         assert warm["state"] == "warm"
         assert warm["memory_usage_gb"] == 0.25
@@ -311,6 +310,55 @@ def test_project_startup_that_misses_its_budget_is_discarded(tmp_path):
 
     assert closed == [project.resolve()]
     assert cache.state(str(project)) == "cold"
+    cache.close()
+
+
+def test_project_change_during_startup_discards_the_new_resource(tmp_path):
+    project = make_lake_project(tmp_path, "changed-startup")
+    resource = object()
+    closed = []
+
+    def factory(root):
+        (root / "lakefile.toml").write_text('[package]\nname = "Changed"\n')
+        return resource
+
+    cache = ProjectResourceCache(
+        factory,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    with pytest.raises(ProjectResourceBusyError, match="changed during startup"):
+        with cache.lease(str(project)):
+            pytest.fail("changed project must not publish its resource")
+
+    assert closed == [resource]
+    assert cache.state(str(project)) == "cold"
+    cache.close()
+
+
+def test_required_project_fingerprint_rejects_pre_start_change(tmp_path):
+    from servers import lean_project_fingerprint
+
+    project = make_lake_project(tmp_path, "required-fingerprint")
+    expected = lean_project_fingerprint(project.resolve())
+    (project / "lakefile.toml").write_text('[package]\nname = "Changed"\n')
+    created = []
+    cache = ProjectResourceCache(
+        lambda root: created.append(root) or root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    with pytest.raises(ProjectResourceBusyError, match="changed after validation"):
+        with cache.lease(str(project), required_fingerprint=expected):
+            pytest.fail("changed project must not reach its factory")
+
+    assert created == []
     cache.close()
 
 
@@ -1029,12 +1077,12 @@ def test_per_project_workers_cannot_exceed_node_budget(monkeypatch):
 def test_response_budget_does_not_scale_with_cold_repl_pool_size(monkeypatch):
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "3")
     monkeypatch.setenv("AUTOFORM_REPL_WORKERS_PER_PROJECT", "3")
-    monkeypatch.setenv("AUTOFORM_RUNTIME_RESPONSE_TIMEOUT", "860")
+    monkeypatch.setenv("AUTOFORM_RUNTIME_RESPONSE_TIMEOUT", "900")
 
     config = LeanRuntimeConfig.from_environment()
 
     assert config.repl_workers_per_project == 3
-    assert config.response_timeout == 860
+    assert config.response_timeout == 900
 
 
 def test_response_budget_must_leave_room_for_repl_cleanup(monkeypatch):

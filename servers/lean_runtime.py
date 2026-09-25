@@ -65,7 +65,7 @@ T = TypeVar("T")
 
 DEFAULT_MAX_PROJECTS = 4
 DEFAULT_IDLE_SECONDS = 30 * 60
-DEFAULT_LSP_TIMEOUT = 60.0
+DEFAULT_LSP_TIMEOUT = 180.0
 DEFAULT_MAX_LSP_REQUEST_SECONDS = 600.0
 DEFAULT_REPL_REQUEST_TIMEOUT = 180.0
 DEFAULT_MAX_REPL_REQUEST_SECONDS = 240.0
@@ -77,7 +77,7 @@ MAX_TERMINAL_CLEANUP_RETRY_SECONDS = 1.0
 # Conservative bounds for cleanup/startup work that surrounds one LSP call.
 # They keep the daemon's work inside the client's response deadline even when
 # an inactive project must be replaced first.
-LSP_STARTUP_BUDGET = 60.0
+LSP_STARTUP_BUDGET = 180.0
 LSP_CLOSE_BUDGET = 65.0
 
 
@@ -325,15 +325,21 @@ class ProjectResourceCache(Generic[T]):
         *,
         create: bool = True,
         acquisition_timeout: float | None = None,
+        deadline: float | None = None,
         creation_budget: float = 0.0,
+        required_fingerprint: ProjectFingerprint | None = None,
     ) -> Iterator[T | None]:
         """Keep a project resource alive for the complete operation."""
+        if deadline is not None and acquisition_timeout is not None:
+            raise TypeError("pass acquisition_timeout or deadline, not both")
         root = resolve_lean_project_dir(project_dir)
         resource = self._acquire(
             root,
             create=create,
             acquisition_timeout=acquisition_timeout,
+            deadline=deadline,
             creation_budget=creation_budget,
+            required_fingerprint=required_fingerprint,
         )
         operation_error: BaseException | None = None
         try:
@@ -517,7 +523,9 @@ class ProjectResourceCache(Generic[T]):
         *,
         create: bool,
         acquisition_timeout: float | None,
+        deadline: float | None,
         creation_budget: float,
+        required_fingerprint: ProjectFingerprint | None,
     ) -> T | None:
         if acquisition_timeout is not None and acquisition_timeout <= 0:
             raise ProjectResourceBusyError(
@@ -525,15 +533,32 @@ class ProjectResourceCache(Generic[T]):
             )
         if creation_budget < 0:
             raise ValueError("creation_budget must be nonnegative")
-        fingerprint = lean_project_fingerprint(root)
-        deadline = (
-            self._clock() + acquisition_timeout
-            if acquisition_timeout is not None
-            else None
-        )
+        if deadline is None and acquisition_timeout is not None:
+            deadline = self._clock() + acquisition_timeout
         while True:
+            if deadline is not None and self._clock() >= deadline:
+                raise ProjectResourceBusyError(
+                    "timed out waiting for a shared Lean project slot because the "
+                    f"response budget expired: {root}"
+                )
+            try:
+                fingerprint = lean_project_fingerprint(root)
+            except OSError as error:
+                if required_fingerprint is not None:
+                    raise ProjectResourceBusyError(
+                        f"shared Lean project changed after validation: {root}"
+                    ) from error
+                raise
+            if (
+                required_fingerprint is not None
+                and fingerprint != required_fingerprint
+            ):
+                raise ProjectResourceBusyError(
+                    f"shared Lean project changed after validation: {root}"
+                )
             wait = False
             retirement: tuple[Path, T] | None = None
+            candidate: T | None = None
             with self._condition:
                 if self._closed:
                     raise RuntimeError("project resource cache is closed")
@@ -596,15 +621,26 @@ class ProjectResourceCache(Generic[T]):
                         )
                     entry.active += 1
                     entry.last_used = self._clock()
-                    return entry.resource
+                    candidate = entry.resource
 
-                if retirement is None and not wait and entry is None and not create:
+                if (
+                    candidate is None
+                    and retirement is None
+                    and not wait
+                    and entry is None
+                    and not create
+                ):
                     return None
 
-                if retirement is None and not wait and root in self._creating:
+                if (
+                    candidate is None
+                    and retirement is None
+                    and not wait
+                    and root in self._creating
+                ):
                     wait = True
 
-                if retirement is None and not wait:
+                if candidate is None and retirement is None and not wait:
                     self._require_creation_budget(
                         root,
                         deadline=deadline,
@@ -645,12 +681,12 @@ class ProjectResourceCache(Generic[T]):
                         else:
                             wait = True
 
-                if retirement is None and not wait:
+                if candidate is None and retirement is None and not wait:
                     self._creating.add(root)
                     self._condition.notify_all()
                     break
 
-                if retirement is None:
+                if candidate is None and retirement is None:
                     wait_seconds = 0.5
                     if deadline is not None:
                         remaining = deadline - self._clock()
@@ -661,6 +697,25 @@ class ProjectResourceCache(Generic[T]):
                         wait_seconds = min(wait_seconds, remaining)
                     self._condition.wait(timeout=wait_seconds)
 
+            if candidate is not None:
+                try:
+                    current_fingerprint = lean_project_fingerprint(root)
+                except OSError as error:
+                    self.invalidate(str(root), candidate)
+                    self._release(root, candidate)
+                    raise ProjectResourceBusyError(
+                        f"shared Lean project changed after validation: {root}"
+                    ) from error
+                if current_fingerprint == fingerprint:
+                    return candidate
+                self.invalidate(str(root), candidate)
+                self._release(root, candidate)
+                if required_fingerprint is not None:
+                    raise ProjectResourceBusyError(
+                        f"shared Lean project changed after validation: {root}"
+                    )
+                continue
+
             if retirement is not None:
                 retiring_root, retiring_resource = retirement
                 if not self._retire(retiring_root, retiring_resource):
@@ -670,6 +725,11 @@ class ProjectResourceCache(Generic[T]):
                     )
 
         try:
+            current_fingerprint = lean_project_fingerprint(root)
+            if current_fingerprint != fingerprint:
+                raise ProjectResourceBusyError(
+                    f"shared Lean project changed before startup: {root}"
+                )
             created = self._factory(root)
         except BaseException:
             with self._condition:
@@ -677,11 +737,18 @@ class ProjectResourceCache(Generic[T]):
                 self._condition.notify_all()
             raise
 
+        try:
+            current_fingerprint = lean_project_fingerprint(root)
+        except OSError:
+            current_fingerprint = None
         close_created = False
         startup_expired = False
+        project_changed = current_fingerprint != fingerprint
         with self._condition:
             self._creating.discard(root)
             if self._closed:
+                close_created = True
+            elif project_changed:
                 close_created = True
             elif deadline is not None and self._clock() >= deadline:
                 close_created = True
@@ -706,6 +773,10 @@ class ProjectResourceCache(Generic[T]):
             if startup_expired:
                 raise ProjectResourceBusyError(
                     f"shared Lean project startup exceeded its response budget: {root}"
+                )
+            if project_changed:
+                raise ProjectResourceBusyError(
+                    f"shared Lean project changed during startup: {root}"
                 )
             raise RuntimeError("project resource cache closed during startup")
         return created
@@ -868,13 +939,20 @@ class LeanRuntimeServices:
                     "timeout exceeds the node-wide limit of "
                     f"{self.config.max_repl_request_seconds:g} seconds"
                 )
+            deadline = time.monotonic() + effective_timeout
+            root = resolve_lean_project_dir(project_dir)
             with self.repl_projects.lease(
-                project_dir,
-                acquisition_timeout=self._acquisition_timeout(effective_timeout),
-                creation_budget=DEFAULT_POOL_CLEANUP_SECONDS,
+                str(root),
+                deadline=deadline,
+                creation_budget=0,
             ) as pool:
                 assert pool is not None
-                return format_repl_response(pool.run(code, timeout=effective_timeout))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProjectResourceBusyError(
+                        f"Lean REPL request budget expired before execution: {root}"
+                    )
+                return format_repl_response(pool.run(code, timeout=remaining))
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")
             with self.repl_projects.inspect(project_dir) as pool:
@@ -907,14 +985,20 @@ class LeanRuntimeServices:
             project_dir = self._string_param(params, "project_dir")
             file_path = self._string_param(params, "file_path")
             root, path = resolve_lean_file(project_dir, file_path)
+            fingerprint = lean_project_fingerprint(root)
+            file_fingerprint = self._lsp_file_fingerprint(path)
             with self.lsp_projects.lease(
                 str(root),
                 acquisition_timeout=self._acquisition_timeout(self.config.lsp_timeout),
                 creation_budget=self.lsp_creation_budget,
+                required_fingerprint=fingerprint,
             ) as session:
                 assert session is not None
                 try:
                     diagnostics = session.get_diagnostics(str(path))
+                    self._require_lsp_fingerprint(
+                        root, path, fingerprint, file_fingerprint
+                    )
                 except LspBusyError:
                     raise
                 except (LspProtocolError, TimeoutError, OSError):
@@ -930,14 +1014,20 @@ class LeanRuntimeServices:
             if line < 0 or character < 0:
                 raise ValueError("line and character must be nonnegative")
             root, path = resolve_lean_file(project_dir, file_path)
+            fingerprint = lean_project_fingerprint(root)
+            file_fingerprint = self._lsp_file_fingerprint(path)
             with self.lsp_projects.lease(
                 str(root),
                 acquisition_timeout=self._acquisition_timeout(self.config.lsp_timeout),
                 creation_budget=self.lsp_creation_budget,
+                required_fingerprint=fingerprint,
             ) as session:
                 assert session is not None
                 try:
                     result = session.hover(str(path), line, character)
+                    self._require_lsp_fingerprint(
+                        root, path, fingerprint, file_fingerprint
+                    )
                 except LspBusyError:
                     raise
                 except (LspProtocolError, TimeoutError, OSError):
@@ -946,6 +1036,37 @@ class LeanRuntimeServices:
                     raise
             return result or "No hover information at this position."
         raise ValueError(f"unknown Lean runtime method: {method}")
+
+    @staticmethod
+    def _require_lsp_fingerprint(
+        root: Path,
+        path: Path,
+        expected_project: ProjectFingerprint,
+        expected_file: tuple[int, int, int, int, int, int],
+    ) -> None:
+        try:
+            current_project = lean_project_fingerprint(root)
+            current_file = LeanRuntimeServices._lsp_file_fingerprint(path)
+        except OSError as error:
+            raise ProjectResourceBusyError(
+                f"shared Lean project or target changed during LSP request: {root}"
+            ) from error
+        if current_project != expected_project or current_file != expected_file:
+            raise ProjectResourceBusyError(
+                f"shared Lean project or target changed during LSP request: {root}"
+            )
+
+    @staticmethod
+    def _lsp_file_fingerprint(path: Path) -> tuple[int, int, int, int, int, int]:
+        info = path.stat()
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
 
     def status(self, *, include_projects: bool) -> dict[str, Any]:
         result: dict[str, Any] = {
