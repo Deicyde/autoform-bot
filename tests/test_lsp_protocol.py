@@ -133,6 +133,110 @@ def test_start_configures_pinned_client_and_supervised_command(fake_session) -> 
     assert session.is_alive()
 
 
+def test_expired_start_deadline_does_not_create_client_or_event_loop(
+    tmp_path: Path,
+) -> None:
+    created = []
+
+    def client_factory(**kwargs):
+        created.append(kwargs)
+        return _FakeAsyncClient(**kwargs)
+
+    session = lsp.LeanLspSession(
+        lsp.LspConfig(cwd=str(tmp_path), timeout=1),
+        client_factory=client_factory,
+    )
+
+    with pytest.raises(lsp.LspBusyError, match="before startup admission"):
+        session.start(deadline=time.monotonic() - 1)
+
+    assert created == []
+    assert session._client is None
+    assert session._loop is None
+
+
+def test_start_lifecycle_admission_uses_explicit_deadline(tmp_path: Path) -> None:
+    created = []
+
+    def client_factory(**kwargs):
+        created.append(kwargs)
+        return _FakeAsyncClient(**kwargs)
+
+    session = lsp.LeanLspSession(
+        lsp.LspConfig(cwd=str(tmp_path), timeout=10),
+        client_factory=client_factory,
+    )
+    session._lifecycle_lock.acquire()
+    started = time.monotonic()
+    try:
+        with pytest.raises(lsp.LspBusyError, match="waiting to start the session"):
+            session.start(deadline=time.monotonic() + 0.01)
+    finally:
+        session._lifecycle_lock.release()
+
+    assert time.monotonic() - started < 1
+    assert created == []
+    assert session._loop is None
+
+
+def test_start_rechecks_deadline_after_lifecycle_admission(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    now = [100.0]
+
+    class AdvancingLock:
+        def acquire(self, *, timeout):
+            now[0] = 102.0
+            return True
+
+        def release(self):
+            pass
+
+    session = lsp.LeanLspSession(lsp.LspConfig(cwd=str(tmp_path), timeout=10))
+    session._lifecycle_lock = AdvancingLock()
+    monkeypatch.setattr(lsp.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        session,
+        "_start_loop",
+        lambda deadline: pytest.fail("expired startup must not create an event loop"),
+    )
+
+    with pytest.raises(lsp.LspBusyError, match="after startup admission"):
+        session.start(deadline=101.0)
+
+
+def test_start_rejects_identity_published_after_deadline(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    now = [100.0]
+    session = lsp.LeanLspSession(
+        lsp.LspConfig(cwd=str(tmp_path), timeout=10),
+        client_factory=_FakeAsyncClient,
+    )
+
+    def read_identity():
+        now[0] = 102.0
+        return 999_999_999
+
+    monkeypatch.setattr(lsp.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(session, "_read_process_identity", read_identity)
+    monkeypatch.setattr(
+        session,
+        "_process_group_has_live_members",
+        lambda process_group_id: bool(session._client and session._client.alive),
+    )
+
+    with pytest.raises(TimeoutError, match="exceeded its deadline"):
+        session.start(deadline=101.0)
+
+    assert session._client is None
+    assert session._loop is None
+    assert session._process_group_id is None
+    assert session._identity_path is None
+
+
 def test_lsp_backend_import_keeps_fastmcp_lazy(tmp_path: Path) -> None:
     result = subprocess.run(
         [
@@ -466,6 +570,76 @@ def test_lsp_queue_wait_is_bounded_by_session_timeout(fake_session) -> None:
             session.hover(str(source), 0, 0)
     finally:
         session._operation_lock.release()
+
+
+def test_lsp_queue_wait_is_bounded_by_explicit_deadline(fake_session) -> None:
+    session, source, _ = fake_session
+    session.config.timeout = 10
+    session._operation_lock.acquire()
+    started = time.monotonic()
+    try:
+        with pytest.raises(lsp.LspBusyError, match="waiting for the Lean LSP session"):
+            session.hover(
+                str(source),
+                0,
+                0,
+                deadline=time.monotonic() + 0.01,
+            )
+    finally:
+        session._operation_lock.release()
+
+    assert time.monotonic() - started < 1
+
+
+def test_expired_deadline_after_admission_does_not_invoke_leanclient(
+    fake_session,
+    monkeypatch,
+) -> None:
+    session, source, client = fake_session
+    remaining = iter([1.0, 1.0, TimeoutError("expired")])
+
+    def next_remaining(deadline: float) -> float:
+        result = next(remaining)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(session, "_remaining", next_remaining)
+
+    with pytest.raises(lsp.LspBusyError, match="before running Lean LSP operation"):
+        session.get_diagnostics(str(source), deadline=123.0)
+
+    assert [call[0] for call in client.calls] == ["start"]
+    assert session.is_alive()
+
+
+def test_explicit_deadline_is_shared_by_admission_and_client_calls(
+    fake_session,
+    monkeypatch,
+) -> None:
+    session, source, client = fake_session
+    observed_deadlines = []
+    remaining = iter([9.0, 8.0, 7.0, 6.0, 5.0])
+
+    def next_remaining(deadline: float) -> float:
+        observed_deadlines.append(deadline)
+        return next(remaining)
+
+    submitted_timeouts = []
+    original_submit = session._submit
+
+    def submit(awaitable, timeout: float, operation: str):
+        submitted_timeouts.append((timeout, operation))
+        return original_submit(awaitable, timeout, operation)
+
+    monkeypatch.setattr(session, "_remaining", next_remaining)
+    monkeypatch.setattr(session, "_submit", submit)
+
+    assert session.get_diagnostics(str(source), deadline=123.0) == client.diagnostic_items
+
+    assert observed_deadlines == [123.0] * 5
+    assert submitted_timeouts == [(7.0, "running Lean LSP operation")]
+    assert client.calls[2] == ("diagnostics", "Main.lean", True, 5.0)
 
 
 def test_leanclient_failure_poisons_session_before_next_operation(fake_session) -> None:

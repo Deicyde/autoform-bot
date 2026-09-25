@@ -100,13 +100,31 @@ class LeanLspSession:
         self._process_group_id: int | None = None
         self._identity_path: Path | None = None
 
-    def start(self) -> None:
-        """Start leanclient and verify the supervised Lean process identity."""
-        with self._lifecycle_lock:
+    def start(self, *, deadline: float | None = None) -> None:
+        """Start leanclient before an optional absolute monotonic deadline."""
+        deadline = self._deadline_or_default(deadline)
+        try:
+            remaining = self._remaining(deadline)
+        except TimeoutError as error:
+            raise LspBusyError(
+                "Lean LSP deadline expired before startup admission"
+            ) from error
+        if not self._lifecycle_lock.acquire(timeout=remaining):
+            raise LspBusyError(
+                "Lean LSP deadline expired while waiting to start the session"
+            )
+        try:
+            try:
+                self._remaining(deadline)
+            except TimeoutError as error:
+                raise LspBusyError(
+                    "Lean LSP deadline expired after startup admission"
+                ) from error
             if self._client is not None or self._loop is not None:
                 raise RuntimeError("Lean LSP session has already been started")
             try:
-                self._start_loop()
+                self._start_loop(deadline)
+                self._remaining(deadline)
                 descriptor, identity_name = tempfile.mkstemp(
                     prefix="autoform-lsp-", suffix=".json"
                 )
@@ -123,6 +141,7 @@ class LeanLspSession:
                 ]
 
                 async def start_client() -> None:
+                    self._remaining(deadline)
                     client = self._client_factory(
                         project_path=str(Path(self.config.cwd).resolve()),
                         max_workers=1,
@@ -134,9 +153,11 @@ class LeanLspSession:
                     self._client = client
                     await client.start()
 
-                self._submit(start_client(), self.config.timeout, "starting Lean LSP")
+                self._submit_until(start_client(), deadline, "starting Lean LSP")
+                self._remaining(deadline)
                 identity = self._read_process_identity()
                 self._process_group_id = identity
+                self._remaining(deadline)
                 self._poisoned = False
             except BaseException:
                 # A failed initialize can still leave lake, the watchdog, or a
@@ -145,6 +166,8 @@ class LeanLspSession:
                 # retry cleanup until the group is verifiably gone.
                 self._cleanup_failed_start()
                 raise
+        finally:
+            self._lifecycle_lock.release()
 
     def close(self) -> None:
         """Close the client and return only after its process group is gone."""
@@ -168,48 +191,74 @@ class LeanLspSession:
             and self._process_group_has_live_members(process_group_id)
         )
 
-    def get_diagnostics(self, file_path: str) -> list[dict]:
+    def get_diagnostics(
+        self,
+        file_path: str,
+        *,
+        deadline: float | None = None,
+    ) -> list[dict]:
         """Return barrier-complete diagnostics for an in-project Lean file."""
         return self._run_document_operation(
             file_path,
             lambda client, path, deadline: self._diagnostics(client, path, deadline),
+            deadline=self._deadline_or_default(deadline),
         )
 
-    def hover(self, file_path: str, line: int, character: int) -> str | None:
+    def hover(
+        self,
+        file_path: str,
+        line: int,
+        character: int,
+        *,
+        deadline: float | None = None,
+    ) -> str | None:
         """Return hover text at a zero-indexed codepoint position."""
         return self._run_document_operation(
             file_path,
             lambda client, path, deadline: self._hover(
                 client, path, line, character, deadline
             ),
+            deadline=self._deadline_or_default(deadline),
         )
 
     def _run_document_operation(
         self,
         file_path: str,
         operation: Callable[[AsyncLeanLSPClient, str, float], Awaitable[Any]],
+        *,
+        deadline: float,
     ) -> Any:
-        deadline = time.monotonic() + self.config.timeout
-        if not self._operation_lock.acquire(timeout=self.config.timeout):
+        try:
+            remaining = self._remaining(deadline)
+        except TimeoutError as error:
             raise LspBusyError(
-                f"timed out after {self.config.timeout:g}s waiting for the Lean LSP session"
+                "Lean LSP deadline expired before session admission"
+            ) from error
+        if not self._operation_lock.acquire(timeout=remaining):
+            raise LspBusyError(
+                "Lean LSP deadline expired while waiting for the Lean LSP session"
             )
         try:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            try:
+                self._remaining(deadline)
+            except TimeoutError as error:
                 raise LspBusyError(
-                    f"timed out after {self.config.timeout:g}s waiting for the Lean LSP session"
-                )
+                    "Lean LSP deadline expired while waiting for the Lean LSP session"
+                ) from error
             client = self._client
             if client is None or self._poisoned or not client.alive:
                 raise LspProtocolError("Lean LSP session is no longer usable")
             relative_path = self._relative_path(file_path)
             try:
-                return self._submit(
+                return self._submit_until(
                     operation(client, relative_path, deadline),
-                    remaining,
+                    deadline,
                     "running Lean LSP operation",
                 )
+            except LspBusyError:
+                # The coroutine was never submitted, so the existing client
+                # remains safe to use after an admission timeout.
+                raise
             except BaseException as error:
                 try:
                     self.abort()
@@ -237,6 +286,7 @@ class LeanLspSession:
         path: str,
         deadline: float,
     ) -> list[dict]:
+        self._remaining(deadline)
         await client.open(path, wait=False)
         try:
             report = await client.diagnostics(
@@ -285,9 +335,11 @@ class LeanLspSession:
         character: int,
         deadline: float,
     ) -> str | None:
+        self._remaining(deadline)
         await client.open(path, wait=False)
         try:
             await client.barrier(path, timeout=self._remaining(deadline))
+            self._remaining(deadline)
             result = await client.hover(path, line, character, fresh=False)
             return self._normalized_hover(result)
         finally:
@@ -369,7 +421,24 @@ class LeanLspSession:
         except LeanClientError as error:
             raise LspProtocolError(f"leanclient failed: {error}") from error
 
-    def _start_loop(self) -> None:
+    def _submit_until(
+        self,
+        awaitable: Awaitable[Any],
+        deadline: float,
+        operation: str,
+    ) -> Any:
+        """Submit an awaitable using only the request's remaining budget."""
+        try:
+            remaining = self._remaining(deadline)
+        except TimeoutError as error:
+            if hasattr(awaitable, "close"):
+                awaitable.close()  # type: ignore[attr-defined]
+            raise LspBusyError(
+                f"Lean LSP deadline expired before {operation}"
+            ) from error
+        return self._submit(awaitable, remaining, operation)
+
+    def _start_loop(self, deadline: float) -> None:
         loop = asyncio.new_event_loop()
         self._loop = loop
         self._loop_ready.clear()
@@ -397,7 +466,10 @@ class LeanLspSession:
             self._loop_thread = None
             loop.close()
             raise
-        if not self._loop_ready.wait(timeout=LSP_LOOP_CLOSE_SECONDS):
+        wait_timeout = min(LSP_LOOP_CLOSE_SECONDS, self._remaining(deadline))
+        if not self._loop_ready.wait(timeout=wait_timeout):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Lean LSP startup exceeded its deadline")
             raise LspProtocolError("Lean LSP event loop failed to start")
 
     def _shutdown(self) -> None:
@@ -576,6 +648,11 @@ class LeanLspSession:
         if remaining <= 0:
             raise TimeoutError("Lean LSP operation exceeded its deadline")
         return remaining
+
+    def _deadline_or_default(self, deadline: float | None) -> float:
+        if deadline is not None:
+            return deadline
+        return time.monotonic() + self.config.timeout
 
 
 class LeanLspProjects:
