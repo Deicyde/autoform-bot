@@ -415,25 +415,27 @@ class ProjectResourceCache(Generic[T]):
         """Borrow existing state without validating, replacing, or creating it."""
         root = resolve_lean_project_dir(project_dir)
         lease_token = object()
-        with self._condition:
-            if self._closed:
-                raise RuntimeError("project resource cache is closed")
-            entry = self._entries.get(root)
-            resource = None if entry is None else entry.resource
-            if entry is not None:
-                entry.active.add(lease_token)
+        resource: T | None = None
         try:
+            with self._condition:
+                if self._closed:
+                    raise RuntimeError("project resource cache is closed")
+                entry = self._entries.get(root)
+                resource = None if entry is None else entry.resource
+                if entry is not None:
+                    entry.active.add(lease_token)
             yield resource
         finally:
             if resource is not None:
                 with self._condition:
                     entry = self._entries.get(root)
-                    if entry is None or entry.resource is not resource:
-                        raise RuntimeError(
-                            "inspected project resource is no longer registered"
-                        )
-                    entry.active.remove(lease_token)
-                    self._condition.notify_all()
+                    if (
+                        entry is not None
+                        and entry.resource is resource
+                        and lease_token in entry.active
+                    ):
+                        entry.active.remove(lease_token)
+                        self._condition.notify_all()
 
     def state(self, project_dir: str) -> str:
         """Return the current project-resource lifecycle state."""
@@ -1070,6 +1072,7 @@ class ProjectResourceCache(Generic[T]):
                 except BaseException as error:
                     validation_error = error
                     invalid = True
+            entry.invalid = invalid
             if not entry.active and invalid:
                 self._entries.pop(root)
                 self._retiring[root] = resource

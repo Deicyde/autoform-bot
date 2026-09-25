@@ -319,6 +319,81 @@ def test_cache_inspection_does_not_validate_or_retire_state(tmp_path):
     cache.close()
 
 
+@pytest.mark.parametrize("insert_before_interrupt", [False, True])
+def test_interrupted_cache_inspection_releases_its_lease_token(
+    tmp_path,
+    insert_before_interrupt,
+):
+    project = make_lake_project(tmp_path, "interrupted-inspection")
+    cache = ProjectResourceCache(
+        lambda root: root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    entry = cache._entries[project.resolve()]
+
+    class InterruptingSet(set):
+        def add(self, value):
+            if insert_before_interrupt:
+                super().add(value)
+            raise KeyboardInterrupt("after inspection admission")
+
+    entry.active = InterruptingSet()
+
+    with pytest.raises(KeyboardInterrupt, match="after inspection admission"):
+        with cache.inspect(str(project)):
+            pass
+
+    assert entry.active == set()
+    cache.close()
+
+
+def test_failed_validation_poisons_a_resource_with_another_active_lease(tmp_path):
+    project = make_lake_project(tmp_path, "concurrent-validation")
+    created = []
+    closed = []
+    validation_error = [False]
+
+    def factory(root):
+        resource = object()
+        created.append(resource)
+        return resource
+
+    def is_valid(resource):
+        if validation_error[0]:
+            validation_error[0] = False
+            raise RuntimeError("validation failed")
+        return True
+
+    cache = ProjectResourceCache(
+        factory,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    first = cache.lease(str(project))
+    second = cache.lease(str(project))
+    first_resource = first.__enter__()
+    assert second.__enter__() is first_resource
+
+    validation_error[0] = True
+    with pytest.raises(RuntimeError, match="validation failed"):
+        first.__exit__(None, None, None)
+    second.__exit__(None, None, None)
+
+    assert closed == [first_resource]
+    with cache.lease(str(project)) as replacement:
+        assert replacement is not first_resource
+    assert len(created) == 2
+    cache.close()
+
+
 def test_shared_runtime_disables_ambiguous_repl_retries(tmp_path, monkeypatch):
     from servers import lean_runtime
 
