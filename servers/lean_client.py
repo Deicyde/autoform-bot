@@ -114,6 +114,7 @@ def _build_id() -> str:
         sys.implementation.name,
         str(sys.implementation.cache_tag),
         ".".join(str(component) for component in sys.version_info[:3]),
+        sys.version,
     )
     for value in interpreter:
         digest.update(value.encode("utf-8"))

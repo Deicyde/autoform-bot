@@ -143,6 +143,14 @@ def test_runtime_build_identity_tracks_exact_dependency_record(monkeypatch):
     assert lean_client._build_id() != original
 
 
+def test_runtime_build_identity_tracks_python_build(monkeypatch):
+    original = lean_client._build_id()
+
+    monkeypatch.setattr(lean_client.sys, "version", f"{lean_client.sys.version} rebuilt")
+
+    assert lean_client._build_id() != original
+
+
 def test_runtime_build_generation_tracks_dependency_install_metadata(
     tmp_path, monkeypatch
 ):
