@@ -42,8 +42,10 @@ REPL transport retries are limited to failures detected before the complete
 request frame is dispatched. Once the final frame delimiter may have reached
 Lean, replay could execute the command twice, so Autoform retires the process
 and reports that the outcome is unknown instead of retrying.
-The per-call timeout covers admission, startup, and Lean execution. Verified
-process cleanup gets a separate bounded grace period before the RPC returns.
+The REPL per-call timeout starts before the shared daemon is connected or
+started, then covers project admission, fresh child startup, idle-worker wait,
+and Lean execution. Verified process cleanup and response delivery get a
+separate bounded grace period before the RPC returns.
 
 `LEAN_REPL_CMD` is a trusted local command. Its descendants must remain in the
 dedicated process group Autoform creates; a command that deliberately detaches

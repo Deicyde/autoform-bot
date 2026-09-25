@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import os
 import socket
 import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -124,10 +127,11 @@ def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path):
 
         assert first == second == "Compiles successfully"
         assert len(pools) == 1
-        assert pools[0].calls == [
-            ("#check Nat", {"timeout": 30.0}),
-            ("#check Int", {"timeout": 3.0}),
-        ]
+        assert [call[0] for call in pools[0].calls] == ["#check Nat", "#check Int"]
+        default_remaining = pools[0].calls[0][1]["timeout"]
+        explicit_remaining = pools[0].calls[1][1]["timeout"]
+        assert 0 < default_remaining <= 30.0
+        assert 0 < explicit_remaining <= 3.0
         warm = services.dispatch("repl.status", {"project_dir": str(project)})
         assert warm["state"] == "warm"
         assert warm["memory_usage_gb"] == 0.25
@@ -572,6 +576,342 @@ def test_stdio_mcp_adapters_delegate_without_owning_lean_state():
             {"project_dir": "/lean", "file_path": "Main.lean"},
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    ("timeout", "configured_default", "expected_deadline"),
+    [(5, None, 105.0), (None, "7", 107.0)],
+)
+def test_repl_client_reuses_one_deadline_across_autostart_retry(
+    runtime_dir,
+    monkeypatch,
+    timeout,
+    configured_default,
+    expected_deadline,
+):
+    from servers import lean_client
+
+    now = [100.0]
+    attempts = []
+    startup_deadlines = []
+    client = LeanRuntimeClient(socket_path=runtime_dir / "deadline.sock")
+    if configured_default is not None:
+        monkeypatch.setenv("AUTOFORM_REPL_REQUEST_TIMEOUT", configured_default)
+
+    def request_once(method, params, **kwargs):
+        attempts.append(kwargs["deadline"])
+        if len(attempts) == 1:
+            raise LeanRuntimeUnavailable("not listening")
+        return "Compiles successfully"
+
+    def ensure_running(*, deadline):
+        startup_deadlines.append(deadline)
+        now[0] = 102.0
+        return {"running": True}
+
+    monkeypatch.setattr(lean_client.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(client, "_request_once", request_once)
+    monkeypatch.setattr(client, "ensure_running", ensure_running)
+
+    assert client.request(
+        "repl.run",
+        {"project_dir": "/lean", "code": "#check Nat", "timeout": timeout},
+    ) == "Compiles successfully"
+    assert attempts == [expected_deadline, expected_deadline]
+    assert startup_deadlines == [expected_deadline]
+
+
+def test_repl_wire_deadline_is_internal_and_response_allows_cleanup(
+    runtime_dir,
+    monkeypatch,
+):
+    from servers import lean_client
+
+    sent = []
+    socket_timeouts = []
+
+    class RespondingSocket:
+        def settimeout(self, timeout):
+            socket_timeouts.append(timeout)
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            sent.append(json.loads(payload))
+
+        def recv(self, size):
+            return json.dumps(
+                {
+                    "v": PROTOCOL_VERSION,
+                    "id": sent[0]["id"],
+                    "ok": True,
+                    "result": "Compiles successfully",
+                }
+            ).encode() + b"\n"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lean_client.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(lean_client.socket, "socket", lambda *args: RespondingSocket())
+    client = LeanRuntimeClient(
+        socket_path=runtime_dir / "wire-deadline.sock",
+        response_timeout=900,
+    )
+    params = {"project_dir": "/lean", "code": "#check Nat", "timeout": 5}
+
+    assert client.request("repl.run", params, autostart=False) == "Compiles successfully"
+    assert sent[0]["deadline"] == 105.0
+    assert sent[0]["params"] == params
+    assert "deadline" not in sent[0]["params"]
+    assert socket_timeouts == [
+        2.0,
+        5.0,
+        5.0 + lean_client.REPL_RESPONSE_GRACE_SECONDS,
+    ]
+
+
+def test_expired_repl_deadline_is_not_dispatched_after_autostart(
+    runtime_dir,
+    monkeypatch,
+):
+    from servers import lean_client
+
+    now = [100.0]
+    connects = []
+    sends = []
+
+    class MissingThenForbiddenSocket:
+        def __init__(self, number):
+            self.number = number
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            connects.append(self.number)
+            if self.number == 1:
+                raise FileNotFoundError(path)
+            pytest.fail("an expired request must not reconnect")
+
+        def sendall(self, payload):
+            sends.append(payload)
+
+        def close(self):
+            pass
+
+    sockets = []
+
+    def create_socket(*args):
+        candidate = MissingThenForbiddenSocket(len(sockets) + 1)
+        sockets.append(candidate)
+        return candidate
+
+    def ensure_running(*, deadline):
+        assert deadline == 105.0
+        now[0] = 106.0
+        return {"running": True}
+
+    monkeypatch.setattr(lean_client.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(lean_client.socket, "socket", create_socket)
+    client = LeanRuntimeClient(socket_path=runtime_dir / "expired.sock")
+    monkeypatch.setattr(client, "ensure_running", ensure_running)
+
+    with pytest.raises(LeanRuntimeUnavailable, match="expired before dispatch"):
+        client.request(
+            "repl.run",
+            {"project_dir": "/lean", "code": "#check Nat", "timeout": 5},
+        )
+
+    assert connects == [1]
+    assert sends == []
+
+
+@pytest.mark.parametrize(
+    ("client_deadline", "server_timeout", "expected_deadline", "expected_remaining"),
+    [
+        (110.0, 30.0, 110.0, 7.0),
+        (200.0, 5.0, 105.0, 2.0),
+    ],
+)
+def test_runtime_caps_client_deadline_and_spends_admission_time(
+    tmp_path,
+    monkeypatch,
+    client_deadline,
+    server_timeout,
+    expected_deadline,
+    expected_remaining,
+):
+    from servers import lean_runtime
+
+    project = make_lake_project(tmp_path, "runtime-deadline")
+    now = [100.0]
+    pool = FakePool(project.resolve())
+    lease_deadlines = []
+
+    class Lease:
+        def __enter__(self):
+            now[0] = 103.0
+            return pool
+
+        def __exit__(self, *args):
+            return False
+
+    class Projects:
+        def lease(self, project_dir, **kwargs):
+            lease_deadlines.append(kwargs["deadline"])
+            return Lease()
+
+    monkeypatch.setattr(lean_runtime.time, "monotonic", lambda: now[0])
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=FakePool,
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    original_projects = services.repl_projects
+    services.repl_projects = Projects()
+    try:
+        assert services.dispatch(
+            "repl.run",
+            {
+                "project_dir": str(project),
+                "code": "#check Nat",
+                "timeout": server_timeout,
+            },
+            client_deadline=client_deadline,
+        ) == "Compiles successfully"
+    finally:
+        services.repl_projects = original_projects
+        services.close()
+
+    assert lease_deadlines == [expected_deadline]
+    assert pool.calls == [
+        ("#check Nat", {"timeout": pytest.approx(expected_remaining)})
+    ]
+
+
+def test_expired_runtime_deadline_never_warms_or_dispatches_a_pool(tmp_path):
+    project = make_lake_project(tmp_path, "expired-runtime")
+    pools = []
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=lambda root: pools.append(FakePool(root)) or pools[-1],
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        with pytest.raises(ProjectResourceBusyError, match="expired before admission"):
+            services.dispatch(
+                "repl.run",
+                {"project_dir": str(project), "code": "#check Nat", "timeout": 30},
+                client_deadline=time.monotonic() - 1,
+            )
+        assert pools == []
+    finally:
+        services.close()
+
+
+def test_runtime_does_not_dispatch_when_deadline_expires_during_admission(
+    tmp_path,
+    monkeypatch,
+):
+    from servers import lean_runtime
+
+    project = make_lake_project(tmp_path, "expired-admission")
+    now = [100.0]
+    pool = FakePool(project.resolve())
+
+    class Lease:
+        def __enter__(self):
+            now[0] = 106.0
+            return pool
+
+        def __exit__(self, *args):
+            return False
+
+    class Projects:
+        def lease(self, project_dir, **kwargs):
+            assert kwargs["deadline"] == 105.0
+            return Lease()
+
+    monkeypatch.setattr(lean_runtime.time, "monotonic", lambda: now[0])
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=FakePool,
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    original_projects = services.repl_projects
+    services.repl_projects = Projects()
+    try:
+        with pytest.raises(ProjectResourceBusyError, match="expired before execution"):
+            services.dispatch(
+                "repl.run",
+                {"project_dir": str(project), "code": "#check Nat", "timeout": 30},
+                client_deadline=105.0,
+            )
+    finally:
+        services.repl_projects = original_projects
+        services.close()
+
+    assert pool.calls == []
+
+
+def test_cache_does_not_start_a_resource_after_its_absolute_deadline(tmp_path):
+    project = make_lake_project(tmp_path, "expired-cache-start")
+    now = iter((0.0, 2.0))
+    created = []
+    cache = ProjectResourceCache(
+        lambda root: created.append(root) or root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+        clock=lambda: next(now),
+    )
+
+    with pytest.raises(ProjectResourceBusyError, match="not enough response budget"):
+        with cache.lease(str(project), deadline=1.0):
+            pytest.fail("an expired lease must not start a project resource")
+
+    assert created == []
+    cache.close()
+
+
+@pytest.mark.parametrize("deadline", [None, 123.5])
+def test_runtime_wire_deadline_is_optional_and_outside_params(deadline):
+    from servers.lean_runtime import LeanRuntimeRequestHandler
+
+    calls = []
+
+    class Services:
+        def dispatch(self, method, params, *, client_deadline=None):
+            calls.append((method, params, client_deadline))
+            return "Compiles successfully"
+
+    request = {
+        "v": PROTOCOL_VERSION,
+        "id": "request-id",
+        "method": "repl.run",
+        "params": {"project_dir": "/lean", "code": "#check Nat", "timeout": 5},
+    }
+    if deadline is not None:
+        request["deadline"] = deadline
+    handler = object.__new__(LeanRuntimeRequestHandler)
+    handler.rfile = io.BytesIO(json.dumps(request).encode() + b"\n")
+    handler.wfile = io.BytesIO()
+    handler.server = SimpleNamespace(
+        services=Services(),
+        request_shutdown=lambda: None,
+    )
+
+    handler.handle()
+
+    assert calls == [("repl.run", request["params"], deadline)]
+    response = json.loads(handler.wfile.getvalue())
+    assert response["ok"] is True
 
 
 def test_lsp_diagnostic_formatting_remains_stable():

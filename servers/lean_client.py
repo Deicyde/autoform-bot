@@ -30,6 +30,10 @@ MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 DEFAULT_CONNECT_TIMEOUT = 2.0
 DEFAULT_RESPONSE_TIMEOUT = 900.0
 DEFAULT_STARTUP_TIMEOUT = 15.0
+DEFAULT_REPL_REQUEST_TIMEOUT = 180.0
+# The daemon reserves two seconds for verified process cleanup and thirty
+# seconds for response/retirement overhead after the public operation deadline.
+REPL_RESPONSE_GRACE_SECONDS = 32.0
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_PATH_ID = hashlib.sha256(os.fsencode(PACKAGE_ROOT)).hexdigest()[:10]
 
@@ -141,6 +145,32 @@ def _response_timeout_from_environment() -> float:
             "AUTOFORM_RUNTIME_RESPONSE_TIMEOUT must be a finite positive number"
         )
     return value
+
+
+def _repl_timeout_from_params(params: dict[str, Any]) -> float:
+    """Resolve the public REPL budget before any daemon startup work begins."""
+    timeout = params.get("timeout")
+    if timeout is None:
+        raw = os.environ.get(
+            "AUTOFORM_REPL_REQUEST_TIMEOUT",
+            str(DEFAULT_REPL_REQUEST_TIMEOUT),
+        )
+        raw = str(DEFAULT_REPL_REQUEST_TIMEOUT) if not raw.strip() else raw
+        try:
+            timeout = float(raw)
+        except ValueError as error:
+            raise ValueError(
+                "AUTOFORM_REPL_REQUEST_TIMEOUT must be a number, "
+                f"got {raw!r}"
+            ) from error
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be a finite positive number or null")
+    return float(timeout)
 
 
 @dataclass(frozen=True)
@@ -272,11 +302,14 @@ class LeanRuntimeClient:
         deadline: float | None = None,
     ) -> Any:
         """Call a runtime method, starting the daemon only before dispatch."""
+        request_params = params or {}
+        if method == "repl.run" and deadline is None:
+            deadline = time.monotonic() + _repl_timeout_from_params(request_params)
         should_start = self.autostart if autostart is None else autostart
         try:
             return self._request_once(
                 method,
-                params or {},
+                request_params,
                 response_timeout=response_timeout,
                 deadline=deadline,
             )
@@ -287,7 +320,7 @@ class LeanRuntimeClient:
         self.ensure_running(deadline=deadline)
         return self._request_once(
             method,
-            params or {},
+            request_params,
             response_timeout=response_timeout,
             deadline=deadline,
         )
@@ -549,15 +582,15 @@ class LeanRuntimeClient:
         deadline: float | None = None,
     ) -> Any:
         request_id = uuid.uuid4().hex
-        payload = json.dumps(
-            {
-                "v": PROTOCOL_VERSION,
-                "id": request_id,
-                "method": method,
-                "params": params,
-            },
-            separators=(",", ":"),
-        ).encode("utf-8") + b"\n"
+        request: dict[str, Any] = {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+        if method == "repl.run" and deadline is not None:
+            request["deadline"] = deadline
+        payload = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
         if len(payload) > MAX_MESSAGE_BYTES:
             raise LeanRuntimeProtocolError("Lean runtime request exceeds the message limit")
 
@@ -571,10 +604,10 @@ class LeanRuntimeClient:
                 "not retried and must not be replayed."
             )
 
-        def bounded_timeout(configured: float) -> float:
+        def bounded_timeout(configured: float, *, grace: float = 0.0) -> float:
             if deadline is None:
                 return configured
-            remaining = deadline - time.monotonic()
+            remaining = deadline + grace - time.monotonic()
             if remaining <= 0:
                 raise LeanRuntimeUnavailable(
                     "Lean runtime request deadline expired before dispatch"
@@ -602,10 +635,22 @@ class LeanRuntimeClient:
                 else response_timeout
             )
             connection.settimeout(bounded_timeout(configured_response_timeout))
+            if deadline is not None and time.monotonic() >= deadline:
+                raise LeanRuntimeUnavailable(
+                    "Lean runtime request deadline expired before dispatch"
+                )
             # From this point onward, any failure is ambiguous: the daemon may
             # have received the request. Never auto-replay Lean execution.
             dispatched = True
             connection.sendall(payload)
+            response_grace = (
+                REPL_RESPONSE_GRACE_SECONDS
+                if method == "repl.run" and deadline is not None
+                else 0.0
+            )
+            connection.settimeout(
+                bounded_timeout(configured_response_timeout, grace=response_grace)
+            )
             raw = self._read_line(connection)
         except socket.timeout as error:
             if dispatched:

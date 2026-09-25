@@ -334,14 +334,23 @@ class ProjectResourceCache(Generic[T]):
         *,
         create: bool = True,
         acquisition_timeout: float | None = None,
+        deadline: float | None = None,
         creation_budget: float = 0.0,
     ) -> Iterator[T | None]:
         """Keep a project resource alive for the complete operation."""
+        if acquisition_timeout is not None and deadline is not None:
+            raise TypeError("pass acquisition_timeout or deadline, not both")
+        if acquisition_timeout is not None:
+            if acquisition_timeout <= 0:
+                raise ProjectResourceBusyError(
+                    "no response budget remains for a shared Lean project slot"
+                )
+            deadline = self._clock() + acquisition_timeout
         root = resolve_lean_project_dir(project_dir)
         resource = self._acquire(
             root,
             create=create,
-            acquisition_timeout=acquisition_timeout,
+            deadline=deadline,
             creation_budget=creation_budget,
         )
         operation_error: BaseException | None = None
@@ -496,21 +505,16 @@ class ProjectResourceCache(Generic[T]):
         root: Path,
         *,
         create: bool,
-        acquisition_timeout: float | None,
+        deadline: float | None,
         creation_budget: float,
     ) -> T | None:
-        if acquisition_timeout is not None and acquisition_timeout <= 0:
+        if deadline is not None and self._clock() >= deadline:
             raise ProjectResourceBusyError(
                 "no response budget remains for a shared Lean project slot"
             )
         if creation_budget < 0:
             raise ValueError("creation_budget must be nonnegative")
         fingerprint = lean_project_fingerprint(root)
-        deadline = (
-            self._clock() + acquisition_timeout
-            if acquisition_timeout is not None
-            else None
-        )
         while True:
             wait = False
             retirement: tuple[Path, T] | None = None
@@ -649,6 +653,14 @@ class ProjectResourceCache(Generic[T]):
                         f"{retiring_root}"
                     )
 
+        if deadline is not None and self._clock() >= deadline:
+            with self._condition:
+                self._creating.discard(root)
+                self._condition.notify_all()
+            raise ProjectResourceBusyError(
+                f"shared Lean project startup deadline expired: {root}"
+            )
+
         try:
             created = self._factory(root)
         except BaseException:
@@ -699,7 +711,7 @@ class ProjectResourceCache(Generic[T]):
     ) -> None:
         if deadline is None:
             return
-        if deadline - self._clock() < creation_budget:
+        if deadline - self._clock() <= creation_budget:
             raise ProjectResourceBusyError(
                 f"not enough response budget to start a shared Lean project slot: {root}"
             )
@@ -823,7 +835,13 @@ class LeanRuntimeServices:
             start_sweeper=start_sweepers,
         )
 
-    def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+    def dispatch(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        client_deadline: float | None = None,
+    ) -> Any:
         if method == "daemon.ping":
             return self.status(include_projects=False)
         if method == "daemon.status":
@@ -848,13 +866,34 @@ class LeanRuntimeServices:
                     "timeout exceeds the node-wide limit of "
                     f"{self.config.max_repl_request_seconds:g} seconds"
                 )
+            if client_deadline is not None and (
+                isinstance(client_deadline, bool)
+                or not isinstance(client_deadline, (int, float))
+                or not math.isfinite(client_deadline)
+            ):
+                raise ValueError("deadline must be a finite number or null")
+            server_deadline = time.monotonic() + effective_timeout
+            deadline = (
+                server_deadline
+                if client_deadline is None
+                else min(server_deadline, float(client_deadline))
+            )
+            if time.monotonic() >= deadline:
+                raise ProjectResourceBusyError(
+                    "Lean REPL request deadline expired before admission"
+                )
             with self.repl_projects.lease(
                 project_dir,
-                acquisition_timeout=self._acquisition_timeout(effective_timeout),
-                creation_budget=DEFAULT_POOL_CLEANUP_SECONDS,
+                deadline=deadline,
+                creation_budget=0.0,
             ) as pool:
                 assert pool is not None
-                return format_repl_response(pool.run(code, timeout=effective_timeout))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProjectResourceBusyError(
+                        "Lean REPL request deadline expired before execution"
+                    )
+                return format_repl_response(pool.run(code, timeout=remaining))
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")
             with self.repl_projects.lease(project_dir, create=False) as pool:
@@ -1060,16 +1099,31 @@ class LeanRuntimeRequestHandler(socketserver.StreamRequestHandler):
                 )
             method = request.get("method")
             params = request.get("params")
+            client_deadline = request.get("deadline")
             if not isinstance(method, str) or not method:
                 raise ValueError("method must be a non-empty string")
             if not isinstance(params, dict):
                 raise ValueError("params must be an object")
+            if client_deadline is not None and (
+                isinstance(client_deadline, bool)
+                or not isinstance(client_deadline, (int, float))
+                or not math.isfinite(client_deadline)
+            ):
+                raise ValueError("deadline must be a finite number or null")
 
             if method == "daemon.shutdown":
                 result = {"stopping": True, "pid": os.getpid()}
                 shutdown = True
             else:
-                result = self.server.services.dispatch(method, params)
+                result = self.server.services.dispatch(
+                    method,
+                    params,
+                    client_deadline=(
+                        None
+                        if client_deadline is None
+                        else float(client_deadline)
+                    ),
+                )
             response = {
                 "v": PROTOCOL_VERSION,
                 "id": request_id,
