@@ -7,6 +7,7 @@ is reached through a private Unix-domain socket.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -18,8 +19,11 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from logging import getLogger
 from pathlib import Path
 from typing import Any
+
+logger = getLogger(__name__)
 
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
@@ -233,6 +237,7 @@ class LeanRuntimeClient:
         *,
         autostart: bool | None = None,
         response_timeout: float | None = None,
+        deadline: float | None = None,
     ) -> Any:
         """Call a runtime method, starting the daemon only before dispatch."""
         should_start = self.autostart if autostart is None else autostart
@@ -241,24 +246,32 @@ class LeanRuntimeClient:
                 method,
                 params or {},
                 response_timeout=response_timeout,
+                deadline=deadline,
             )
         except LeanRuntimeUnavailable:
             if not should_start:
                 raise
 
-        self.ensure_running()
+        self.ensure_running(deadline=deadline)
         return self._request_once(
             method,
             params or {},
             response_timeout=response_timeout,
+            deadline=deadline,
         )
 
-    def ping(self, *, autostart: bool = False) -> dict[str, Any]:
+    def ping(
+        self,
+        *,
+        autostart: bool = False,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         """Return daemon identity without warming a Lean project."""
         result = self.request(
             "daemon.ping",
             autostart=autostart,
             response_timeout=min(self.response_timeout, 5.0),
+            deadline=deadline,
         )
         if not isinstance(result, dict):
             raise LeanRuntimeProtocolError("daemon.ping returned a non-object result")
@@ -268,10 +281,26 @@ class LeanRuntimeClient:
             )
         return result
 
-    def ensure_running(self) -> dict[str, Any]:
+    def ensure_running(self, *, deadline: float | None = None) -> dict[str, Any]:
         """Race-safely start one detached runtime for this user and node."""
+        startup_deadline = time.monotonic() + self.startup_timeout
+        deadline = (
+            startup_deadline
+            if deadline is None
+            else min(deadline, startup_deadline)
+        )
+
+        def remaining(purpose: str) -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise LeanRuntimeUnavailable(
+                    f"timed out waiting for {purpose}; a previous Lean runtime "
+                    "may still be cleaning up"
+                )
+            return value
+
         try:
-            return self.ping(autostart=False)
+            return self.ping(autostart=False, deadline=deadline)
         except LeanRuntimeUnavailable:
             pass
 
@@ -280,16 +309,31 @@ class LeanRuntimeClient:
         except ImportError as error:  # pragma: no cover - guarded by AF_UNIX above
             raise LeanRuntimeError("runtime bootstrap requires POSIX file locking") from error
 
+        def acquire_lock(fd: int, *, purpose: str) -> None:
+            delay = 0.025
+            while True:
+                wait = remaining(purpose)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    pass
+                except OSError as error:
+                    if error.errno != errno.EACCES:
+                        raise
+                time.sleep(min(delay, wait))
+                delay = min(delay * 1.7, 0.25)
+
         _private_runtime_directory(self.paths.directory)
         lock_fd = os.open(self.paths.lock, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            acquire_lock(lock_fd, purpose="Lean runtime startup coordination")
             try:
-                return self.ping(autostart=False)
+                return self.ping(autostart=False, deadline=deadline)
             except LeanRuntimeUnavailable:
                 pass
 
-            self._stop_previous_builds()
+            self._stop_previous_builds(deadline=deadline)
 
             # A daemon owns this lock for its complete lifetime. If it has
             # stopped accepting connections but is still draining requests,
@@ -300,24 +344,27 @@ class LeanRuntimeClient:
                 0o600,
             )
             try:
-                fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
+                acquire_lock(lifetime_fd, purpose="the previous Lean runtime")
+                remaining("Lean runtime startup")
                 self._remove_stale_socket()
                 process = self._spawn_daemon()
             finally:
                 os.close(lifetime_fd)
 
             try:
-                deadline = time.monotonic() + self.startup_timeout
                 delay = 0.025
                 last_error: BaseException | None = None
                 while time.monotonic() < deadline:
                     if process.poll() is not None:
                         break
                     try:
-                        return self.ping(autostart=False)
+                        return self.ping(autostart=False, deadline=deadline)
                     except LeanRuntimeUnavailable as error:
                         last_error = error
-                    time.sleep(delay)
+                    wait = deadline - time.monotonic()
+                    if wait <= 0:
+                        break
+                    time.sleep(min(delay, wait))
                     delay = min(delay * 1.7, 0.25)
 
                 exit_detail = (
@@ -336,31 +383,36 @@ class LeanRuntimeClient:
         finally:
             os.close(lock_fd)
 
-    def stop(self) -> dict[str, Any]:
+    def stop(self, *, deadline: float | None = None) -> dict[str, Any]:
         """Ask a running daemon to finish active calls and shut down."""
         try:
             result = self.request(
                 "daemon.shutdown",
                 autostart=False,
                 response_timeout=10.0,
+                deadline=deadline,
             )
         except LeanRuntimeUnavailable:
-            stopped = self._stop_previous_builds()
+            stopped = self._stop_previous_builds(deadline=deadline)
             if stopped:
                 return {"stopping": False, "stopped_previous": stopped}
             raise
         if not isinstance(result, dict):
             raise LeanRuntimeProtocolError("daemon.shutdown returned a non-object result")
-        deadline = time.monotonic() + self.response_timeout
-        while self.paths.socket.exists() and time.monotonic() < deadline:
-            time.sleep(0.025)
+        stop_deadline = (
+            time.monotonic() + self.response_timeout
+            if deadline is None
+            else deadline
+        )
+        while self.paths.socket.exists() and time.monotonic() < stop_deadline:
+            time.sleep(min(0.025, max(0.0, stop_deadline - time.monotonic())))
         if self.paths.socket.exists():
             raise LeanRuntimeError(
                 f"Lean runtime is still draining requests at {self.paths.socket}"
             )
         return result
 
-    def _stop_previous_builds(self) -> list[int]:
+    def _stop_previous_builds(self, *, deadline: float | None = None) -> list[int]:
         """Gracefully replace older code generations at the same install path."""
         if not self._uses_default_paths:
             return []
@@ -377,7 +429,11 @@ class LeanRuntimeClient:
                 startup_timeout=self.startup_timeout,
             )
             try:
-                status = previous.request("daemon.ping", autostart=False)
+                status = previous.request(
+                    "daemon.ping",
+                    autostart=False,
+                    deadline=deadline,
+                )
             except LeanRuntimeUnavailable:
                 continue
             generation = (
@@ -388,7 +444,7 @@ class LeanRuntimeClient:
                     "a newer Autoform runtime build is already active; "
                     "restart this plugin session before using Lean tools"
                 )
-            result = previous.stop()
+            result = previous.stop(deadline=deadline)
             pid = result.get("pid") if isinstance(result, dict) else None
             if isinstance(pid, int):
                 stopped.append(pid)
@@ -403,6 +459,8 @@ class LeanRuntimeClient:
             str(self.paths.socket),
             "--log",
             str(self.paths.log),
+            "--lifetime-lock",
+            str(self.paths.lifetime_lock),
             "serve",
         ]
         with self.paths.log.open("ab", buffering=0) as log:
@@ -433,14 +491,22 @@ class LeanRuntimeClient:
 
     @staticmethod
     def _terminate_failed_start(process: subprocess.Popen[bytes]) -> None:
+        """Request shutdown without killing a daemon that may own active work."""
         if process.poll() is not None:
             return
-        process.terminate()
         try:
+            process.terminate()
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+            # The daemon may already be serving another client and draining a
+            # Lean child. Its lifetime lock prevents a replacement from being
+            # admitted while fail-closed cleanup continues.
+            logger.warning(
+                "spawned Lean runtime is still shutting down; leaving it under "
+                "its lifetime lock"
+            )
+        except OSError:
+            logger.exception("failed to request shutdown of the spawned Lean runtime")
 
     def _request_once(
         self,
@@ -448,6 +514,7 @@ class LeanRuntimeClient:
         params: dict[str, Any],
         *,
         response_timeout: float | None = None,
+        deadline: float | None = None,
     ) -> Any:
         request_id = uuid.uuid4().hex
         payload = json.dumps(
@@ -464,8 +531,19 @@ class LeanRuntimeClient:
 
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         dispatched = False
+
+        def bounded_timeout(configured: float) -> float:
+            if deadline is None:
+                return configured
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LeanRuntimeUnavailable(
+                    "Lean runtime request deadline expired before dispatch"
+                )
+            return min(configured, remaining)
+
         try:
-            connection.settimeout(self.connect_timeout)
+            connection.settimeout(bounded_timeout(self.connect_timeout))
             try:
                 connection.connect(str(self.paths.socket))
             except (FileNotFoundError, ConnectionRefusedError) as error:
@@ -479,7 +557,12 @@ class LeanRuntimeClient:
                     ) from error
                 raise LeanRuntimeError(f"cannot connect to Lean runtime: {error}") from error
 
-            connection.settimeout(response_timeout or self.response_timeout)
+            configured_response_timeout = (
+                self.response_timeout
+                if response_timeout is None
+                else response_timeout
+            )
+            connection.settimeout(bounded_timeout(configured_response_timeout))
             # From this point onward, any failure is ambiguous: the daemon may
             # have received the request. Never auto-replay Lean execution.
             dispatched = True

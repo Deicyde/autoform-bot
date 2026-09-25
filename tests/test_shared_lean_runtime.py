@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import subprocess
 import sys
@@ -68,6 +69,9 @@ class FakePool:
     def get_memory_usage(self):
         return 0.25
 
+    def is_usable(self):
+        return not self._shutdown
+
     def shutdown(self):
         self._shutdown = True
 
@@ -129,6 +133,30 @@ def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path):
         services.close()
 
     assert pools[0]._shutdown is True
+
+
+def test_status_reports_an_active_poisoned_pool_as_retiring(tmp_path):
+    project = make_lake_project(tmp_path, "retiring-status")
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=FakePool,
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        with services.repl_projects.lease(str(project)) as pool:
+            assert pool is not None
+            pool._shutdown = True
+
+            status = services.dispatch(
+                "repl.status",
+                {"project_dir": str(project)},
+            )
+
+            assert status["state"] == "retiring"
+            assert status["shutdown"] is True
+    finally:
+        services.close()
 
 
 def test_shared_runtime_disables_ambiguous_repl_retries(tmp_path, monkeypatch):
@@ -281,6 +309,204 @@ def test_idle_ttl_never_closes_an_active_resource(tmp_path):
     cache.close()
 
 
+def test_failed_retirement_blocks_replacement_without_losing_ownership(tmp_path):
+    first = make_lake_project(tmp_path, "retiring-first")
+    second = make_lake_project(tmp_path, "retiring-second")
+    created = []
+    allow_close = False
+
+    def factory(root):
+        created.append(root)
+        return root
+
+    def close(resource):
+        if not allow_close:
+            raise RuntimeError("cleanup failed")
+
+    cache = ProjectResourceCache(
+        factory,
+        close,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(first)):
+        pass
+
+    with pytest.raises(ProjectResourceBusyError, match="failed to retire"):
+        with cache.lease(str(second)):
+            pytest.fail("replacement must wait for confirmed cleanup")
+
+    assert created == [first.resolve()]
+    assert cache.state(str(first)) == "retiring"
+    assert cache.stats()["retiring"] == [str(first.resolve())]
+
+    allow_close = True
+    with cache.lease(str(second)) as resource:
+        assert resource == second.resolve()
+    assert created == [first.resolve(), second.resolve()]
+    cache.close()
+
+
+def test_concurrent_replacement_has_only_one_retirement_owner(tmp_path):
+    first = make_lake_project(tmp_path, "single-closer-first")
+    second = make_lake_project(tmp_path, "single-closer-second")
+    close_started = threading.Event()
+    release_close = threading.Event()
+    concurrent_close = threading.Event()
+    close_active = 0
+    first_close_calls = 0
+
+    def close(resource):
+        nonlocal close_active, first_close_calls
+        if resource != first.resolve():
+            return
+        first_close_calls += 1
+        close_active += 1
+        if close_active > 1:
+            concurrent_close.set()
+        close_started.set()
+        release_close.wait(timeout=2)
+        close_active -= 1
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        close,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(first)):
+        pass
+
+    errors = []
+
+    def replace():
+        try:
+            with cache.lease(str(second)):
+                pass
+        except BaseException as error:
+            errors.append(error)
+
+    callers = [threading.Thread(target=replace) for _ in range(2)]
+    callers[0].start()
+    assert close_started.wait(timeout=1)
+    callers[1].start()
+    assert not concurrent_close.wait(timeout=0.1)
+    release_close.set()
+    for caller in callers:
+        caller.join(timeout=2)
+
+    assert all(not caller.is_alive() for caller in callers)
+    assert errors == []
+    assert first_close_calls == 1
+    cache.close()
+
+
+def test_cache_close_retains_failed_resources_for_a_later_retry(tmp_path):
+    project = make_lake_project(tmp_path, "close-retry")
+    close_calls = 0
+
+    def close(resource):
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise RuntimeError("cleanup failed")
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        close,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+
+    with pytest.raises(RuntimeError, match="failed to retire 1"):
+        cache.close()
+
+    assert cache.stats()["retiring"] == [str(project.resolve())]
+    cache.close()
+    assert close_calls == 2
+    assert cache.stats()["retiring"] == []
+
+
+def test_lease_preserves_operation_cancellation_when_release_also_fails(tmp_path):
+    project = make_lake_project(tmp_path, "release-cancellation")
+
+    def is_valid(resource):
+        raise asyncio.CancelledError("release")
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="operation") as raised:
+        with cache.lease(str(project)):
+            raise KeyboardInterrupt("operation")
+
+    if hasattr(raised.value, "add_note"):
+        assert raised.value.__notes__ == [
+            "Lean project resource release also failed: release"
+        ]
+    cache.close()
+
+
+def test_services_attempt_lsp_cleanup_after_repl_cleanup_failure(monkeypatch):
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=FakePool,
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    lsp_closed = []
+    monkeypatch.setattr(
+        services.repl_projects,
+        "close",
+        lambda: (_ for _ in ()).throw(RuntimeError("REPL cleanup failed")),
+    )
+    monkeypatch.setattr(
+        services.lsp_projects,
+        "close",
+        lambda: lsp_closed.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="REPL cleanup failed"):
+        services.close()
+
+    assert lsp_closed == [True]
+
+
+def test_terminal_cleanup_retries_without_releasing_ownership(monkeypatch):
+    from servers import lean_runtime
+
+    close_calls = 0
+    delays = []
+
+    class Services:
+        def close(self):
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls < 3:
+                raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(lean_runtime.time, "sleep", delays.append)
+
+    lean_runtime._close_services_until_clean(Services())
+
+    assert close_calls == 3
+    assert delays == [
+        lean_runtime.TERMINAL_CLEANUP_RETRY_SECONDS,
+        lean_runtime.TERMINAL_CLEANUP_RETRY_SECONDS * 2,
+    ]
+
+
 def test_stdio_mcp_adapters_delegate_without_owning_lean_state():
     from servers.lsp.server import create_lsp_server
     from servers.repl.server import create_repl_server
@@ -363,6 +589,114 @@ def test_lsp_diagnostic_formatting_remains_stable():
         "Diagnostics: 1 error(s), 0 warning(s)\n"
         "3:4: error: unknown identifier"
     )
+
+
+def test_startup_times_out_while_previous_runtime_retains_lifetime_lock(
+    runtime_dir,
+    monkeypatch,
+):
+    import fcntl
+
+    socket_path = runtime_dir / "retiring.sock"
+    client = LeanRuntimeClient(socket_path=socket_path, startup_timeout=0.01)
+    lock_calls = 0
+
+    def flock(fd, operation):
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 1:
+            return
+        raise BlockingIOError
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+
+    with pytest.raises(LeanRuntimeUnavailable, match="still be cleaning up"):
+        client.ensure_running()
+
+
+def test_startup_does_not_acquire_a_free_lock_after_its_deadline(
+    runtime_dir,
+    monkeypatch,
+):
+    from servers import lean_client
+
+    client = LeanRuntimeClient(
+        socket_path=runtime_dir / "expired.sock",
+        startup_timeout=1,
+    )
+    now = [100.0]
+    lock_calls = []
+
+    def unavailable_ping(*, autostart=False, deadline=None):
+        now[0] = 102.0
+        raise LeanRuntimeUnavailable("not listening")
+
+    monkeypatch.setattr(lean_client.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(client, "ping", unavailable_ping)
+    monkeypatch.setattr(
+        "fcntl.flock",
+        lambda *args: lock_calls.append(args),
+    )
+
+    with pytest.raises(LeanRuntimeUnavailable, match="startup coordination"):
+        client.ensure_running()
+
+    assert lock_calls == []
+
+
+def test_previous_build_shutdown_uses_the_startup_deadline(runtime_dir, monkeypatch):
+    from servers import lean_client
+
+    current_socket = runtime_dir / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-new.sock"
+    old_socket = runtime_dir / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-old.sock"
+    old_socket.touch()
+    client = LeanRuntimeClient(socket_path=current_socket)
+    client._uses_default_paths = True
+    calls = []
+
+    class PreviousClient:
+        def __init__(self, *, socket_path, **kwargs):
+            assert socket_path == old_socket
+
+        def request(self, method, *, autostart, deadline):
+            calls.append((method, deadline))
+            return {"build_generation": 0}
+
+        def stop(self, *, deadline):
+            calls.append(("stop", deadline))
+            return {"pid": 7}
+
+    monkeypatch.setattr(lean_client, "LeanRuntimeClient", PreviousClient)
+
+    assert client._stop_previous_builds(deadline=123.0) == [7]
+    assert calls == [("daemon.ping", 123.0), ("stop", 123.0)]
+
+
+def test_failed_start_never_hard_kills_a_daemon_that_may_own_work(runtime_dir):
+    client = LeanRuntimeClient(socket_path=runtime_dir / "failed-start.sock")
+
+    class Process:
+        returncode = None
+        terminate_calls = 0
+        kill_calls = 0
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired("runtime", timeout)
+
+        def kill(self):
+            self.kill_calls += 1
+
+    process = Process()
+    client._terminate_failed_start(process)
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
 
 
 def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(runtime_dir, monkeypatch):
@@ -477,6 +811,8 @@ def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
 
 
 def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, monkeypatch):
+    import fcntl
+
     monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
     old_socket = runtime_dir / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-old.sock"
@@ -488,6 +824,12 @@ def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, m
         current_pid = current.ensure_running()["pid"]
         assert current_pid != old_pid
         assert not old_socket.exists()
+        lifetime_fd = os.open(current.paths.lifetime_lock, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(lifetime_fd)
     finally:
         current.stop()
 
@@ -589,11 +931,23 @@ def test_per_project_workers_cannot_exceed_node_budget(monkeypatch):
         LeanRuntimeConfig.from_environment()
 
 
-def test_response_budget_includes_replacement_and_failed_pool_cleanup(monkeypatch):
+def test_response_budget_does_not_scale_with_cold_repl_pool_size(monkeypatch):
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "3")
     monkeypatch.setenv("AUTOFORM_REPL_WORKERS_PER_PROJECT", "3")
     monkeypatch.setenv("AUTOFORM_RUNTIME_RESPONSE_TIMEOUT", "860")
-    with pytest.raises(ValueError, match="REPL worker startup"):
+
+    config = LeanRuntimeConfig.from_environment()
+
+    assert config.repl_workers_per_project == 3
+    assert config.response_timeout == 860
+
+
+def test_response_budget_must_leave_room_for_repl_cleanup(monkeypatch):
+    monkeypatch.setenv("AUTOFORM_RUNTIME_RESPONSE_TIMEOUT", "272")
+    monkeypatch.setenv("LEAN_LSP_TIMEOUT", "1")
+    monkeypatch.setenv("AUTOFORM_MAX_LSP_REQUEST_SECONDS", "1")
+
+    with pytest.raises(ValueError, match="REPL request and cleanup limits"):
         LeanRuntimeConfig.from_environment()
 
 

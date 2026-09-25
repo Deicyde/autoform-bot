@@ -46,10 +46,10 @@ from servers.lsp.server import (
     LspProtocolError,
     format_lsp_diagnostics,
 )
-from servers.repl.core import DEFAULT_REPL_STARTUP_TIMEOUT, format_repl_response
+from servers.repl.core import format_repl_response
 from servers.repl.pool import (
+    DEFAULT_POOL_CLEANUP_SECONDS,
     DEFAULT_RAM_FRACTION,
-    DEFAULT_STARTUP_STAGGER_SECONDS,
     LeanReplPool,
     LeanReplPoolConfig,
 )
@@ -62,30 +62,22 @@ DEFAULT_MAX_PROJECTS = 4
 DEFAULT_IDLE_SECONDS = 30 * 60
 DEFAULT_LSP_TIMEOUT = 60.0
 DEFAULT_MAX_LSP_REQUEST_SECONDS = 600.0
-DEFAULT_REPL_REQUEST_TIMEOUT = 30.0
+DEFAULT_REPL_REQUEST_TIMEOUT = 180.0
 DEFAULT_MAX_REPL_REQUEST_SECONDS = 240.0
 DEFAULT_RPC_READ_TIMEOUT = 10.0
 DEFAULT_MAX_CONNECTIONS = 64
 RUNTIME_SAFETY_SECONDS = 30.0
-# Conservative bounds for cleanup/startup work that surrounds one tool call.
+TERMINAL_CLEANUP_RETRY_SECONDS = 0.05
+MAX_TERMINAL_CLEANUP_RETRY_SECONDS = 1.0
+# Conservative bounds for cleanup/startup work that surrounds one LSP call.
 # They keep the daemon's work inside the client's response deadline even when
 # an inactive project must be replaced first.
-REPL_WORKER_CLOSE_BUDGET = 10.0
 LSP_STARTUP_BUDGET = 60.0
 LSP_CLOSE_BUDGET = 65.0
 
 
 class ProjectResourceBusyError(TimeoutError):
     """A shared project slot could not be admitted within the RPC budget."""
-
-
-def _repl_creation_budget(worker_count: int) -> float:
-    """Bound victim cleanup, cold startup, and failed-start cleanup."""
-    return (
-        worker_count * DEFAULT_REPL_STARTUP_TIMEOUT
-        + max(0, worker_count - 1) * DEFAULT_STARTUP_STAGGER_SECONDS
-        + 2 * worker_count * REPL_WORKER_CLOSE_BUDGET
-    )
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -209,16 +201,15 @@ class LeanRuntimeConfig:
             "AUTOFORM_RUNTIME_RESPONSE_TIMEOUT",
             DEFAULT_RESPONSE_TIMEOUT,
         )
-        repl_creation_budget = _repl_creation_budget(workers_per_project)
         if (
-            repl_creation_budget
-            + max_repl_request_seconds
+            max_repl_request_seconds
+            + DEFAULT_POOL_CLEANUP_SECONDS
             + RUNTIME_SAFETY_SECONDS
-            > response_timeout
+            >= response_timeout
         ):
             raise ValueError(
                 "AUTOFORM_RUNTIME_RESPONSE_TIMEOUT is too small for the configured "
-                "REPL worker startup and request limits"
+                "REPL request and cleanup limits"
             )
         if (
             LSP_CLOSE_BUDGET
@@ -319,6 +310,8 @@ class ProjectResourceCache(Generic[T]):
         self._is_valid = is_valid
         self._clock = clock
         self._entries: dict[Path, _CacheEntry[T]] = {}
+        self._retiring: dict[Path, T] = {}
+        self._retiring_active: set[Path] = set()
         self._creating: set[Path] = set()
         self._condition = threading.Condition()
         self._closed = False
@@ -351,11 +344,25 @@ class ProjectResourceCache(Generic[T]):
             acquisition_timeout=acquisition_timeout,
             creation_budget=creation_budget,
         )
+        operation_error: BaseException | None = None
         try:
             yield resource
-        finally:
+        except BaseException as error:
+            operation_error = error
+        try:
             if resource is not None:
                 self._release(root, resource)
+        except BaseException as cleanup_error:
+            if operation_error is None:
+                raise
+            note = f"Lean project resource release also failed: {cleanup_error}"
+            add_note = getattr(operation_error, "add_note", None)
+            if add_note is not None:
+                add_note(note)
+            else:  # pragma: no cover - Python 3.10 compatibility
+                logger.error("%s", note)
+        if operation_error is not None:
+            raise operation_error.with_traceback(operation_error.__traceback__)
 
     def stats(self) -> dict[str, Any]:
         with self._condition:
@@ -366,22 +373,35 @@ class ProjectResourceCache(Generic[T]):
                     {
                         "project_dir": str(root),
                         "active": entry.active,
-                        "valid": not entry.invalid,
+                        "valid": (
+                            not entry.invalid
+                            and (
+                                self._is_valid is None
+                                or self._is_valid(entry.resource)
+                            )
+                        ),
                         "idle_seconds": round(max(0.0, now - entry.last_used), 3),
                     }
                     for root, entry in sorted(
                         self._entries.items(), key=lambda item: str(item[0])
                     )
                 ],
+                "retiring": sorted(str(root) for root in self._retiring),
                 "creating": sorted(str(root) for root in self._creating),
             }
 
     def state(self, project_dir: str) -> str:
-        """Return ``cold``, ``warming``, or ``warm`` without creating state."""
+        """Return the current project-resource lifecycle state."""
         root = resolve_lean_project_dir(project_dir)
         with self._condition:
-            if root in self._entries:
-                return "warm"
+            entry = self._entries.get(root)
+            if entry is not None:
+                valid = not entry.invalid and (
+                    self._is_valid is None or self._is_valid(entry.resource)
+                )
+                return "warm" if valid else "retiring"
+            if root in self._retiring:
+                return "retiring"
             if root in self._creating:
                 return "warming"
             return "cold"
@@ -400,31 +420,76 @@ class ProjectResourceCache(Generic[T]):
         if self._idle_seconds <= 0:
             return 0
         with self._condition:
+            if self._closed:
+                return 0
             now = self._clock()
             victims = [
                 root
                 for root, entry in self._entries.items()
                 if entry.active == 0 and now - entry.last_used >= self._idle_seconds
             ]
-            resources = [self._entries.pop(root).resource for root in victims]
+            for root in victims:
+                self._retiring[root] = self._entries.pop(root).resource
+            retiring = [
+                (root, resource)
+                for root, resource in self._retiring.items()
+                if root not in self._retiring_active
+            ]
             if victims:
                 self._condition.notify_all()
-        self._close_many(resources)
-        return len(resources)
+        for root, resource in retiring:
+            with self._condition:
+                if (
+                    self._retiring.get(root) is not resource
+                    or root in self._retiring_active
+                ):
+                    continue
+                self._retiring_active.add(root)
+            self._retire(root, resource)
+        return len(victims)
 
     def close(self) -> None:
         """Stop admission, wait for active leases, then close all resources."""
         self._stop_sweeper.set()
         with self._condition:
             self._closed = True
-            while self._creating or any(entry.active for entry in self._entries.values()):
+            while (
+                self._creating
+                or self._retiring_active
+                or any(entry.active for entry in self._entries.values())
+            ):
                 self._condition.wait(timeout=0.5)
-            resources = [entry.resource for entry in self._entries.values()]
+            for root, entry in self._entries.items():
+                self._retiring[root] = entry.resource
             self._entries.clear()
+            retiring = list(self._retiring.items())
             self._condition.notify_all()
-        self._close_many(resources)
-        if self._sweeper and self._sweeper is not threading.current_thread():
-            self._sweeper.join()
+        first_error: BaseException | None = None
+        try:
+            for root, resource in retiring:
+                with self._condition:
+                    self._condition.wait_for(
+                        lambda: root not in self._retiring_active
+                    )
+                    if self._retiring.get(root) is not resource:
+                        continue
+                    self._retiring_active.add(root)
+                try:
+                    self._retire(root, resource)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+        finally:
+            if self._sweeper and self._sweeper is not threading.current_thread():
+                self._sweeper.join()
+        if first_error is not None:
+            raise first_error.with_traceback(first_error.__traceback__)
+        with self._condition:
+            failed = len(self._retiring)
+        if failed:
+            raise RuntimeError(
+                f"failed to retire {failed} Lean project resource(s)"
+            )
 
     def _acquire(
         self,
@@ -446,38 +511,17 @@ class ProjectResourceCache(Generic[T]):
             if acquisition_timeout is not None
             else None
         )
-        resources_to_close: list[T] = []
-        reserved = False
-
         while True:
             wait = False
+            retirement: tuple[Path, T] | None = None
             with self._condition:
                 if self._closed:
                     raise RuntimeError("project resource cache is closed")
 
-                entry = self._entries.get(root)
-                entry_is_stale = (
-                    entry is not None
-                    and (
-                        entry.invalid
-                        or entry.fingerprint != fingerprint
-                        or (
-                            self._is_valid is not None
-                            and not self._is_valid(entry.resource)
-                        )
-                    )
-                )
-                if entry_is_stale:
-                    assert entry is not None
-                    if entry.active:
-                        if not create:
-                            resource = None
-                            break
-                        self._require_creation_budget(
-                            root,
-                            deadline=deadline,
-                            creation_budget=creation_budget,
-                        )
+                if root in self._retiring:
+                    if not create:
+                        return None
+                    if root in self._retiring_active:
                         wait = True
                     else:
                         self._require_creation_budget(
@@ -485,34 +529,72 @@ class ProjectResourceCache(Generic[T]):
                             deadline=deadline,
                             creation_budget=creation_budget,
                         )
-                        resources_to_close.append(self._entries.pop(root).resource)
-                        self._condition.notify_all()
-                        entry = None
+                        self._retiring_active.add(root)
+                        retirement = (root, self._retiring[root])
+                    entry = None
+                else:
+                    entry = self._entries.get(root)
+                    entry_is_stale = (
+                        entry is not None
+                        and (
+                            entry.invalid
+                            or entry.fingerprint != fingerprint
+                            or (
+                                self._is_valid is not None
+                                and not self._is_valid(entry.resource)
+                            )
+                        )
+                    )
+                    if entry_is_stale:
+                        assert entry is not None
+                        if entry.active:
+                            if not create:
+                                return None
+                            self._require_creation_budget(
+                                root,
+                                deadline=deadline,
+                                creation_budget=creation_budget,
+                            )
+                            wait = True
+                        else:
+                            self._require_creation_budget(
+                                root,
+                                deadline=deadline,
+                                creation_budget=creation_budget,
+                            )
+                            resource = self._entries.pop(root).resource
+                            self._retiring[root] = resource
+                            self._retiring_active.add(root)
+                            retirement = (root, resource)
+                            self._condition.notify_all()
+                            entry = None
 
-                if not wait and entry is not None:
+                if retirement is None and not wait and entry is not None:
                     if deadline is not None and self._clock() >= deadline:
                         raise ProjectResourceBusyError(
                             f"timed out waiting for a shared Lean project slot: {root}"
                         )
                     entry.active += 1
                     entry.last_used = self._clock()
-                    resource = entry.resource
-                    break
+                    return entry.resource
 
-                if not wait and entry is None and not create:
-                    resource = None
-                    break
+                if retirement is None and not wait and entry is None and not create:
+                    return None
 
-                if not wait and root in self._creating:
+                if retirement is None and not wait and root in self._creating:
                     wait = True
 
-                if not wait:
+                if retirement is None and not wait:
                     self._require_creation_budget(
                         root,
                         deadline=deadline,
                         creation_budget=creation_budget,
                     )
-                    occupied = len(self._entries) + len(self._creating)
+                    occupied = (
+                        len(self._entries)
+                        + len(self._creating)
+                        + len(self._retiring)
+                    )
                     if occupied >= self._max_entries:
                         inactive = [
                             (candidate.last_used, path)
@@ -521,36 +603,51 @@ class ProjectResourceCache(Generic[T]):
                         ]
                         if inactive:
                             _, victim = min(inactive)
-                            resources_to_close.append(self._entries.pop(victim).resource)
+                            resource = self._entries.pop(victim).resource
+                            self._retiring[victim] = resource
+                            self._retiring_active.add(victim)
+                            retirement = (victim, resource)
+                            self._condition.notify_all()
+                        elif any(
+                            path not in self._retiring_active
+                            for path in self._retiring
+                        ):
+                            retiring_root = next(
+                                path
+                                for path in self._retiring
+                                if path not in self._retiring_active
+                            )
+                            self._retiring_active.add(retiring_root)
+                            retirement = (
+                                retiring_root,
+                                self._retiring[retiring_root],
+                            )
                         else:
                             wait = True
 
-                if not wait:
+                if retirement is None and not wait:
                     self._creating.add(root)
-                    reserved = True
                     self._condition.notify_all()
-                    resource = None
                     break
 
-                wait_seconds = 0.5
-                if deadline is not None:
-                    remaining = deadline - self._clock()
-                    if remaining <= 0:
-                        raise ProjectResourceBusyError(
-                            f"timed out waiting for a shared Lean project slot: {root}"
-                        )
-                    wait_seconds = min(wait_seconds, remaining)
-                self._condition.wait(timeout=wait_seconds)
+                if retirement is None:
+                    wait_seconds = 0.5
+                    if deadline is not None:
+                        remaining = deadline - self._clock()
+                        if remaining <= 0:
+                            raise ProjectResourceBusyError(
+                                f"timed out waiting for a shared Lean project slot: {root}"
+                            )
+                        wait_seconds = min(wait_seconds, remaining)
+                    self._condition.wait(timeout=wait_seconds)
 
-            if resources_to_close:
-                self._close_many(resources_to_close)
-                resources_to_close.clear()
-
-        if resources_to_close:
-            self._close_many(resources_to_close)
-
-        if not reserved:
-            return resource
+            if retirement is not None:
+                retiring_root, retiring_resource = retirement
+                if not self._retire(retiring_root, retiring_resource):
+                    raise ProjectResourceBusyError(
+                        "failed to retire a stale Lean project resource: "
+                        f"{retiring_root}"
+                    )
 
         try:
             created = self._factory(root)
@@ -576,9 +673,16 @@ class ProjectResourceCache(Generic[T]):
                     last_used=self._clock(),
                     active=1,
                 )
+            if close_created:
+                self._retiring[root] = created
+                self._retiring_active.add(root)
             self._condition.notify_all()
         if close_created:
-            self._safe_close(created)
+            cleaned = self._retire(root, created)
+            if not cleaned:
+                raise ProjectResourceBusyError(
+                    f"failed to retire a late Lean project resource: {root}"
+                )
             if startup_expired:
                 raise ProjectResourceBusyError(
                     f"shared Lean project startup exceeded its response budget: {root}"
@@ -601,13 +705,41 @@ class ProjectResourceCache(Generic[T]):
             )
 
     def _release(self, root: Path, resource: T) -> None:
+        retirement: tuple[Path, T] | None = None
+        validation_error: BaseException | None = None
         with self._condition:
             entry = self._entries.get(root)
             if entry is None or entry.resource is not resource:
                 raise RuntimeError("project resource lease is no longer registered")
             entry.active -= 1
             entry.last_used = self._clock()
+            invalid = entry.invalid
+            if not invalid and self._is_valid is not None:
+                try:
+                    invalid = not self._is_valid(resource)
+                except BaseException as error:
+                    validation_error = error
+                    invalid = True
+            if entry.active == 0 and invalid:
+                self._entries.pop(root)
+                self._retiring[root] = resource
+                self._retiring_active.add(root)
+                retirement = (root, resource)
             self._condition.notify_all()
+        if retirement is not None:
+            try:
+                self._retire(*retirement)
+            except BaseException as cleanup_error:
+                if validation_error is None:
+                    raise
+                note = f"Lean project resource cleanup also failed: {cleanup_error}"
+                add_note = getattr(validation_error, "add_note", None)
+                if add_note is not None:
+                    add_note(note)
+                else:  # pragma: no cover - Python 3.10 compatibility
+                    logger.error("%s", note)
+        if validation_error is not None:
+            raise validation_error.with_traceback(validation_error.__traceback__)
 
     def _sweep(self, interval: float) -> None:
         while not self._stop_sweeper.wait(interval):
@@ -616,15 +748,23 @@ class ProjectResourceCache(Generic[T]):
             except Exception:
                 logger.exception("failed to evict idle Lean project resources")
 
-    def _close_many(self, resources: list[T]) -> None:
-        for resource in resources:
-            self._safe_close(resource)
-
-    def _safe_close(self, resource: T) -> None:
+    def _retire(self, root: Path, resource: T) -> bool:
+        """Try one bounded close while retaining failed ownership in quarantine."""
+        succeeded = False
         try:
             self._close_resource(resource)
         except Exception:
             logger.exception("failed to close Lean project resource")
+            return False
+        else:
+            succeeded = True
+            return True
+        finally:
+            with self._condition:
+                self._retiring_active.discard(root)
+                if succeeded and self._retiring.get(root) is resource:
+                    self._retiring.pop(root)
+                self._condition.notify_all()
 
 
 class LeanRuntimeServices:
@@ -640,9 +780,6 @@ class LeanRuntimeServices:
     ) -> None:
         self.config = config or LeanRuntimeConfig.from_environment()
         self.started_at = time.monotonic()
-        self.repl_creation_budget = _repl_creation_budget(
-            self.config.repl_workers_per_project
-        )
         self.lsp_creation_budget = LSP_STARTUP_BUDGET + LSP_CLOSE_BUDGET
 
         def default_repl_factory(project_dir: Path) -> LeanReplPool:
@@ -666,11 +803,15 @@ class LeanRuntimeServices:
             session.start()
             return session
 
+        def close_repl_pool(pool: LeanReplPool) -> None:
+            pool.shutdown()
+
         self.repl_projects = ProjectResourceCache(
             repl_factory or default_repl_factory,
-            lambda pool: pool.shutdown(),
+            close_repl_pool,
             max_entries=self.config.repl_project_limit,
             idle_seconds=self.config.idle_seconds,
+            is_valid=lambda pool: getattr(pool, "is_usable", lambda: True)(),
             start_sweeper=start_sweepers,
         )
         self.lsp_projects = ProjectResourceCache(
@@ -710,14 +851,18 @@ class LeanRuntimeServices:
             with self.repl_projects.lease(
                 project_dir,
                 acquisition_timeout=self._acquisition_timeout(effective_timeout),
-                creation_budget=self.repl_creation_budget,
+                creation_budget=DEFAULT_POOL_CLEANUP_SECONDS,
             ) as pool:
                 assert pool is not None
                 return format_repl_response(pool.run(code, timeout=effective_timeout))
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")
             with self.repl_projects.lease(project_dir, create=False) as pool:
-                state = "warm" if pool is not None else self.repl_projects.state(project_dir)
+                state = (
+                    "warm"
+                    if pool is not None
+                    else self.repl_projects.state(project_dir)
+                )
                 return {
                     "state": state,
                     "capacity": (
@@ -728,7 +873,9 @@ class LeanRuntimeServices:
                     "memory_usage_gb": (
                         round(pool.get_memory_usage(), 2) if pool is not None else 0.0
                     ),
-                    "shutdown": pool._shutdown if pool is not None else False,
+                    "shutdown": (
+                        pool._shutdown if pool is not None else state == "retiring"
+                    ),
                     "daemon_pid": os.getpid(),
                     "node_total_workers": self.config.total_repl_workers,
                 }
@@ -792,8 +939,23 @@ class LeanRuntimeServices:
         return result
 
     def close(self) -> None:
-        self.repl_projects.close()
-        self.lsp_projects.close()
+        repl_error: BaseException | None = None
+        try:
+            self.repl_projects.close()
+        except BaseException as error:
+            repl_error = error
+        try:
+            self.lsp_projects.close()
+        except BaseException as lsp_error:
+            if repl_error is None:
+                raise
+            add_note = getattr(repl_error, "add_note", None)
+            if add_note is not None:
+                add_note(f"Lean LSP cleanup also failed: {lsp_error}")
+            else:  # pragma: no cover - Python 3.10 compatibility
+                logger.error("Lean LSP cleanup also failed: %s", lsp_error)
+        if repl_error is not None:
+            raise repl_error.with_traceback(repl_error.__traceback__)
 
     def _acquisition_timeout(self, operation_timeout: float) -> float:
         """Reserve enough of the RPC deadline for the admitted tool operation."""
@@ -949,6 +1111,21 @@ class LeanRuntimeRequestHandler(socketserver.StreamRequestHandler):
             self.server.request_shutdown()
 
 
+def _close_services_until_clean(services: LeanRuntimeServices) -> None:
+    """Keep terminal ownership until every quarantined child is gone."""
+    delay = TERMINAL_CLEANUP_RETRY_SECONDS
+    while True:
+        try:
+            services.close()
+            return
+        except Exception:
+            logger.exception(
+                "Lean runtime cleanup remains incomplete; retaining ownership"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, MAX_TERMINAL_CLEANUP_RETRY_SECONDS)
+
+
 def _configure_logging(log_path: Path | None) -> None:
     handlers: list[logging.Handler] = []
     if log_path is not None:
@@ -1014,7 +1191,7 @@ def serve(paths: RuntimePaths) -> None:
         finally:
             try:
                 if services is not None:
-                    services.close()
+                    _close_services_until_clean(services)
             finally:
                 try:
                     info = paths.socket.lstat()
@@ -1029,22 +1206,33 @@ def serve(paths: RuntimePaths) -> None:
                 os.close(lifetime_fd)
 
 
-def _paths_from_args(socket_path: str | None, log_path: str | None) -> RuntimePaths:
+def _paths_from_args(
+    socket_path: str | None,
+    log_path: str | None,
+    lifetime_lock_path: str | None = None,
+) -> RuntimePaths:
     paths = (
         runtime_paths_for_socket(socket_path)
         if socket_path is not None
         else default_runtime_paths()
     )
-    if log_path is None:
+    if log_path is None and lifetime_lock_path is None:
         return paths
-    log = Path(log_path).expanduser()
+    log = paths.log if log_path is None else Path(log_path).expanduser()
+    lifetime_lock = (
+        paths.lifetime_lock
+        if lifetime_lock_path is None
+        else Path(lifetime_lock_path).expanduser()
+    )
     if not log.is_absolute():
         raise LeanRuntimeError("Lean runtime log path must be absolute")
+    if not lifetime_lock.is_absolute():
+        raise LeanRuntimeError("Lean runtime lifetime lock path must be absolute")
     return RuntimePaths(
         directory=paths.directory,
         socket=paths.socket,
         lock=paths.lock,
-        lifetime_lock=paths.lifetime_lock,
+        lifetime_lock=lifetime_lock,
         log=log,
     )
 
@@ -1053,6 +1241,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", help="override the Unix socket path")
     parser.add_argument("--log", help="override the rotating log path")
+    parser.add_argument("--lifetime-lock", help="override the runtime lifetime lock")
     parser.add_argument(
         "command",
         choices=("serve", "start", "status", "stop"),
@@ -1060,7 +1249,7 @@ def main(argv: list[str] | None = None) -> None:
         default="status",
     )
     args = parser.parse_args(argv)
-    paths = _paths_from_args(args.socket, args.log)
+    paths = _paths_from_args(args.socket, args.log, args.lifetime_lock)
 
     if args.command == "serve":
         serve(paths)
