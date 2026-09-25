@@ -865,6 +865,8 @@ class LeanRepl:
             if not allow_expired and deadline - time.monotonic() <= 0:
                 raise TimeoutError("REPL command deadline exceeded after dispatch")
             current = lean_project_fingerprint(project_identity)
+            if not allow_expired and deadline - time.monotonic() <= 0:
+                raise TimeoutError("REPL command deadline exceeded after dispatch")
             if current != expected:
                 raise RuntimeError("Lean project changed after REPL dispatch")
         except (OSError, TimeoutError, RuntimeError) as error:

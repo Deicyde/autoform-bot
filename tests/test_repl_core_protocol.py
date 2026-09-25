@@ -1005,6 +1005,45 @@ def test_run_disposable_reports_project_change_after_dispatch_as_unknown(
     assert "freshness changed" in response["repl_error"]
 
 
+def test_run_disposable_fingerprint_work_cannot_extend_the_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    now = [100.0]
+    fingerprint = object()
+    fingerprint_calls = 0
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+
+    def project_fingerprint(project_identity):
+        nonlocal fingerprint_calls
+        fingerprint_calls += 1
+        if fingerprint_calls == 3:
+            now[0] = 102.0
+        return fingerprint
+
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(repl_core, "lean_project_fingerprint", project_fingerprint)
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: {"env": 1, "messages": [], "sorries": []},
+    )
+
+    response = repl.run_disposable("#check Nat", timeout=1)
+
+    assert response["outcome_unknown"] is True
+    assert "freshness changed" in response["repl_error"]
+    assert fingerprint_calls == 3
+
+
 class _PipeProcess:
     def __init__(self, stack: ExitStack, stdout_chunks: list[bytes], stderr: bytes = b""):
         stdin_read, stdin_write = os.pipe()
