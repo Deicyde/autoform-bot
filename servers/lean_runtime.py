@@ -755,107 +755,93 @@ class ProjectResourceCache(Generic[T]):
                 self._condition.notify_all()
             raise
 
-        if deadline is None:
-            try:
-                created = self._factory(root)
-            except BaseException:
-                with self._condition:
-                    self._creating.discard(root)
-                    self._condition.notify_all()
-                raise
-            disposition = self._settle_created_resource(
-                root,
-                created,
-                fingerprint=fingerprint,
-                required_fingerprint=required_fingerprint,
-            )
-        else:
-            future: Future[None] = Future()
-            factory_outcome: list[tuple[bool, Any]] = []
-            start_gate = threading.Event()
-            start_decision = {"run": False}
+        future: Future[None] = Future()
+        factory_outcome: list[tuple[bool, Any]] = []
+        start_gate = threading.Event()
+        start_decision = {"run": False}
 
-            def log_abandoned_failure(completed: Future[None]) -> None:
-                del completed
-                succeeded, outcome = factory_outcome[0]
-                if not succeeded:
-                    assert isinstance(outcome, BaseException)
-                    logger.error(
-                        "Lean project resource startup failed after its caller "
-                        "stopped waiting",
-                        exc_info=(type(outcome), outcome, outcome.__traceback__),
-                    )
-
-            def create_resource() -> None:
-                start_gate.wait()
-                if not start_decision["run"]:
-                    return
-                try:
-                    factory = self._deadline_factory
-                    resource = (
-                        self._factory(root)
-                        if factory is None
-                        else factory(root, deadline)
-                    )
-                except BaseException as error:
-                    with self._condition:
-                        self._creating.discard(root)
-                        self._condition.notify_all()
-                    factory_outcome.append((False, error))
-                else:
-                    try:
-                        disposition = self._settle_created_resource(
-                            root,
-                            resource,
-                            fingerprint=fingerprint,
-                            required_fingerprint=required_fingerprint,
-                        )
-                    except BaseException as error:
-                        factory_outcome.append((False, error))
-                    else:
-                        factory_outcome.append(
-                            (True, (resource, disposition))
-                        )
-                future.set_result(None)
-
-            creator: threading.Thread | None = None
-            try:
-                creator = threading.Thread(
-                    target=create_resource,
-                    name="autoform-project-startup",
-                    daemon=False,
-                )
-                creator.start()
-                start_decision["run"] = True
-                start_gate.set()
-            except BaseException:
-                # The worker cannot touch the factory until this thread makes
-                # an explicit decision.  This removes Thread.start's ambiguous
-                # interruption window: a possibly launched worker observes
-                # ``run == False`` and exits without creating a resource.
-                start_gate.set()
-                if not start_decision["run"]:
-                    with self._condition:
-                        self._creating.discard(root)
-                        self._condition.notify_all()
-                raise
-
-            try:
-                future.result(timeout=max(0.0, deadline - self._clock()))
-            except FutureTimeoutError:
-                future.add_done_callback(log_abandoned_failure)
-                raise ProjectResourceBusyError(
-                    "shared Lean project startup exceeded its response "
-                    f"budget: {root}"
-                ) from None
-            except BaseException:
-                future.add_done_callback(log_abandoned_failure)
-                raise
+        def log_abandoned_failure(completed: Future[None]) -> None:
+            del completed
             succeeded, outcome = factory_outcome[0]
             if not succeeded:
                 assert isinstance(outcome, BaseException)
-                raise outcome.with_traceback(outcome.__traceback__)
-            created, disposition = outcome
+                logger.error(
+                    "Lean project resource startup failed after its caller "
+                    "stopped waiting",
+                    exc_info=(type(outcome), outcome, outcome.__traceback__),
+                )
+
+        def create_resource() -> None:
+            start_gate.wait()
+            if not start_decision["run"]:
+                return
+            try:
+                factory = self._deadline_factory if deadline is not None else None
+                resource = (
+                    self._factory(root)
+                    if factory is None
+                    else factory(root, deadline)
+                )
+            except BaseException as error:
+                with self._condition:
+                    self._creating.discard(root)
+                    self._condition.notify_all()
+                factory_outcome.append((False, error))
+            else:
+                try:
+                    disposition = self._settle_created_resource(
+                        root,
+                        resource,
+                        fingerprint=fingerprint,
+                        required_fingerprint=required_fingerprint,
+                    )
+                except BaseException as error:
+                    factory_outcome.append((False, error))
+                else:
+                    factory_outcome.append((True, (resource, disposition)))
+            future.set_result(None)
+
+        creator: threading.Thread | None = None
+        try:
+            creator = threading.Thread(
+                target=create_resource,
+                name="autoform-project-startup",
+                daemon=False,
+            )
+            creator.start()
+            start_decision["run"] = True
+            start_gate.set()
+        except BaseException:
+            # The worker cannot touch the factory until this thread makes
+            # an explicit decision.  This removes Thread.start's ambiguous
+            # interruption window: a possibly launched worker observes
+            # ``run == False`` and exits without creating a resource.
+            start_gate.set()
+            if not start_decision["run"]:
+                with self._condition:
+                    self._creating.discard(root)
+                    self._condition.notify_all()
+            raise
+
+        try:
+            if deadline is None:
+                future.result()
+            else:
+                future.result(timeout=max(0.0, deadline - self._clock()))
+        except FutureTimeoutError:
+            future.add_done_callback(log_abandoned_failure)
+            raise ProjectResourceBusyError(
+                "shared Lean project startup exceeded its response "
+                f"budget: {root}"
+            ) from None
+        except BaseException:
+            future.add_done_callback(log_abandoned_failure)
+            raise
+        succeeded, outcome = factory_outcome[0]
+        if not succeeded:
+            assert isinstance(outcome, BaseException)
+            raise outcome.with_traceback(outcome.__traceback__)
+        created, disposition = outcome
 
         if disposition == "closed":
             raise RuntimeError("project resource cache closed during startup")
