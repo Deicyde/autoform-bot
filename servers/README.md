@@ -20,9 +20,11 @@ protocol is explicitly stateful. Closing the session that started the runtime
 does not stop it; after a crash, the next tool call starts it again. Runtime
 sockets include a code fingerprint, so an in-place upgrade gracefully replaces
 the older build. The fingerprint includes the packaged server modules, Python
-runtime, and installed dependency closure. Stable lifecycle locks plus the
-released v1 lock names prevent old and new plugin processes from owning Lean
-children at the same time during an upgrade.
+runtime, and installed dependency closure. Stable daemon-lifetime locks plus
+the released v1 lock names serialize in-place upgrades. A separate shared
+child-lifetime fence is inherited by each Lean launcher and its watchdog, so a
+daemon crash cannot let a replacement start before surviving child groups are
+reaped.
 
 Lean subprocesses remain lazy. A REPL call stays pending while its fresh child
 starts, and the first LSP call stays pending while its session starts, so no
@@ -50,7 +52,8 @@ process cleanup gets a separate bounded grace period before the RPC returns.
 
 `LEAN_REPL_CMD` is a trusted local command. Its descendants must remain in the
 dedicated process group Autoform creates; a command that deliberately detaches
-with a new session escapes that operating-system cleanup boundary.
+with a new session escapes automatic termination and can block replacement of
+the runtime indefinitely.
 
 The LSP session delegates Lean's evolving JSON-RPC protocol to the pinned
 `leanclient` backend. In particular, diagnostics and hover wait on Lean's

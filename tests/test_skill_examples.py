@@ -391,6 +391,8 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "synchronization barriers",
         "Autoform's adapter responsible for policy",
         "Test\nthat boundary as a contract",
+        "OS-held lifetime fence",
+        "crash-orphan overlap",
     ):
         assert required in develop_plugin
     assert re.search(r"consumer\s+scenario", develop_plugin)

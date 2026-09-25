@@ -9,9 +9,8 @@ description: >-
 # Develop Autoform from consumer nudges
 
 Autoform is an example-based plugin for an independent formalization
-repository. Use the bundled Cabannes thesis only as an executable consumer
-example. State a consumer scenario, inspect the worktree, observe installed
-behavior, and name a refactor's invariant.
+repository. Use the bundled thesis as the executable consumer example. State
+the consumer scenario, inspect installed behavior, and name the invariant.
 
 Treat user nudges as product evidence. Distill each reusable insight into the
 owning skill so future agents need less steering. Preserve the insight,
@@ -23,6 +22,8 @@ framing, server requests, encoding, and synchronization barriers. Keep
 Autoform's adapter responsible for policy: clean startup, absolute deadlines,
 resource ownership, limits, and error translation. Test
 that boundary as a contract; duplicate wire protocol only when necessary.
+Persistent subprocesses need an OS-held lifetime fence that survives owner
+death; daemon cleanup cannot prevent crash-orphan overlap.
 
 Keep plugin and formalization roots distinct. Agents can infer routine details;
 skills should preserve only non-obvious constraints.
