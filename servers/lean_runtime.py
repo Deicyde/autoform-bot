@@ -276,6 +276,17 @@ class _CacheEntry(Generic[T]):
     invalid: bool = False
 
 
+@dataclass
+class _CacheValidation(Generic[T]):
+    resource: T
+    reservation: object
+    future: Future[tuple[bool, BaseException | None]]
+    waiters: set[object] = field(default_factory=set)
+    started: bool = False
+    abandoned: bool = False
+    error_logged: bool = False
+
+
 class ProjectResourceCache(Generic[T]):
     """Bounded project cache with active leases and idle/LRU eviction.
 
@@ -317,6 +328,7 @@ class ProjectResourceCache(Generic[T]):
         self._retiring: dict[Path, T] = {}
         self._retiring_active: dict[Path, object] = {}
         self._creating: set[Path] = set()
+        self._validating: dict[Path, _CacheValidation[T]] = {}
         self._condition = threading.Condition()
         self._closed = False
         self._stop_sweeper = threading.Event()
@@ -385,7 +397,6 @@ class ProjectResourceCache(Generic[T]):
             entries = [
                 (
                     root,
-                    entry.resource,
                     len(entry.active),
                     entry.invalid,
                     entry.last_used,
@@ -397,18 +408,12 @@ class ProjectResourceCache(Generic[T]):
             retiring = sorted(str(root) for root in self._retiring)
             creating = sorted(str(root) for root in self._creating)
         resident = []
-        for root, resource, active, invalid, last_used in entries:
-            valid = not invalid
-            if valid and self._is_valid is not None:
-                try:
-                    valid = self._is_valid(resource)
-                except Exception:
-                    valid = False
+        for root, active, invalid, last_used in entries:
             resident.append(
                 {
                     "project_dir": str(root),
                     "active": active,
-                    "valid": valid,
+                    "valid": not invalid,
                     "idle_seconds": round(max(0.0, now - last_used), 3),
                 }
             )
@@ -588,6 +593,8 @@ class ProjectResourceCache(Generic[T]):
             wait = False
             retirement: tuple[Path, T] | None = None
             candidate: T | None = None
+            validation: _CacheValidation[T] | None = None
+            validation_waiter: object | None = None
             with self._condition:
                 if self._closed:
                     raise RuntimeError("project resource cache is closed")
@@ -612,10 +619,6 @@ class ProjectResourceCache(Generic[T]):
                         and (
                             entry.invalid
                             or entry.fingerprint != fingerprint
-                            or (
-                                self._is_valid is not None
-                                and not self._is_valid(entry.resource)
-                            )
                         )
                     )
                     if entry_is_stale:
@@ -646,9 +649,25 @@ class ProjectResourceCache(Generic[T]):
                         raise ProjectResourceBusyError(
                             f"timed out waiting for a shared Lean project slot: {root}"
                         )
-                    entry.active.add(lease_token)
-                    entry.last_used = self._clock()
                     candidate = entry.resource
+                    entry.last_used = self._clock()
+                    if self._is_valid is None:
+                        entry.active.add(lease_token)
+                    else:
+                        validation_waiter = object()
+                        validation = self._validating.get(root)
+                        if validation is None:
+                            validation = self._reserve_validation(
+                                root,
+                                entry,
+                                validation_waiter,
+                            )
+                        else:
+                            try:
+                                validation.waiters.add(validation_waiter)
+                            except BaseException:
+                                validation.waiters.discard(validation_waiter)
+                                raise
 
                 if (
                     candidate is None
@@ -723,23 +742,82 @@ class ProjectResourceCache(Generic[T]):
                     self._condition.wait(timeout=wait_seconds)
 
             if candidate is not None:
+                if validation is not None:
+                    assert validation_waiter is not None
+                    try:
+                        validation_result = self._await_validation(
+                            root,
+                            validation,
+                            validation_waiter,
+                            deadline=deadline,
+                        )
+                        if validation_result is None:
+                            raise ProjectResourceBusyError(
+                                "shared Lean project validation exceeded its response "
+                                f"budget: {root}"
+                            )
+                        valid, validation_error = validation_result
+                        if validation_error is not None:
+                            raise validation_error.with_traceback(
+                                validation_error.__traceback__
+                            )
+                        if not valid:
+                            if not create:
+                                return None
+                            continue
+                        claimed = self._finish_validation_waiter(
+                            root,
+                            validation,
+                            validation_waiter,
+                            lease_token=lease_token,
+                            deadline=deadline,
+                        )
+                        if not claimed:
+                            if deadline is not None and self._clock() >= deadline:
+                                raise ProjectResourceBusyError(
+                                    "shared Lean project validation exceeded its "
+                                    f"response budget: {root}"
+                                )
+                            if not create:
+                                return None
+                            continue
+                    finally:
+                        self._finish_validation_waiter(
+                            root,
+                            validation,
+                            validation_waiter,
+                        )
                 try:
                     current_fingerprint = lean_project_fingerprint(root)
                 except OSError as error:
-                    self.invalidate(str(root), candidate)
-                    self._release(root, lease_token, deadline=deadline)
+                    self._invalidate_and_release(
+                        root,
+                        candidate,
+                        lease_token,
+                        deadline=deadline,
+                    )
                     raise ProjectResourceBusyError(
                         f"shared Lean project changed after validation: {root}"
                     ) from error
                 if current_fingerprint == fingerprint:
                     if deadline is not None and self._clock() >= deadline:
+                        self._release_without_validation(
+                            root,
+                            candidate,
+                            lease_token,
+                            deadline=deadline,
+                        )
                         raise ProjectResourceBusyError(
                             "shared Lean project validation exceeded its response "
                             f"budget: {root}"
                         )
                     return candidate
-                self.invalidate(str(root), candidate)
-                self._release(root, lease_token, deadline=deadline)
+                self._invalidate_and_release(
+                    root,
+                    candidate,
+                    lease_token,
+                    deadline=deadline,
+                )
                 if required_fingerprint is not None:
                     raise ProjectResourceBusyError(
                         f"shared Lean project changed after validation: {root}"
@@ -1086,6 +1164,340 @@ class ProjectResourceCache(Generic[T]):
                 f"not enough response budget to start a shared Lean project slot: {root}"
             )
 
+    def _reserve_validation(
+        self,
+        root: Path,
+        entry: _CacheEntry[T],
+        waiter: object,
+        *,
+        release_token: object | None = None,
+    ) -> _CacheValidation[T]:
+        """Reserve an entry for one shared validation while holding the lock."""
+        validation = _CacheValidation(
+            resource=entry.resource,
+            reservation=object(),
+            future=Future(),
+        )
+        try:
+            entry.active.add(validation.reservation)
+            self._validating[root] = validation
+            validation.waiters.add(waiter)
+            if release_token is not None:
+                entry.active.remove(release_token)
+                entry.last_used = self._clock()
+            self._condition.notify_all()
+            self._start_validation(root, validation)
+        except BaseException as error:
+            validation.waiters.discard(waiter)
+            if release_token is not None and release_token in entry.active:
+                entry.active.remove(release_token)
+                entry.last_used = self._clock()
+            if not validation.started and not validation.future.done():
+                self._fail_validation_start(root, validation, error)
+            self._condition.notify_all()
+            raise
+        return validation
+
+    def _settle_validation(
+        self,
+        root: Path,
+        validation: _CacheValidation[T],
+        *,
+        valid: bool,
+    ) -> None:
+        retirement: tuple[Path, T] | None = None
+        with self._condition:
+            entry = self._entries.get(root)
+            if (
+                self._validating.get(root) is validation
+                and entry is not None
+                and entry.resource is validation.resource
+                and validation.reservation in entry.active
+            ):
+                if not valid:
+                    entry.invalid = True
+                entry.active.remove(validation.reservation)
+                entry.last_used = self._clock()
+                if not entry.active and entry.invalid:
+                    self._entries.pop(root)
+                    self._retiring[root] = validation.resource
+                    retirement = (root, validation.resource)
+            self._condition.notify_all()
+        if retirement is not None:
+            self._ensure_retirement_started(*retirement)
+
+    def _fail_validation_start(
+        self,
+        root: Path,
+        validation: _CacheValidation[T],
+        error: BaseException,
+    ) -> None:
+        with self._condition:
+            entry = self._entries.get(root)
+            if (
+                entry is not None
+                and entry.resource is validation.resource
+                and validation.reservation in entry.active
+            ):
+                entry.active.remove(validation.reservation)
+                entry.last_used = self._clock()
+            self._condition.notify_all()
+        if not validation.future.done():
+            validation.future.set_exception(error)
+        self._drop_completed_validation(root, validation)
+
+    def _quarantine_failed_validation(
+        self,
+        root: Path,
+        validation: _CacheValidation[T],
+    ) -> None:
+        """Recover ownership if publishing a validator result is interrupted."""
+        retirement: tuple[Path, T] | None = None
+        with self._condition:
+            entry = self._entries.get(root)
+            if entry is not None and entry.resource is validation.resource:
+                entry.invalid = True
+                entry.active.discard(validation.reservation)
+                if not entry.active:
+                    self._entries.pop(root)
+                    self._retiring[root] = validation.resource
+                    retirement = (root, validation.resource)
+            elif self._retiring.get(root) is validation.resource:
+                retirement = (root, validation.resource)
+            self._condition.notify_all()
+        if retirement is not None:
+            self._ensure_retirement_started(*retirement)
+
+    def _drop_completed_validation(
+        self,
+        root: Path,
+        validation: _CacheValidation[T],
+    ) -> None:
+        with self._condition:
+            if (
+                self._validating.get(root) is validation
+                and validation.future.done()
+                and not validation.waiters
+            ):
+                self._validating.pop(root)
+            self._condition.notify_all()
+
+    def _start_validation(
+        self,
+        root: Path,
+        validation: _CacheValidation[T],
+    ) -> None:
+        assert self._is_valid is not None
+        start_gate = threading.Event()
+        start_decision = {"run": False}
+
+        def validate() -> None:
+            start_gate.wait()
+            if not start_decision["run"]:
+                return
+            validation_error: BaseException | None = None
+            try:
+                valid = bool(self._is_valid(validation.resource))
+            except BaseException as error:
+                validation_error = error
+                valid = False
+            try:
+                self._settle_validation(root, validation, valid=valid)
+            except BaseException as error:
+                try:
+                    self._quarantine_failed_validation(root, validation)
+                except BaseException as recovery_error:
+                    self._add_cleanup_note(error, recovery_error)
+                if validation_error is not None:
+                    self._add_cleanup_note(validation_error, error)
+                    error = validation_error
+                if not validation.future.done():
+                    validation.future.set_exception(error)
+            else:
+                validation.future.set_result((valid, validation_error))
+            finally:
+                self._log_abandoned_validation_error(validation)
+                self._drop_completed_validation(root, validation)
+
+        try:
+            worker = threading.Thread(
+                target=validate,
+                name="autoform-project-validation",
+                daemon=False,
+            )
+            worker.start()
+            start_decision["run"] = True
+            validation.started = True
+            start_gate.set()
+        except BaseException as error:
+            start_gate.set()
+            if not start_decision["run"]:
+                self._fail_validation_start(root, validation, error)
+                return
+            raise error.with_traceback(error.__traceback__)
+
+    def _finish_validation_waiter(
+        self,
+        root: Path,
+        validation: _CacheValidation[T],
+        waiter: object,
+        *,
+        lease_token: object | None = None,
+        deadline: float | None = None,
+    ) -> bool:
+        claimed = False
+        with self._condition:
+            entry = self._entries.get(root)
+            if (
+                lease_token is not None
+                and (deadline is None or self._clock() < deadline)
+                and not self._closed
+                and entry is not None
+                and entry.resource is validation.resource
+                and not entry.invalid
+            ):
+                entry.active.add(lease_token)
+                entry.last_used = self._clock()
+                claimed = True
+            validation.waiters.discard(waiter)
+            if (
+                self._validating.get(root) is validation
+                and validation.future.done()
+                and not validation.waiters
+            ):
+                self._validating.pop(root)
+            self._condition.notify_all()
+        return claimed
+
+    def _mark_validation_abandoned(
+        self,
+        validation: _CacheValidation[T],
+    ) -> None:
+        with self._condition:
+            validation.abandoned = True
+
+    def _log_abandoned_validation_error(
+        self,
+        validation: _CacheValidation[T],
+    ) -> None:
+        validation_error: BaseException | None = None
+        with self._condition:
+            if (
+                not validation.abandoned
+                or validation.waiters
+                or not validation.future.done()
+                or validation.error_logged
+            ):
+                return
+            try:
+                _, validation_error = validation.future.result()
+            except BaseException as error:
+                validation_error = error
+            if validation_error is None:
+                return
+            validation.error_logged = True
+        logger.error(
+            "Lean project resource validation failed after every caller "
+            "stopped waiting",
+            exc_info=(
+                type(validation_error),
+                validation_error,
+                validation_error.__traceback__,
+            ),
+        )
+
+    def _await_validation(
+        self,
+        root: Path,
+        validation: _CacheValidation[T],
+        waiter: object,
+        *,
+        deadline: float | None,
+    ) -> tuple[bool, BaseException | None] | None:
+        try:
+            if deadline is None:
+                result = validation.future.result()
+            else:
+                result = validation.future.result(
+                    timeout=max(0.0, deadline - self._clock())
+                )
+        except FutureTimeoutError:
+            if (
+                validation.future.done()
+                and validation.future.exception() is not None
+            ):
+                self._finish_validation_waiter(root, validation, waiter)
+                raise
+            self._mark_validation_abandoned(validation)
+            self._finish_validation_waiter(root, validation, waiter)
+            self._log_abandoned_validation_error(validation)
+            return None
+        except BaseException:
+            if not validation.future.done() or validation.future.exception() is None:
+                self._mark_validation_abandoned(validation)
+            self._finish_validation_waiter(root, validation, waiter)
+            self._log_abandoned_validation_error(validation)
+            raise
+        if deadline is not None and self._clock() >= deadline:
+            self._mark_validation_abandoned(validation)
+            self._finish_validation_waiter(root, validation, waiter)
+            self._log_abandoned_validation_error(validation)
+            return None
+        valid, validation_error = result
+        if not valid or validation_error is not None:
+            self._finish_validation_waiter(root, validation, waiter)
+        return result
+
+    def _release_without_validation(
+        self,
+        root: Path,
+        resource: T,
+        lease_token: object,
+        *,
+        deadline: float | None,
+        invalid: bool = False,
+    ) -> bool | None:
+        retirement: tuple[Path, T] | None = None
+        with self._condition:
+            entry = self._entries.get(root)
+            if (
+                entry is None
+                or entry.resource is not resource
+                or lease_token not in entry.active
+            ):
+                return True
+            if invalid:
+                entry.invalid = True
+            entry.active.remove(lease_token)
+            entry.last_used = self._clock()
+            if not entry.active and entry.invalid:
+                self._entries.pop(root)
+                self._retiring[root] = resource
+                retirement = (root, resource)
+            self._condition.notify_all()
+        if retirement is None:
+            return True
+        return self._retire_until_deadline(
+            *retirement,
+            deadline=deadline,
+        )
+
+    def _invalidate_and_release(
+        self,
+        root: Path,
+        resource: T,
+        lease_token: object,
+        *,
+        deadline: float | None,
+    ) -> bool | None:
+        return self._release_without_validation(
+            root,
+            resource,
+            lease_token,
+            deadline=deadline,
+            invalid=True,
+        )
+
     def _release(
         self,
         root: Path,
@@ -1094,41 +1506,81 @@ class ProjectResourceCache(Generic[T]):
         deadline: float | None = None,
     ) -> None:
         retirement: tuple[Path, T] | None = None
-        validation_error: BaseException | None = None
+        resource: T | None = None
+        validation: _CacheValidation[T] | None = None
+        validation_waiter: object | None = None
         with self._condition:
             entry = self._entries.get(root)
             if entry is None or lease_token not in entry.active:
                 return
             resource = entry.resource
-            entry.active.remove(lease_token)
-            entry.last_used = self._clock()
-            invalid = entry.invalid
-            if not invalid and self._is_valid is not None:
-                try:
-                    invalid = not self._is_valid(resource)
-                except BaseException as error:
-                    validation_error = error
-                    invalid = True
-            entry.invalid = invalid
-            if not entry.active and invalid:
-                self._entries.pop(root)
-                self._retiring[root] = resource
-                retirement = (root, resource)
-            self._condition.notify_all()
-        if retirement is not None:
+            if not entry.invalid and self._is_valid is not None:
+                validation_waiter = object()
+                validation = self._validating.get(root)
+                if validation is None:
+                    validation = self._reserve_validation(
+                        root,
+                        entry,
+                        validation_waiter,
+                        release_token=lease_token,
+                    )
+                else:
+                    try:
+                        validation.waiters.add(validation_waiter)
+                        entry.active.remove(lease_token)
+                        entry.last_used = self._clock()
+                        self._condition.notify_all()
+                    except BaseException:
+                        validation.waiters.discard(validation_waiter)
+                        if lease_token in entry.active:
+                            entry.active.remove(lease_token)
+                            entry.last_used = self._clock()
+                        self._condition.notify_all()
+                        raise
+            else:
+                entry.active.remove(lease_token)
+                entry.last_used = self._clock()
+                if not entry.active and entry.invalid:
+                    self._entries.pop(root)
+                    self._retiring[root] = resource
+                    retirement = (root, resource)
+                self._condition.notify_all()
+        if validation is not None:
+            assert validation_waiter is not None
             try:
-                self._retire_until_deadline(*retirement, deadline=deadline)
-            except BaseException as cleanup_error:
-                if validation_error is None:
-                    raise
-                note = f"Lean project resource cleanup also failed: {cleanup_error}"
-                add_note = getattr(validation_error, "add_note", None)
-                if add_note is not None:
-                    add_note(note)
-                else:  # pragma: no cover - Python 3.10 compatibility
-                    logger.error("%s", note)
-        if validation_error is not None:
-            raise validation_error.with_traceback(validation_error.__traceback__)
+                validation_result = self._await_validation(
+                    root,
+                    validation,
+                    validation_waiter,
+                    deadline=deadline,
+                )
+                if validation_result is None:
+                    return
+                valid, validation_error = validation_result
+                if not valid:
+                    try:
+                        self._retire_until_deadline(
+                            root,
+                            validation.resource,
+                            deadline=deadline,
+                        )
+                    except BaseException as cleanup_error:
+                        if validation_error is None:
+                            raise
+                        self._add_cleanup_note(validation_error, cleanup_error)
+                if validation_error is not None:
+                    raise validation_error.with_traceback(
+                        validation_error.__traceback__
+                    )
+                return
+            finally:
+                self._finish_validation_waiter(
+                    root,
+                    validation,
+                    validation_waiter,
+                )
+        if retirement is not None:
+            self._retire_until_deadline(*retirement, deadline=deadline)
 
     def _sweep(self, interval: float) -> None:
         while not self._stop_sweeper.wait(interval):

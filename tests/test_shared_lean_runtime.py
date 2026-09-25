@@ -313,7 +313,7 @@ def test_status_reports_an_active_poisoned_pool_as_retiring(tmp_path):
         services.close()
 
 
-def test_cache_inspection_does_not_validate_or_retire_state(tmp_path):
+def test_cache_observation_does_not_validate_or_retire_state(tmp_path):
     project = make_lake_project(tmp_path, "inspection")
     validations = 0
 
@@ -336,9 +336,11 @@ def test_cache_inspection_does_not_validate_or_retire_state(tmp_path):
 
     with cache.inspect(str(project)) as resource:
         assert resource == project.resolve()
+    stats = cache.stats()
 
     assert validations == before
     assert cache.state(str(project)) == "warm"
+    assert stats["resident"][0]["valid"] is True
     cache.close()
 
 
@@ -375,7 +377,9 @@ def test_interrupted_cache_inspection_releases_its_lease_token(
     cache.close()
 
 
-def test_failed_validation_poisons_a_resource_with_another_active_lease(tmp_path):
+def test_failed_validation_poisons_a_resource_with_another_active_lease(
+    tmp_path, caplog
+):
     project = make_lake_project(tmp_path, "concurrent-validation")
     created = []
     closed = []
@@ -408,6 +412,11 @@ def test_failed_validation_poisons_a_resource_with_another_active_lease(tmp_path
     validation_error[0] = True
     with pytest.raises(RuntimeError, match="validation failed"):
         first.__exit__(None, None, None)
+    assert not [
+        record
+        for record in caplog.records
+        if "after every caller stopped waiting" in record.getMessage()
+    ]
     second.__exit__(None, None, None)
 
     assert closed == [first_resource]
@@ -415,6 +424,493 @@ def test_failed_validation_poisons_a_resource_with_another_active_lease(tmp_path
         assert replacement is not first_resource
     assert len(created) == 2
     cache.close()
+
+
+def test_slow_validation_does_not_block_an_unrelated_project(tmp_path):
+    first = make_lake_project(tmp_path, "slow-validation-first")
+    second = make_lake_project(tmp_path, "slow-validation-second")
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    block_first = False
+
+    def is_valid(resource):
+        nonlocal block_first
+        if resource == first.resolve() and block_first:
+            block_first = False
+            validation_started.set()
+            assert release_validation.wait(timeout=2)
+        return True
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        lambda resource: None,
+        max_entries=2,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    with cache.lease(str(first)):
+        pass
+    with cache.lease(str(second)):
+        pass
+    block_first = True
+    errors = []
+
+    def use_first():
+        try:
+            with cache.lease(str(first), acquisition_timeout=1):
+                pass
+        except BaseException as error:
+            errors.append(error)
+
+    caller = threading.Thread(target=use_first)
+    caller.start()
+    assert validation_started.wait(timeout=1)
+    started = time.monotonic()
+    with cache.lease(str(second), acquisition_timeout=0.5) as resource:
+        assert resource == second.resolve()
+    assert time.monotonic() - started < 0.4
+
+    release_validation.set()
+    caller.join(timeout=2)
+    assert not caller.is_alive()
+    assert errors == []
+    cache.close()
+
+
+def test_timed_acquisition_leaves_slow_validator_owning_its_resource(tmp_path):
+    project = make_lake_project(tmp_path, "timed-validation-owner")
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    block_validation = False
+    validations = 0
+    closed = []
+
+    def is_valid(resource):
+        nonlocal validations
+        if block_validation:
+            validations += 1
+            validation_started.set()
+            assert release_validation.wait(timeout=2)
+        return True
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    block_validation = True
+
+    started = time.monotonic()
+    with pytest.raises(ProjectResourceBusyError, match="validation exceeded"):
+        with cache.lease(str(project), acquisition_timeout=0.05):
+            pytest.fail("slow validation must not outlive the acquisition deadline")
+    assert time.monotonic() - started < 0.5
+    assert validation_started.is_set()
+    with cache._condition:
+        assert len(cache._entries[project.resolve()].active) == 1
+    assert closed == []
+    for _ in range(3):
+        with pytest.raises(ProjectResourceBusyError, match="validation exceeded"):
+            with cache.lease(str(project), acquisition_timeout=0.02):
+                pytest.fail("callers must share the blocked validation")
+    assert validations == 1
+    with cache._condition:
+        assert len(cache._entries[project.resolve()].active) == 1
+
+    release_validation.set()
+    deadline = time.monotonic() + 2
+    while cache._validating and time.monotonic() < deadline:
+        time.sleep(0.01)
+    with cache._condition:
+        assert cache._entries[project.resolve()].active == set()
+    cache.close()
+    assert closed == [project.resolve()]
+
+
+def test_concurrent_acquirers_share_one_successful_validation(tmp_path):
+    project = make_lake_project(tmp_path, "shared-validation-result")
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    release_leases = threading.Event()
+    block_validation = False
+    validations = 0
+
+    def is_valid(resource):
+        nonlocal block_validation, validations
+        validations += 1
+        if block_validation:
+            block_validation = False
+            validation_started.set()
+            assert release_validation.wait(timeout=2)
+        return True
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    before = validations
+    block_validation = True
+    entered = []
+    errors = []
+
+    def acquire():
+        try:
+            with cache.lease(str(project), acquisition_timeout=1) as resource:
+                entered.append(resource)
+                assert release_leases.wait(timeout=2)
+        except BaseException as error:
+            errors.append(error)
+
+    callers = [threading.Thread(target=acquire) for _ in range(2)]
+    callers[0].start()
+    assert validation_started.wait(timeout=1)
+    callers[1].start()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with cache._condition:
+            validation = cache._validating.get(project.resolve())
+            if validation is not None and len(validation.waiters) == 2:
+                break
+        time.sleep(0.01)
+    else:
+        pytest.fail("both callers did not join the shared validation")
+    release_validation.set()
+    deadline = time.monotonic() + 1
+    while len(entered) != 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert entered == [project.resolve(), project.resolve()]
+    assert validations == before + 1
+    with cache._condition:
+        assert len(cache._entries[project.resolve()].active) == 2
+
+    release_leases.set()
+    for caller in callers:
+        caller.join(timeout=2)
+    assert all(not caller.is_alive() for caller in callers)
+    assert errors == []
+    cache.close()
+
+
+@pytest.mark.parametrize("outcome", ["false", "error"])
+def test_timed_release_latches_late_invalid_validation(tmp_path, outcome, caplog):
+    project = make_lake_project(tmp_path, f"timed-release-{outcome}")
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    validation_mode = "valid"
+    closed = []
+
+    def is_valid(resource):
+        if validation_mode == "valid":
+            return True
+        validation_started.set()
+        assert release_validation.wait(timeout=2)
+        if outcome == "error":
+            raise RuntimeError("late validation failed")
+        return False
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    lease = cache.lease(str(project), acquisition_timeout=0.05)
+    assert lease.__enter__() == project.resolve()
+    validation_mode = outcome
+
+    started = time.monotonic()
+    lease.__exit__(None, None, None)
+    assert time.monotonic() - started < 0.5
+    assert validation_started.is_set()
+    with cache._condition:
+        assert len(cache._entries[project.resolve()].active) == 1
+    assert closed == []
+
+    release_validation.set()
+    deadline = time.monotonic() + 2
+    while not closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert closed == [project.resolve()]
+    assert cache.state(str(project)) == "cold"
+    while cache._validating and time.monotonic() < deadline:
+        time.sleep(0.01)
+    late_errors = [
+        record
+        for record in caplog.records
+        if "after every caller stopped waiting" in record.getMessage()
+    ]
+    assert len(late_errors) == (1 if outcome == "error" else 0)
+    cache.close()
+
+
+def test_concurrent_validation_failure_is_latched_and_retired_once(tmp_path):
+    project = make_lake_project(tmp_path, "concurrent-validation-outcomes")
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    validation_calls = 0
+    concurrent_mode = False
+    closed = []
+
+    def is_valid(resource):
+        nonlocal validation_calls
+        if not concurrent_mode:
+            return True
+        validation_calls += 1
+        validation_started.set()
+        assert release_validation.wait(timeout=2)
+        return False
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    first = cache.lease(str(project))
+    second = cache.lease(str(project))
+    resource = first.__enter__()
+    assert second.__enter__() is resource
+    concurrent_mode = True
+    errors = []
+
+    def release(lease):
+        try:
+            lease.__exit__(None, None, None)
+        except BaseException as error:
+            errors.append(error)
+
+    first_release = threading.Thread(target=release, args=(first,))
+    second_release = threading.Thread(target=release, args=(second,))
+    first_release.start()
+    assert validation_started.wait(timeout=1)
+    second_release.start()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with cache._condition:
+            validation = cache._validating.get(project.resolve())
+            if validation is not None and len(validation.waiters) == 2:
+                break
+        time.sleep(0.01)
+    else:
+        pytest.fail("both releases did not join the shared validation")
+    assert validation_calls == 1
+    assert closed == []
+    release_validation.set()
+    first_release.join(timeout=2)
+    second_release.join(timeout=2)
+
+    assert not first_release.is_alive()
+    assert not second_release.is_alive()
+    assert errors == []
+    assert validation_calls == 1
+    assert closed == [resource]
+    assert cache.state(str(project)) == "cold"
+    cache.close()
+    assert closed == [resource]
+
+
+def test_validation_completion_at_timeout_releases_transferred_lease(
+    tmp_path, monkeypatch
+):
+    from servers import lean_runtime as lean_runtime_module
+
+    project = make_lake_project(tmp_path, "validation-timeout-boundary")
+    closed = []
+    cache = ProjectResourceCache(
+        lambda root: root,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=lambda resource: True,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    real_future = lean_runtime_module.Future
+
+    class BoundaryFuture(real_future):
+        def result(self, timeout=None):
+            result = super().result(timeout=timeout)
+            if timeout is not None:
+                raise lean_runtime_module.FutureTimeoutError
+            return result
+
+    monkeypatch.setattr(lean_runtime_module, "Future", BoundaryFuture)
+    with pytest.raises(ProjectResourceBusyError, match="validation exceeded"):
+        with cache.lease(str(project), acquisition_timeout=1):
+            pytest.fail("a boundary timeout must not transfer the lease")
+
+    with cache._condition:
+        assert cache._entries[project.resolve()].active == set()
+        assert cache._validating == {}
+    assert closed == []
+    cache.close()
+    assert closed == [project.resolve()]
+
+
+@pytest.mark.parametrize("launch", [False, True])
+def test_interrupted_validation_thread_start_releases_its_reservation(
+    tmp_path, monkeypatch, launch
+):
+    from servers import lean_runtime as lean_runtime_module
+
+    project = make_lake_project(tmp_path, f"validation-start-{launch}")
+    validations = 0
+    worker_exited = threading.Event()
+
+    def is_valid(resource):
+        nonlocal validations
+        validations += 1
+        return True
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    before = validations
+    real_thread = threading.Thread
+
+    class InterruptedStart:
+        ident = None
+
+        def __init__(self, thread):
+            self.thread = thread
+
+        def start(self):
+            if launch:
+                self.thread.start()
+            raise KeyboardInterrupt("validation thread start interrupted")
+
+    def thread_factory(*args, **kwargs):
+        if kwargs.get("name") != "autoform-project-validation":
+            return real_thread(*args, **kwargs)
+        target = kwargs["target"]
+
+        def run():
+            try:
+                target()
+            finally:
+                worker_exited.set()
+
+        kwargs["target"] = run
+        return InterruptedStart(real_thread(*args, **kwargs))
+
+    monkeypatch.setattr(lean_runtime_module.threading, "Thread", thread_factory)
+    with pytest.raises(KeyboardInterrupt, match="thread start interrupted"):
+        with cache.lease(str(project), acquisition_timeout=1):
+            pytest.fail("interrupted validation must not transfer the lease")
+
+    if launch:
+        assert worker_exited.wait(timeout=1)
+    assert validations == before
+    with cache._condition:
+        assert cache._entries[project.resolve()].active == set()
+        assert cache._validating == {}
+    cache.close()
+
+
+@pytest.mark.parametrize("during_release", [False, True])
+def test_interruption_before_validation_start_rolls_back_reservation(
+    tmp_path, monkeypatch, during_release
+):
+    project = make_lake_project(
+        tmp_path,
+        f"validation-before-start-{during_release}",
+    )
+    cache = ProjectResourceCache(
+        lambda root: root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=lambda resource: True,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    lease = cache.lease(str(project), acquisition_timeout=1)
+    if during_release:
+        assert lease.__enter__() == project.resolve()
+
+    def interrupt_before_start(root, validation):
+        raise KeyboardInterrupt("before validation worker start")
+
+    monkeypatch.setattr(cache, "_start_validation", interrupt_before_start)
+    with pytest.raises(KeyboardInterrupt, match="before validation worker start"):
+        if during_release:
+            lease.__exit__(None, None, None)
+        else:
+            with lease:
+                pytest.fail("an unstarted validation must not retain ownership")
+
+    with cache._condition:
+        assert cache._entries[project.resolve()].active == set()
+        assert cache._validating == {}
+    cache.close()
+
+
+def test_cache_close_waits_for_abandoned_validation_reservation(tmp_path):
+    project = make_lake_project(tmp_path, "validation-close")
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    block_validation = False
+    closed = []
+
+    def is_valid(resource):
+        if block_validation:
+            validation_started.set()
+            assert release_validation.wait(timeout=2)
+        return True
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        is_valid=is_valid,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    block_validation = True
+    with pytest.raises(ProjectResourceBusyError, match="validation exceeded"):
+        with cache.lease(str(project), acquisition_timeout=0.05):
+            pytest.fail("slow validation must not reach the caller")
+    assert validation_started.is_set()
+
+    cache_closed = threading.Event()
+    closer = threading.Thread(target=lambda: (cache.close(), cache_closed.set()))
+    closer.start()
+    assert not cache_closed.wait(timeout=0.1)
+    assert closed == []
+    release_validation.set()
+    closer.join(timeout=2)
+
+    assert not closer.is_alive()
+    assert cache_closed.is_set()
+    assert closed == [project.resolve()]
 
 
 def test_shared_runtime_disables_ambiguous_repl_retries(tmp_path, monkeypatch):
