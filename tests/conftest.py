@@ -2,12 +2,65 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
+import psutil
 import pytest
+
+from servers.lean_client import LeanRuntimeClient, LeanRuntimeError
+
+
+def _terminate_test_runtime(pid: int) -> None:
+    try:
+        parent = psutil.Process(pid)
+        processes = [*parent.children(recursive=True), parent]
+        parent.terminate()
+    except psutil.NoSuchProcess:
+        return
+    _, alive = psutil.wait_procs(processes, timeout=10)
+    for process in reversed(alive):
+        try:
+            process.kill()
+        except psutil.NoSuchProcess:
+            pass
+    _, alive = psutil.wait_procs(alive, timeout=2)
+    if alive:
+        raise RuntimeError(
+            "test Lean runtime processes survived cleanup: "
+            + ", ".join(str(process.pid) for process in alive)
+        )
+
+
+def _stop_test_runtimes(directory: Path) -> None:
+    for path in directory.iterdir():
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISSOCK(metadata.st_mode):
+            continue
+        client = LeanRuntimeClient(
+            socket_path=path,
+            autostart=False,
+            connect_timeout=0.25,
+            response_timeout=15.0,
+            startup_timeout=2.0,
+        )
+        pid = None
+        try:
+            status = client.ping()
+            candidate = status.get("pid")
+            if isinstance(candidate, int) and candidate != os.getpid():
+                pid = candidate
+            client.stop()
+        except LeanRuntimeError:
+            if pid is not None:
+                _terminate_test_runtime(pid)
 
 
 @pytest.fixture
@@ -35,4 +88,5 @@ def runtime_dir() -> Iterator[Path]:
     try:
         yield directory
     finally:
+        _stop_test_runtimes(directory)
         shutil.rmtree(directory, ignore_errors=True)

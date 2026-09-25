@@ -9,6 +9,8 @@ import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from servers import lean_client
+
 
 def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
     skills = {path.parent.name for path in (repo_root / "skills").glob("*/SKILL.md")}
@@ -95,6 +97,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             "autoform_cli/visualize.py",
             "servers/lean_client.py",
             "servers/lean_runtime.py",
+            "servers/lsp/launcher.py",
             "servers/lsp/server.py",
             "servers/repl/core.py",
             "servers/repl/server.py",
@@ -112,9 +115,13 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
         metadata = archive.read(
             next(name for name in names if name.endswith(".dist-info/METADATA"))
         ).decode()
+        assert "Requires-Dist: leanclient==0.13.2" in metadata
+        assert "Requires-Dist: packaging<27,>=24" in metadata
         assert "Requires-Dist: psutil>=5.9" in metadata
         assert "Requires-Dist: tomli" not in metadata
         assert "Provides-Extra: repl" in metadata
+        assert "pyproject.toml" not in names
+        assert "uv.lock" not in names
         archive.extractall(site)
 
     with TemporaryDirectory(prefix="autoform-wheel-", dir="/tmp") as runtime_dir:
@@ -138,6 +145,7 @@ assert Path(lean_runtime.__file__).resolve().is_relative_to(site)
 assert Path(lsp_server.__file__).resolve().is_relative_to(site)
 assert Path(repl_server.__file__).resolve().is_relative_to(site)
 assert Path(visualize.__file__).resolve().is_relative_to(site)
+assert lean_client.BUILD_ID == sys.argv[3]
 client = lean_client.LeanRuntimeClient(socket_path=sys.argv[2], startup_timeout=15)
 try:
     assert client.ensure_running()["install_id"] == lean_client.INSTALL_ID
@@ -146,6 +154,7 @@ finally:
 """,
                 str(site),
                 str(Path(runtime_dir) / "runtime.sock"),
+                lean_client.BUILD_ID,
             ],
             # Deliberately run beside the source checkout. The installed client
             # must launch the installed daemon, not import this cwd's servers/.

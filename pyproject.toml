@@ -15,6 +15,8 @@ dependencies = [
     # The exact pin also protects the small synchronous adapter around its
     # public async API from silent lifecycle-contract drift.
     "leanclient==0.13.2",
+    # Parse installed dependency markers when fencing persistent runtimes.
+    "packaging>=24,<27",
     "psutil>=5.9",
     # The blueprint checks predict what the generated MkDocs site publishes.
     # Anchor prediction runs the configured renderer itself rather than
@@ -46,6 +48,13 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["autoform_cli", "servers"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+markers = [
+    "daemon: detached shared Lean runtime lifecycle and process tests",
+    "real_lean: integration tests that require a pinned Lean/Lake toolchain",
+]
 
 [tool.ruff]
 line-length = 120

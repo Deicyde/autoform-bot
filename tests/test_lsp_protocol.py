@@ -272,6 +272,33 @@ def test_failed_start_preserves_cancellation_after_verified_cleanup(
     assert session._process_group_id is None
 
 
+def test_identity_file_unlink_failure_remains_retryable(tmp_path: Path, monkeypatch) -> None:
+    identity = tmp_path / "identity.json"
+    identity.write_text("{}", encoding="utf-8")
+    session = lsp.LeanLspSession(lsp.LspConfig())
+    session._identity_path = identity
+    original_unlink = Path.unlink
+    attempts = 0
+
+    def unlink(path, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("busy")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    with pytest.raises(OSError, match="busy"):
+        session._remove_identity_file()
+    assert session._identity_path == identity
+    assert identity.exists()
+
+    session._remove_identity_file()
+    assert session._identity_path is None
+    assert not identity.exists()
+
+
 def test_launcher_scrubs_lake_environment_and_records_own_group(tmp_path: Path) -> None:
     identity = tmp_path / "identity.json"
     observed = tmp_path / "environment.json"
@@ -361,6 +388,28 @@ def test_diagnostics_surface_fatal_file_progress(fake_session) -> None:
     assert "1 error(s)" in lsp.format_lsp_diagnostics(diagnostics)
 
 
+@pytest.mark.parametrize(
+    "diagnostics,fatal_error",
+    [
+        (None, False),
+        (["not an object"], False),
+        ([{"message": "bad", "range": {"start": {"line": "0"}}}], False),
+        ([], "yes"),
+    ],
+)
+def test_malformed_diagnostics_poison_session_before_return(
+    fake_session, diagnostics, fatal_error
+) -> None:
+    session, source, client = fake_session
+    client.diagnostic_items = diagnostics
+    client.diagnostic_fatal_error = fatal_error
+
+    with pytest.raises(lsp.LspProtocolError, match="malformed|not an object"):
+        session.get_diagnostics(str(source))
+
+    assert not session.is_alive()
+
+
 def test_hover_waits_for_barrier_and_preserves_text_format(fake_session) -> None:
     session, source, client = fake_session
 
@@ -375,6 +424,25 @@ def test_hover_waits_for_barrier_and_preserves_text_format(fake_session) -> None
     ]
     assert client.calls[2][1] == "Main.lean"
     assert client.calls[3] == ("hover", "Main.lean", 0, 7, False)
+
+
+def test_hover_normalizes_lsp_content_lists(fake_session) -> None:
+    session, source, client = fake_session
+    client.hover_result = {
+        "contents": ["first", {"language": "lean", "value": "second"}]
+    }
+
+    assert session.hover(str(source), 0, 7) == "first\n\nsecond"
+
+
+def test_malformed_hover_poisons_session_before_return(fake_session) -> None:
+    session, source, client = fake_session
+    client.hover_result = {"contents": {"value": 7}}
+
+    with pytest.raises(lsp.LspProtocolError, match="must contain text"):
+        session.hover(str(source), 0, 7)
+
+    assert not session.is_alive()
 
 
 def test_document_operations_reject_paths_outside_project(fake_session, tmp_path: Path) -> None:
@@ -418,6 +486,16 @@ def test_leanclient_failure_poisons_session_before_next_operation(fake_session) 
     assert not session.is_alive()
     with pytest.raises(lsp.LspProtocolError, match="no longer usable"):
         session.get_diagnostics(str(source))
+
+
+def test_unexpected_leanclient_failure_poisons_session(fake_session) -> None:
+    session, source, client = fake_session
+    client.diagnostics_error = ValueError("malformed diagnostic range")
+
+    with pytest.raises(lsp.LspProtocolError, match="before its result"):
+        session.get_diagnostics(str(source))
+
+    assert not session.is_alive()
 
 
 def test_operation_timeout_is_absolute_and_aborts_session(fake_session) -> None:
@@ -586,7 +664,9 @@ def test_real_leanclient_adapter_waits_for_diagnostics_and_serves_hover(
         "  trivial\n",
         encoding="utf-8",
     )
-    session = lsp.LeanLspSession(lsp.LspConfig(cwd=str(project), timeout=60))
+    session = lsp.LeanLspSession(
+        lsp.LspConfig(cwd=str(project), timeout=lsp.DEFAULT_LSP_TIMEOUT)
+    )
 
     session.start()
     process_group_id = session._process_group_id

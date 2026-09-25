@@ -1044,6 +1044,9 @@ class LeanRuntimeServices:
         expected_project: ProjectFingerprint,
         expected_file: tuple[int, int, int, int, int, int],
     ) -> None:
+        # Leanclient's diagnostics barrier owns imported-module freshness. This
+        # fence separately prevents returning a result after the request's
+        # project configuration or target file was replaced underneath it.
         try:
             current_project = lean_project_fingerprint(root)
             current_file = LeanRuntimeServices._lsp_file_fingerprint(path)
@@ -1297,8 +1300,18 @@ def serve(paths: RuntimePaths) -> None:
     _configure_logging(paths.log)
     import fcntl
 
-    lifetime_fd = os.open(paths.lifetime_lock, os.O_CREAT | os.O_RDWR, 0o600)
-    fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
+    lifetime_fds = []
+    try:
+        for path in dict.fromkeys(
+            (paths.lifetime_lock, *paths.compatibility_lifetime_locks)
+        ):
+            lifetime_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            lifetime_fds.append(lifetime_fd)
+            fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
+    except BaseException:
+        for lifetime_fd in reversed(lifetime_fds):
+            os.close(lifetime_fd)
+        raise
     services: LeanRuntimeServices | None = None
     server: LeanRuntimeServer | None = None
     bound_identity: tuple[int, int] | None = None
@@ -1348,20 +1361,26 @@ def serve(paths: RuntimePaths) -> None:
                 for signum, handler in previous_handlers.items():
                     signal.signal(signum, handler)
                 logger.info("Lean runtime %s stopped", os.getpid())
-                os.close(lifetime_fd)
+                for lifetime_fd in reversed(lifetime_fds):
+                    os.close(lifetime_fd)
 
 
 def _paths_from_args(
     socket_path: str | None,
     log_path: str | None,
     lifetime_lock_path: str | None = None,
+    compatibility_lifetime_lock_paths: list[str] | None = None,
 ) -> RuntimePaths:
     paths = (
         runtime_paths_for_socket(socket_path)
         if socket_path is not None
         else default_runtime_paths()
     )
-    if log_path is None and lifetime_lock_path is None:
+    if (
+        log_path is None
+        and lifetime_lock_path is None
+        and compatibility_lifetime_lock_paths is None
+    ):
         return paths
     log = paths.log if log_path is None else Path(log_path).expanduser()
     lifetime_lock = (
@@ -1373,12 +1392,30 @@ def _paths_from_args(
         raise LeanRuntimeError("Lean runtime log path must be absolute")
     if not lifetime_lock.is_absolute():
         raise LeanRuntimeError("Lean runtime lifetime lock path must be absolute")
+    compatibility_lifetime_locks = (
+        paths.compatibility_lifetime_locks
+        if compatibility_lifetime_lock_paths is None
+        else tuple(
+            Path(path).expanduser() for path in compatibility_lifetime_lock_paths
+        )
+    )
+    for path in compatibility_lifetime_locks:
+        if not path.is_absolute():
+            raise LeanRuntimeError(
+                "Lean runtime compatibility lifetime lock path must be absolute"
+            )
+        if path.parent != paths.directory:
+            raise LeanRuntimeError(
+                "Lean runtime compatibility lifetime locks must stay in the "
+                "runtime directory"
+            )
     return RuntimePaths(
         directory=paths.directory,
         socket=paths.socket,
         lock=paths.lock,
         lifetime_lock=lifetime_lock,
         log=log,
+        compatibility_lifetime_locks=compatibility_lifetime_locks,
     )
 
 
@@ -1388,13 +1425,23 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--log", help="override the rotating log path")
     parser.add_argument("--lifetime-lock", help="override the runtime lifetime lock")
     parser.add_argument(
+        "--compatibility-lifetime-lock",
+        action="append",
+        help="additional lifetime lock held for an older Autoform client",
+    )
+    parser.add_argument(
         "command",
         choices=("serve", "start", "status", "stop"),
         nargs="?",
         default="status",
     )
     args = parser.parse_args(argv)
-    paths = _paths_from_args(args.socket, args.log, args.lifetime_lock)
+    paths = _paths_from_args(
+        args.socket,
+        args.log,
+        args.lifetime_lock,
+        args.compatibility_lifetime_lock,
+    )
 
     if args.command == "serve":
         serve(paths)

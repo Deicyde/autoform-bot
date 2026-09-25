@@ -13,6 +13,7 @@ from servers.repl.core import LeanRepl, LeanReplConfig
 REPL_FIXTURE = Path(__file__).parent / "fixtures" / "repl-smoke"
 
 
+@pytest.mark.real_lean
 @pytest.mark.skipif(
     os.environ.get("AUTOFORM_RUN_REAL_REPL_TESTS") != "1",
     reason="set AUTOFORM_RUN_REAL_REPL_TESTS=1 to run the pinned REPL integration",

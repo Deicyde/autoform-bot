@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+from importlib import metadata
 import json
 import math
 import os
@@ -23,53 +24,129 @@ from logging import getLogger
 from pathlib import Path
 from typing import Any
 
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+
 logger = getLogger(__name__)
 
 PROTOCOL_VERSION = 1
+# Keep literal versions here: removing one lets that released client start a
+# second daemon because it cannot see the protocol-independent lifetime lock.
+LEGACY_LOCK_PROTOCOL_VERSIONS = (1,)
+# Add a version only when this client can encode that version's shutdown RPC.
+SUPPORTED_PREVIOUS_PROTOCOL_VERSIONS: tuple[int, ...] = ()
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 DEFAULT_CONNECT_TIMEOUT = 2.0
 DEFAULT_RESPONSE_TIMEOUT = 900.0
 DEFAULT_STARTUP_TIMEOUT = 15.0
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_PATH_ID = hashlib.sha256(os.fsencode(PACKAGE_ROOT)).hexdigest()[:10]
+_RUNTIME_FILES = tuple(sorted((PACKAGE_ROOT / "servers").rglob("*.py")))
+_RUNTIME_GENERATION_FILES = (*_RUNTIME_FILES, Path(sys.executable).resolve())
+_RUNTIME_ROOT_DISTRIBUTIONS = ("leanclient", "packaging", "psutil")
+_DISTRIBUTION_IDENTITY_FILES = ("METADATA", "RECORD", "direct_url.json")
+
+
+def _runtime_distribution_names(
+    roots: tuple[str, ...] = _RUNTIME_ROOT_DISTRIBUTIONS,
+) -> tuple[str, ...]:
+    """Find the installed non-extra dependency closure used by the runtime."""
+    pending = list(roots)
+    discovered: set[str] = set()
+    while pending:
+        requirement = Requirement(pending.pop())
+        name = canonicalize_name(requirement.name)
+        if name in discovered:
+            continue
+        discovered.add(name)
+        try:
+            requirements = metadata.distribution(name).requires or ()
+        except metadata.PackageNotFoundError:
+            continue
+        for dependency in requirements:
+            requirement = Requirement(dependency)
+            if requirement.marker is not None and not requirement.marker.evaluate(
+                {"extra": ""}
+            ):
+                continue
+            pending.append(requirement.name)
+    return tuple(sorted(discovered))
+
+
+_RUNTIME_DISTRIBUTIONS = _runtime_distribution_names()
+
+
+def _distribution_identity(name: str) -> tuple[str, ...]:
+    """Return stable installed metadata for a runtime dependency."""
+    try:
+        distribution = metadata.distribution(name)
+    except metadata.PackageNotFoundError:
+        return ("<missing>",)
+    identity = [distribution.version]
+    for filename in _DISTRIBUTION_IDENTITY_FILES:
+        contents = distribution.read_text(filename)
+        if contents is not None:
+            identity.extend((filename, contents))
+    return tuple(identity)
+
+
+def _distribution_generation(name: str) -> int:
+    """Return the newest install-metadata timestamp for one dependency."""
+    try:
+        distribution = metadata.distribution(name)
+    except metadata.PackageNotFoundError:
+        return 0
+    mtimes = []
+    for path in distribution.files or ():
+        if path.name not in _DISTRIBUTION_IDENTITY_FILES:
+            continue
+        try:
+            mtimes.append(Path(distribution.locate_file(path)).stat().st_mtime_ns)
+        except OSError:
+            continue
+    return max(mtimes, default=0)
 
 
 def _build_id() -> str:
     """Fingerprint code that can change persistent runtime behavior."""
     digest = hashlib.sha256()
-    runtime_files = (
-        PACKAGE_ROOT / "servers" / "__init__.py",
-        Path(__file__).resolve(),
-        PACKAGE_ROOT / "servers" / "lean_runtime.py",
-        PACKAGE_ROOT / "servers" / "lsp" / "launcher.py",
-        PACKAGE_ROOT / "servers" / "lsp" / "server.py",
-        PACKAGE_ROOT / "servers" / "repl" / "core.py",
-        PACKAGE_ROOT / "servers" / "repl" / "pool.py",
+    interpreter = (
+        sys.implementation.name,
+        str(sys.implementation.cache_tag),
+        ".".join(str(component) for component in sys.version_info[:3]),
     )
-    for path in runtime_files:
+    for value in interpreter:
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\0")
+    for path in _RUNTIME_FILES:
+        digest.update(os.fsencode(path.relative_to(PACKAGE_ROOT)))
+        digest.update(b"\0")
         try:
             digest.update(path.read_bytes())
         except OSError:
             digest.update(os.fsencode(path))
+        digest.update(b"\0")
+    for distribution in _RUNTIME_DISTRIBUTIONS:
+        digest.update(distribution.encode("utf-8"))
+        digest.update(b"\0")
+        for value in _distribution_identity(distribution):
+            digest.update(value.encode("utf-8"))
+            digest.update(b"\0")
     return digest.hexdigest()[:10]
 
 
 def _build_generation() -> int:
     """Order in-place builds so an older live wrapper cannot replace a newer one."""
-    candidates = (
-        Path(__file__).resolve(),
-        PACKAGE_ROOT / "servers" / "lean_runtime.py",
-        PACKAGE_ROOT / "servers" / "lsp" / "launcher.py",
-        PACKAGE_ROOT / "servers" / "lsp" / "server.py",
-        PACKAGE_ROOT / "servers" / "repl" / "core.py",
-        PACKAGE_ROOT / "servers" / "repl" / "pool.py",
-    )
     mtimes: list[int] = []
-    for path in candidates:
+    for path in _RUNTIME_GENERATION_FILES:
         try:
             mtimes.append(path.stat().st_mtime_ns)
         except OSError:
             continue
+    mtimes.extend(
+        _distribution_generation(distribution)
+        for distribution in _RUNTIME_DISTRIBUTIONS
+    )
     return max(mtimes, default=0)
 
 
@@ -143,6 +220,7 @@ class RuntimePaths:
     lock: Path
     lifetime_lock: Path
     log: Path
+    compatibility_lifetime_locks: tuple[Path, ...] = ()
 
 
 def _private_runtime_directory(path: Path) -> Path:
@@ -200,6 +278,11 @@ def default_runtime_paths() -> RuntimePaths:
         lock=directory / f"lean-{INSTALL_PATH_ID}.lock",
         lifetime_lock=directory / f"lean-{INSTALL_PATH_ID}.lifetime.lock",
         log=directory / f"lean-v{PROTOCOL_VERSION}-{INSTALL_ID}.log",
+        compatibility_lifetime_locks=tuple(
+            directory
+            / f"lean-v{version}-{INSTALL_PATH_ID}.lifetime.lock"
+            for version in LEGACY_LOCK_PROTOCOL_VERSIONS
+        ),
     )
 
 
@@ -345,7 +428,7 @@ class LeanRuntimeClient:
         if self._uses_default_paths:
             lock_paths.extend(
                 self.paths.directory / f"lean-v{version}-{INSTALL_PATH_ID}.lock"
-                for version in range(PROTOCOL_VERSION + 1)
+                for version in LEGACY_LOCK_PROTOCOL_VERSIONS
             )
         lock_fds: list[int] = []
         try:
@@ -356,6 +439,33 @@ class LeanRuntimeClient:
                     lock_fd,
                     deadline=deadline,
                     purpose="Lean runtime startup coordination",
+                )
+        except BaseException:
+            for lock_fd in reversed(lock_fds):
+                os.close(lock_fd)
+            raise
+        return lock_fds
+
+    def _lifetime_lock_paths(self) -> tuple[Path, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    self.paths.lifetime_lock,
+                    *self.paths.compatibility_lifetime_locks,
+                )
+            )
+        )
+
+    def _acquire_lifetime_locks(self, deadline: float) -> list[int]:
+        lock_fds: list[int] = []
+        try:
+            for lock_path in self._lifetime_lock_paths():
+                lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                lock_fds.append(lock_fd)
+                self._acquire_file_lock(
+                    lock_fd,
+                    deadline=deadline,
+                    purpose="the previous Lean runtime",
                 )
         except BaseException:
             for lock_fd in reversed(lock_fds):
@@ -390,22 +500,14 @@ class LeanRuntimeClient:
             # A daemon owns this lock for its complete lifetime. If it has
             # stopped accepting connections but is still draining requests,
             # wait here rather than starting an overlapping replacement.
-            lifetime_fd = os.open(
-                self.paths.lifetime_lock,
-                os.O_CREAT | os.O_RDWR,
-                0o600,
-            )
+            lifetime_fds = self._acquire_lifetime_locks(deadline)
             try:
-                self._acquire_file_lock(
-                    lifetime_fd,
-                    deadline=deadline,
-                    purpose="the previous Lean runtime",
-                )
                 self._remaining(deadline, "Lean runtime startup")
                 self._remove_stale_socket()
                 process = self._spawn_daemon()
             finally:
-                os.close(lifetime_fd)
+                for lifetime_fd in reversed(lifetime_fds):
+                    os.close(lifetime_fd)
 
             try:
                 delay = 0.025
@@ -453,10 +555,11 @@ class LeanRuntimeClient:
                 result = self._stop_protocol(PROTOCOL_VERSION, deadline=deadline)
             except LeanRuntimeUnavailable:
                 stopped = self._stop_previous_builds(deadline=deadline)
+                self._wait_for_lifetimes(deadline=deadline)
                 if stopped:
                     return {"stopping": False, "stopped_previous": stopped}
                 raise
-            self._wait_for_lifetime(self.paths.lifetime_lock, deadline=deadline)
+            self._wait_for_lifetimes(deadline=deadline)
             return result
         finally:
             for lock_fd in reversed(lock_fds):
@@ -468,6 +571,8 @@ class LeanRuntimeClient:
             return []
         pattern = f"lean-v*-{INSTALL_PATH_ID}-*.sock"
         stopped: list[int] = []
+        stale: list[LeanRuntimeClient] = []
+        needs_lifetime_wait = False
         for socket_path in sorted(self.paths.directory.glob(pattern)):
             if socket_path == self.paths.socket:
                 continue
@@ -477,6 +582,15 @@ class LeanRuntimeClient:
                     f"Lean runtime protocol v{protocol_version} is newer than "
                     f"supported v{PROTOCOL_VERSION}; restart with the newer "
                     "Autoform installation"
+                )
+            if (
+                protocol_version != PROTOCOL_VERSION
+                and protocol_version not in SUPPORTED_PREVIOUS_PROTOCOL_VERSIONS
+            ):
+                raise LeanRuntimeProtocolError(
+                    f"Lean runtime protocol v{protocol_version} is older than "
+                    f"the supported versions for v{PROTOCOL_VERSION}; stop it "
+                    "with its matching Autoform installation"
                 )
             previous = LeanRuntimeClient(
                 socket_path=socket_path,
@@ -494,11 +608,8 @@ class LeanRuntimeClient:
                     protocol_version=protocol_version,
                 )
             except LeanRuntimeUnavailable:
-                previous._wait_for_lifetime(
-                    socket_path.with_suffix(".lifetime.lock"),
-                    deadline=deadline,
-                )
-                previous._remove_stale_socket()
+                stale.append(previous)
+                needs_lifetime_wait = True
                 continue
             if not isinstance(status, dict):
                 raise LeanRuntimeProtocolError(
@@ -529,13 +640,14 @@ class LeanRuntimeClient:
                         "restart this plugin session before using Lean tools"
                     )
             result = previous._stop_protocol(protocol_version, deadline=deadline)
-            previous._wait_for_lifetime(
-                socket_path.with_suffix(".lifetime.lock"),
-                deadline=deadline,
-            )
+            needs_lifetime_wait = True
             pid = result.get("pid") if isinstance(result, dict) else None
             if isinstance(pid, int):
                 stopped.append(pid)
+        if needs_lifetime_wait:
+            self._wait_for_lifetimes(deadline=deadline)
+        for previous in stale:
+            previous._remove_stale_socket()
         return stopped
 
     def _stop_protocol(
@@ -569,6 +681,10 @@ class LeanRuntimeClient:
         finally:
             os.close(lifetime_fd)
 
+    def _wait_for_lifetimes(self, *, deadline: float) -> None:
+        for path in self._lifetime_lock_paths():
+            self._wait_for_lifetime(path, deadline=deadline)
+
     def _spawn_daemon(self) -> subprocess.Popen[bytes]:
         command = [
             sys.executable,
@@ -580,8 +696,10 @@ class LeanRuntimeClient:
             str(self.paths.log),
             "--lifetime-lock",
             str(self.paths.lifetime_lock),
-            "serve",
         ]
+        for path in self.paths.compatibility_lifetime_locks:
+            command.extend(("--compatibility-lifetime-lock", str(path)))
+        command.append("serve")
         with self.paths.log.open("ab", buffering=0) as log:
             return subprocess.Popen(
                 command,

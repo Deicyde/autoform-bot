@@ -9,15 +9,19 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+from servers import lean_client
 from servers.lean_client import (
     INSTALL_ID,
     INSTALL_PATH_ID,
     PROTOCOL_VERSION,
     LeanRuntimeClient,
     LeanRuntimeOutcomeUnknown,
+    LeanRuntimeProtocolError,
     LeanRuntimeUnavailable,
 )
 from servers.lean_runtime import (
@@ -33,6 +37,133 @@ def make_lake_project(tmp_path, name: str):
     project.mkdir()
     (project / "lakefile.toml").write_text(f'[package]\nname = "{name}"\n')
     return project
+
+
+def test_runtime_identity_tracks_all_packaged_server_modules():
+    assert lean_client._RUNTIME_FILES == tuple(
+        sorted((lean_client.PACKAGE_ROOT / "servers").rglob("*.py"))
+    )
+
+
+def test_runtime_behavior_dependency_closure_contains_active_lsp_stack():
+    assert lean_client._RUNTIME_ROOT_DISTRIBUTIONS == (
+        "leanclient",
+        "packaging",
+        "psutil",
+    )
+    assert {
+        "anyio",
+        "leanclient",
+        "orjson",
+        "packaging",
+        "psutil",
+        "tqdm",
+        "watchfiles",
+    } <= set(lean_client._RUNTIME_DISTRIBUTIONS)
+
+
+def test_runtime_behavior_dependency_closure_ignores_optional_extras(monkeypatch):
+    requirements = {
+        "root-package": (
+            "watchfiles>=1",
+            "pytest>=7; extra == 'dev'",
+            "typing-extensions; python_version < '0'",
+        ),
+        "watchfiles": ("anyio>=3",),
+        "anyio": (),
+    }
+
+    class FakeDistribution:
+        def __init__(self, name):
+            self.requires = requirements[name]
+
+    monkeypatch.setattr(
+        lean_client.metadata, "distribution", lambda name: FakeDistribution(name)
+    )
+
+    assert lean_client._runtime_distribution_names(("Root_Package",)) == (
+        "anyio",
+        "root-package",
+        "watchfiles",
+    )
+
+
+@pytest.mark.parametrize("distribution", lean_client._RUNTIME_DISTRIBUTIONS)
+def test_runtime_build_identity_tracks_behavior_dependency_versions(
+    monkeypatch, distribution
+):
+    versions = {name: "1.0" for name in lean_client._RUNTIME_DISTRIBUTIONS}
+
+    class FakeDistribution:
+        def __init__(self, name):
+            self.version = versions[name]
+
+        def read_text(self, filename):
+            return None
+
+    monkeypatch.setattr(
+        lean_client.metadata, "distribution", lambda name: FakeDistribution(name)
+    )
+
+    original = lean_client._build_id()
+    versions[distribution] += ".changed"
+
+    assert lean_client._build_id() != original
+
+
+def test_runtime_build_identity_tracks_exact_dependency_record(monkeypatch):
+    record = ["sha256=old"]
+
+    class FakeDistribution:
+        version = "0.13.2"
+
+        def read_text(self, filename):
+            return record[0] if filename == "RECORD" else None
+
+    monkeypatch.setattr(
+        lean_client.metadata, "distribution", lambda name: FakeDistribution()
+    )
+
+    original = lean_client._build_id()
+    record[0] = "sha256=new"
+
+    assert lean_client._build_id() != original
+
+
+def test_runtime_build_generation_tracks_dependency_install_metadata(
+    tmp_path, monkeypatch
+):
+    record = tmp_path / "RECORD"
+    record.write_text("installed")
+
+    class FakeDistribution:
+        files = (Path("package.dist-info/RECORD"),)
+
+        def locate_file(self, path):
+            return record
+
+    monkeypatch.setattr(lean_client, "_RUNTIME_GENERATION_FILES", ())
+    monkeypatch.setattr(
+        lean_client.metadata, "distribution", lambda name: FakeDistribution()
+    )
+
+    assert lean_client._build_generation() == record.stat().st_mtime_ns
+
+
+def test_default_runtime_ownership_paths_are_protocol_independent(
+    runtime_dir, monkeypatch
+):
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
+
+    paths = lean_client.default_runtime_paths()
+
+    assert paths.lock.name == f"lean-{INSTALL_PATH_ID}.lock"
+    assert paths.lifetime_lock.name == f"lean-{INSTALL_PATH_ID}.lifetime.lock"
+    assert lean_client.LEGACY_LOCK_PROTOCOL_VERSIONS == (1,)
+    assert paths.compatibility_lifetime_locks == (
+        runtime_dir / f"lean-v1-{INSTALL_PATH_ID}.lifetime.lock",
+    )
+    assert f"lean-v{PROTOCOL_VERSION}-" in paths.socket.name
 
 
 def runtime_config(**overrides):
@@ -760,13 +891,45 @@ def test_previous_build_shutdown_uses_the_startup_deadline(runtime_dir, monkeypa
             calls.append(("lifetime", deadline, path))
 
     monkeypatch.setattr(lean_client, "LeanRuntimeClient", PreviousClient)
+    monkeypatch.setattr(
+        client,
+        "_wait_for_lifetimes",
+        lambda *, deadline: calls.append(("lifetimes", deadline)),
+    )
 
     assert client._stop_previous_builds(deadline=123.0) == [7]
     assert calls == [
         ("daemon.ping", 123.0, PROTOCOL_VERSION),
         ("stop", 123.0, PROTOCOL_VERSION),
-        ("lifetime", 123.0, old_socket.with_suffix(".lifetime.lock")),
+        ("lifetimes", 123.0),
     ]
+
+
+def test_stale_wrapper_cannot_replace_a_newer_runtime_build(runtime_dir, monkeypatch):
+    current_socket = runtime_dir / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-old.sock"
+    newer_socket = runtime_dir / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-new.sock"
+    newer_socket.touch()
+    client = LeanRuntimeClient(socket_path=current_socket)
+    client._uses_default_paths = True
+
+    class NewerClient:
+        def __init__(self, *, socket_path, **kwargs):
+            assert socket_path == newer_socket
+
+        def _request_once(self, method, params, **kwargs):
+            return {
+                "protocol": PROTOCOL_VERSION,
+                "install_id": f"{INSTALL_PATH_ID}-new",
+                "build_generation": lean_client.BUILD_GENERATION + 1,
+            }
+
+        def _stop_protocol(self, protocol_version, *, deadline):
+            pytest.fail("a stale wrapper must not stop a newer runtime")
+
+    monkeypatch.setattr(lean_client, "LeanRuntimeClient", NewerClient)
+
+    with pytest.raises(LeanRuntimeProtocolError, match="newer Autoform runtime"):
+        client._stop_previous_builds(deadline=time.monotonic() + 1)
 
 
 def test_failed_start_never_hard_kills_a_daemon_that_may_own_work(runtime_dir):
@@ -796,6 +959,7 @@ def test_failed_start_never_hard_kills_a_daemon_that_may_own_work(runtime_dir):
     assert process.kill_calls == 0
 
 
+@pytest.mark.daemon
 def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(runtime_dir, monkeypatch):
     socket_path = runtime_dir / "lean.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -844,6 +1008,7 @@ def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(runtime_di
     assert not socket_path.exists()
 
 
+@pytest.mark.daemon
 def test_daemon_outlives_the_separate_process_that_started_it(
     tmp_path,
     runtime_dir,
@@ -893,6 +1058,7 @@ def test_daemon_outlives_the_separate_process_that_started_it(
         client.stop()
 
 
+@pytest.mark.daemon
 def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
     socket_path = runtime_dir / "restart.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -907,6 +1073,40 @@ def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
         client.stop()
 
 
+def test_stop_waits_for_cleanup_after_runtime_socket_disappears(
+    runtime_dir, monkeypatch
+):
+    import fcntl
+
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
+    client = LeanRuntimeClient(autostart=False, response_timeout=2)
+    lifetime_fd = os.open(
+        client.paths.lifetime_lock, os.O_CREAT | os.O_RDWR, 0o600
+    )
+    fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
+    errors = []
+
+    def stop():
+        try:
+            client.stop()
+        except BaseException as error:
+            errors.append(error)
+
+    stopping = threading.Thread(target=stop)
+    stopping.start()
+    try:
+        stopping.join(timeout=0.1)
+        assert stopping.is_alive()
+    finally:
+        os.close(lifetime_fd)
+        stopping.join(timeout=2)
+
+    assert not stopping.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], LeanRuntimeUnavailable)
+
+
+@pytest.mark.daemon
 def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, monkeypatch):
     import fcntl
 
@@ -914,6 +1114,10 @@ def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, m
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
     old_socket = runtime_dir / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-old.sock"
     old_client = LeanRuntimeClient(socket_path=old_socket, startup_timeout=15)
+    old_client.paths = replace(
+        old_client.paths,
+        lifetime_lock=runtime_dir / f"lean-v1-{INSTALL_PATH_ID}.lifetime.lock",
+    )
     old_pid = old_client.ensure_running()["pid"]
 
     current = LeanRuntimeClient(startup_timeout=15)
@@ -931,6 +1135,246 @@ def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, m
         current.stop()
 
 
+@pytest.mark.daemon
+def test_new_lock_scheme_retires_pr13_runtime_before_owning_runtime(
+    runtime_dir,
+    repo_root,
+    monkeypatch,
+    request,
+):
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
+    current = LeanRuntimeClient(startup_timeout=15)
+    old_protocol = 1
+    old_socket = runtime_dir / f"lean-v1-{INSTALL_PATH_ID}-old.sock"
+    stale_socket = runtime_dir / f"lean-v1-{INSTALL_PATH_ID}-000.sock"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(stale_socket))
+    stale.close()
+    old_lifetime_lock = runtime_dir / f"lean-v1-{INSTALL_PATH_ID}.lifetime.lock"
+    draining = runtime_dir / "old-draining"
+    release = runtime_dir / "release-old"
+    old_script = """
+import fcntl
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+socket_path = Path(sys.argv[1])
+lifetime_path = Path(sys.argv[2])
+draining_path = Path(sys.argv[3])
+release_path = Path(sys.argv[4])
+protocol = int(sys.argv[5])
+lifetime_fd = os.open(lifetime_path, os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(str(socket_path))
+server.listen()
+try:
+    while True:
+        connection, _ = server.accept()
+        with connection:
+            request = json.loads(connection.makefile("rb").readline())
+            assert request["v"] == protocol
+            stopping = request["method"] == "daemon.shutdown"
+            result = (
+                {"stopping": True, "pid": os.getpid()}
+                if stopping
+                else {
+                    "pid": os.getpid(),
+                    "protocol": protocol,
+                    "install_id": sys.argv[6],
+                    "build_generation": 0,
+                }
+            )
+            connection.sendall(
+                json.dumps(
+                    {"v": protocol, "id": request["id"], "ok": True, "result": result}
+                ).encode()
+                + b"\\n"
+            )
+        if stopping:
+            server.close()
+            socket_path.unlink()
+            draining_path.touch()
+            while not release_path.exists():
+                time.sleep(0.01)
+            break
+finally:
+    server.close()
+    socket_path.unlink(missing_ok=True)
+    os.close(lifetime_fd)
+"""
+    old_process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            old_script,
+            str(old_socket),
+            str(old_lifetime_lock),
+            str(draining),
+            str(release),
+            str(old_protocol),
+            f"{INSTALL_PATH_ID}-old",
+        ],
+        cwd=repo_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    def stop_old_process():
+        release.touch(exist_ok=True)
+        if old_process.poll() is None:
+            old_process.terminate()
+            old_process.wait(timeout=5)
+
+    request.addfinalizer(stop_old_process)
+    old_client = LeanRuntimeClient(socket_path=old_socket, startup_timeout=15)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if old_process.poll() is not None:
+            pytest.fail(f"old protocol runtime exited with {old_process.returncode}")
+        try:
+            old_status = old_client._request_once(
+                "daemon.ping",
+                {},
+                protocol_version=old_protocol,
+            )
+            break
+        except LeanRuntimeUnavailable:
+            time.sleep(0.025)
+    else:
+        pytest.fail("old protocol runtime did not become ready")
+
+    statuses = []
+    errors = []
+
+    def start_current():
+        try:
+            statuses.append(current.ensure_running())
+        except BaseException as error:
+            errors.append(error)
+
+    starter = threading.Thread(target=start_current)
+    try:
+        starter.start()
+        deadline = time.monotonic() + 10
+        while not draining.exists() and time.monotonic() < deadline:
+            time.sleep(0.025)
+        assert draining.exists()
+        starter.join(timeout=0.1)
+        assert starter.is_alive()
+        assert old_process.poll() is None
+        assert not current.paths.socket.exists()
+
+        release.touch()
+        starter.join(timeout=20)
+        assert not starter.is_alive()
+        assert errors == []
+        assert len(statuses) == 1
+        current_status = statuses[0]
+        assert current_status["protocol"] == PROTOCOL_VERSION
+        assert current_status["pid"] != old_status["pid"]
+        assert old_process.wait(timeout=5) == 0
+        assert not stale_socket.exists()
+
+        import fcntl
+
+        lifetime_fd = os.open(
+            current.paths.lifetime_lock, os.O_CREAT | os.O_RDWR, 0o600
+        )
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(lifetime_fd)
+    finally:
+        release.touch(exist_ok=True)
+        starter.join(timeout=5)
+        try:
+            current.stop()
+        except LeanRuntimeUnavailable:
+            pass
+        if old_process.poll() is None:
+            old_process.terminate()
+            old_process.wait(timeout=5)
+
+
+@pytest.mark.daemon
+def test_new_lock_scheme_removes_stale_pr13_socket(runtime_dir, monkeypatch):
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
+    stale_path = runtime_dir / f"lean-v1-{INSTALL_PATH_ID}-stale.sock"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(stale_path))
+    stale.close()
+
+    current = LeanRuntimeClient(startup_timeout=15)
+    try:
+        current.ensure_running()
+        assert not stale_path.exists()
+    finally:
+        current.stop()
+
+
+@pytest.mark.daemon
+def test_new_runtime_blocks_pr13_client_lifetime_ownership(runtime_dir, monkeypatch):
+    import fcntl
+
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
+    current = LeanRuntimeClient(startup_timeout=15)
+    current.ensure_running()
+    old_bootstrap = os.open(
+        runtime_dir / f"lean-v1-{INSTALL_PATH_ID}.lock",
+        os.O_CREAT | os.O_RDWR,
+        0o600,
+    )
+    old_lifetime = os.open(
+        runtime_dir / f"lean-v1-{INSTALL_PATH_ID}.lifetime.lock",
+        os.O_CREAT | os.O_RDWR,
+        0o600,
+    )
+    try:
+        fcntl.flock(old_bootstrap, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(old_lifetime, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(old_lifetime)
+        os.close(old_bootstrap)
+        current.stop()
+
+
+def test_newer_protocol_socket_fails_closed(runtime_dir, monkeypatch):
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
+    newer_path = runtime_dir / f"lean-v{PROTOCOL_VERSION + 1}-{INSTALL_PATH_ID}-new.sock"
+    newer_path.touch()
+    current = LeanRuntimeClient(startup_timeout=0.1)
+
+    with pytest.raises(LeanRuntimeProtocolError, match="newer than supported"):
+        current.ensure_running()
+
+    assert newer_path.is_file()
+
+
+def test_unsupported_older_protocol_socket_fails_closed(runtime_dir, monkeypatch):
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
+    older_path = runtime_dir / f"lean-v0-{INSTALL_PATH_ID}-old.sock"
+    older_path.touch()
+    current = LeanRuntimeClient(startup_timeout=0.1)
+
+    with pytest.raises(LeanRuntimeProtocolError, match="older than"):
+        current.ensure_running()
+
+    assert older_path.is_file()
+
+
+@pytest.mark.daemon
 def test_default_cli_stop_finds_a_previous_build(runtime_dir, monkeypatch, capsys):
     from servers import lean_runtime
 
@@ -947,6 +1391,7 @@ def test_default_cli_stop_finds_a_previous_build(runtime_dir, monkeypatch, capsy
     assert not old_socket.exists()
 
 
+@pytest.mark.daemon
 def test_silent_connection_cannot_block_graceful_stop(runtime_dir, monkeypatch):
     socket_path = runtime_dir / "silent.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -1172,5 +1617,60 @@ def test_failed_lsp_session_is_replaced_on_the_next_call(tmp_path):
         assert services.dispatch("lsp.diagnostics", params).startswith("No diagnostics")
         assert len(sessions) == 2
         assert sessions[0].closed is True
+    finally:
+        services.close()
+
+
+@pytest.mark.parametrize("method", ["lsp.diagnostics", "lsp.hover"])
+@pytest.mark.parametrize("changed_file", ["lakefile.toml", "Main.lean"])
+def test_lsp_result_is_rejected_when_request_inputs_change(
+    tmp_path, method, changed_file
+):
+    project = make_lake_project(tmp_path, f"changed-{method.rsplit('.', 1)[1]}")
+    source = project / "Main.lean"
+    source.write_text("#check Nat\n")
+    sessions = []
+
+    class Session(FakeLsp):
+        def __init__(self, root):
+            super().__init__(root)
+            self.number = len(sessions) + 1
+            sessions.append(self)
+
+        def change_input(self):
+            if self.number != 1:
+                return
+            target = project / changed_file
+            original_mtime = target.stat().st_mtime_ns
+            replacement = project / f"{changed_file}.replacement"
+            replacement.write_text(target.read_text() + "-- changed\n")
+            os.utime(replacement, ns=(original_mtime, original_mtime))
+            replacement.replace(target)
+
+        def get_diagnostics(self, file_path):
+            self.change_input()
+            return []
+
+        def hover(self, file_path, line, character):
+            self.change_input()
+            return "Nat : Type"
+
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=FakePool,
+        lsp_factory=Session,
+        start_sweepers=False,
+    )
+    params = {"project_dir": str(project), "file_path": "Main.lean"}
+    if method == "lsp.hover":
+        params.update({"line": 0, "character": 7})
+    try:
+        with pytest.raises(ProjectResourceBusyError, match="changed during LSP request"):
+            services.dispatch(method, params)
+        assert sessions[0].closed is True
+
+        result = services.dispatch(method, params)
+        assert result in {"No diagnostics — file compiles cleanly.", "Nat : Type"}
+        assert len(sessions) == 2
     finally:
         services.close()

@@ -177,27 +177,12 @@ class LeanLspSession:
 
     def hover(self, file_path: str, line: int, character: int) -> str | None:
         """Return hover text at a zero-indexed codepoint position."""
-        try:
-            result = self._run_document_operation(
-                file_path,
-                lambda client, path, deadline: self._hover(
-                    client, path, line, character, deadline
-                ),
-            )
-            if result is None:
-                return None
-            if not isinstance(result, dict) or "contents" not in result:
-                raise LspProtocolError(f"LSP hover returned malformed result: {result!r}")
-            contents = result["contents"]
-            if isinstance(contents, dict):
-                value = contents.get("value")
-                if not isinstance(value, str):
-                    raise LspProtocolError("LSP hover contents.value must be a string")
-                return value
-            return str(contents)
-        except LspProtocolError:
-            self.abort()
-            raise
+        return self._run_document_operation(
+            file_path,
+            lambda client, path, deadline: self._hover(
+                client, path, line, character, deadline
+            ),
+        )
 
     def _run_document_operation(
         self,
@@ -225,8 +210,23 @@ class LeanLspSession:
                     remaining,
                     "running Lean LSP operation",
                 )
-            except (LspProtocolError, TimeoutError, OSError):
-                self.abort()
+            except BaseException as error:
+                try:
+                    self.abort()
+                except BaseException as cleanup_error:
+                    note = f"Lean LSP abort also failed: {cleanup_error}"
+                    add_note = getattr(error, "add_note", None)
+                    if add_note is not None:
+                        add_note(note)
+                    else:  # pragma: no cover - Python 3.10 compatibility
+                        logger.error("%s", note)
+                if isinstance(error, Exception) and not isinstance(
+                    error, (LspProtocolError, TimeoutError, OSError)
+                ):
+                    raise LspProtocolError(
+                        "leanclient operation failed before its result could be "
+                        f"validated: {error}"
+                    ) from error
                 raise
         finally:
             self._operation_lock.release()
@@ -244,8 +244,24 @@ class LeanLspSession:
                 fresh=True,
                 timeout=self._remaining(deadline),
             )
-            diagnostics = list(report.items)
-            if report.fatal_error:
+            try:
+                raw_diagnostics = report.items
+                fatal_error = report.fatal_error
+            except AttributeError as error:
+                raise LspProtocolError(
+                    f"LSP diagnostics returned a malformed report: {report!r}"
+                ) from error
+            if not isinstance(raw_diagnostics, list) or not isinstance(
+                fatal_error, bool
+            ):
+                raise LspProtocolError(
+                    f"LSP diagnostics returned a malformed report: {report!r}"
+                )
+            diagnostics = [
+                self._validated_diagnostic(diagnostic, index)
+                for index, diagnostic in enumerate(raw_diagnostics)
+            ]
+            if fatal_error:
                 diagnostics.append(
                     {
                         "severity": 1,
@@ -268,13 +284,59 @@ class LeanLspSession:
         line: int,
         character: int,
         deadline: float,
-    ) -> dict | None:
+    ) -> str | None:
         await client.open(path, wait=False)
         try:
             await client.barrier(path, timeout=self._remaining(deadline))
-            return await client.hover(path, line, character, fresh=False)
+            result = await client.hover(path, line, character, fresh=False)
+            return self._normalized_hover(result)
         finally:
             await client.close_file(path)
+
+    @staticmethod
+    def _validated_diagnostic(diagnostic: Any, index: int) -> dict:
+        if not isinstance(diagnostic, dict):
+            raise LspProtocolError(
+                f"LSP diagnostic {index} is not an object: {diagnostic!r}"
+            )
+        message = diagnostic.get("message")
+        diagnostic_range = diagnostic.get("range")
+        if not isinstance(message, str) or not isinstance(diagnostic_range, dict):
+            raise LspProtocolError(f"LSP diagnostic {index} is malformed")
+        position = diagnostic_range.get("start")
+        if not isinstance(position, dict):
+            raise LspProtocolError(f"LSP diagnostic {index} is malformed")
+        for coordinate in ("line", "character"):
+            value = position.get(coordinate)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise LspProtocolError(f"LSP diagnostic {index} is malformed")
+        severity = diagnostic.get("severity")
+        if severity is not None and (
+            isinstance(severity, bool) or not isinstance(severity, int)
+        ):
+            raise LspProtocolError(f"LSP diagnostic {index} is malformed")
+        return dict(diagnostic)
+
+    @staticmethod
+    def _normalized_hover(result: Any) -> str | None:
+        if result is None:
+            return None
+        if not isinstance(result, dict) or "contents" not in result:
+            raise LspProtocolError(f"LSP hover returned malformed result: {result!r}")
+
+        def text(content: Any) -> str:
+            if isinstance(content, str):
+                return content
+            if isinstance(content, dict):
+                value = content.get("value")
+                if isinstance(value, str):
+                    return value
+            raise LspProtocolError("LSP hover contents must contain text")
+
+        contents = result["contents"]
+        if isinstance(contents, list):
+            return "\n\n".join(text(content) for content in contents)
+        return text(contents)
 
     def _relative_path(self, file_path: str) -> str:
         root = Path(self.config.cwd).resolve()
@@ -499,12 +561,14 @@ class LeanLspSession:
         return True
 
     def _remove_identity_file(self) -> None:
-        path, self._identity_path = self._identity_path, None
-        if path is not None:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+        path = self._identity_path
+        if path is None:
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        self._identity_path = None
 
     @staticmethod
     def _remaining(deadline: float) -> float:

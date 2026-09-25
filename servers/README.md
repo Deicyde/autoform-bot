@@ -19,7 +19,10 @@ replacement until cleanup succeeds. LSP sessions remain resident because their
 protocol is explicitly stateful. Closing the session that started the runtime
 does not stop it; after a crash, the next tool call starts it again. Runtime
 sockets include a code fingerprint, so an in-place upgrade gracefully replaces
-the older build.
+the older build. The fingerprint includes the packaged server modules, Python
+runtime, and installed dependency closure. Stable lifecycle locks plus the
+released v1 lock names prevent old and new plugin processes from owning Lean
+children at the same time during an upgrade.
 
 Lean subprocesses remain lazy. A REPL call stays pending while its fresh child
 starts, and the first LSP call stays pending while its session starts, so no
@@ -54,6 +57,9 @@ The LSP session delegates Lean's evolving JSON-RPC protocol to the pinned
 `textDocument/waitForDiagnostics` barrier instead of guessing completion from
 a quiet stdout interval. Autoform still owns admission deadlines, project-path
 validation, a scrubbed Lake environment, and verified process-group cleanup.
+Leanclient's barrier tracks imported-module changes; Autoform additionally
+rejects a result if the project configuration or requested file changes during
+the call.
 This backend requires Lean 4.24 or newer; Autoform's bundled project pins a
 supported stable release.
 
@@ -65,6 +71,9 @@ by `AUTOFORM_REPL_TOTAL_WORKERS`, `AUTOFORM_REPL_WORKERS_PER_PROJECT`,
 process to start the runtime supplies those settings until it is stopped.
 `get_repl_status` reports a project pool as `warm` when its admission slots are
 cached; it does not mean a Lean REPL child is resident between calls.
+`AUTOFORM_REPL_REQUEST_TIMEOUT` and `LEAN_LSP_TIMEOUT` set the default
+end-to-end operation budgets. `AUTOFORM_MAX_REPL_REQUEST_SECONDS` and
+`AUTOFORM_MAX_LSP_REQUEST_SECONDS` cap those settings.
 `AUTOFORM_RUNTIME_RESPONSE_TIMEOUT` can raise the client/daemon response budget
 when a Lean operation and its verified child cleanup need more than the default
 15 minutes.
