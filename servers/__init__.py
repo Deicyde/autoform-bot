@@ -7,6 +7,7 @@ server process's working directory.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -84,6 +85,23 @@ def lean_project_fingerprint(project_dir: Path) -> ProjectFingerprint:
     return ProjectFingerprint(
         root=(root.st_dev, root.st_ino, root.st_mode),
         files=tuple(fingerprint),
+    )
+
+
+def is_initial_manifest_materialization(
+    before: ProjectFingerprint,
+    after: ProjectFingerprint,
+) -> bool:
+    """Return whether only a regular, previously absent manifest appeared."""
+    manifest = "lake-manifest.json"
+    created = [item for item in after.files if item[0] == manifest]
+    return (
+        before.root == after.root
+        and all(item[0] != manifest for item in before.files)
+        and len(created) == 1
+        and stat.S_ISREG(created[0][3])
+        and before.files
+        == tuple(item for item in after.files if item[0] != manifest)
     )
 
 

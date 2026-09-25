@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -2924,6 +2925,80 @@ def test_lsp_dispatch_shares_one_deadline_with_start_and_operation(
     assert before + timeout <= events[0][1] <= after + timeout
 
 
+def test_lsp_startup_adopts_an_initial_lake_manifest(tmp_path):
+    from servers import lean_project_fingerprint
+
+    project = make_lake_project(tmp_path, "lsp-manifest")
+    source = project / "Main.lean"
+    source.write_text("#check Nat\n")
+    manifest = project / "lake-manifest.json"
+    sessions = []
+
+    class Session(FakeLsp):
+        def __init__(self, root):
+            super().__init__(root)
+            manifest.write_text('{"version": "1.1.0"}\n')
+            sessions.append(self)
+
+        def get_diagnostics(self, file_path, *, deadline=None):
+            return []
+
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=FakePool,
+        lsp_factory=Session,
+        start_sweepers=False,
+    )
+    try:
+        result = services.dispatch(
+            "lsp.diagnostics",
+            {"project_dir": str(project), "file_path": str(source)},
+        )
+
+        assert result == "No diagnostics — file compiles cleanly."
+        assert len(sessions) == 1
+        entry = services.lsp_projects._entries[project.resolve()]
+        assert entry.fingerprint == lean_project_fingerprint(project.resolve())
+    finally:
+        services.close()
+
+
+def test_lsp_rejects_a_manifest_edit_after_startup_materialization(tmp_path):
+    project = make_lake_project(tmp_path, "lsp-manifest-edit")
+    source = project / "Main.lean"
+    source.write_text("#check Nat\n")
+    manifest = project / "lake-manifest.json"
+    sessions = []
+
+    class Session(FakeLsp):
+        def __init__(self, root):
+            super().__init__(root)
+            manifest.write_text('{"version": "1.1.0"}\n')
+            sessions.append(self)
+
+        def get_diagnostics(self, file_path, *, deadline=None):
+            replacement = project / "manifest.replacement"
+            replacement.write_text('{"version": "1.2.0"}\n')
+            replacement.replace(manifest)
+            return []
+
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=FakePool,
+        lsp_factory=Session,
+        start_sweepers=False,
+    )
+    try:
+        with pytest.raises(ProjectResourceBusyError, match="changed during LSP request"):
+            services.dispatch(
+                "lsp.diagnostics",
+                {"project_dir": str(project), "file_path": str(source)},
+            )
+        assert sessions[0].closed is True
+    finally:
+        services.close()
+
+
 def test_failed_lsp_session_is_replaced_on_the_next_call(tmp_path):
     from servers.lsp.server import LspProtocolError
 
@@ -3018,3 +3093,37 @@ def test_lsp_result_is_rejected_when_request_inputs_change(
         assert len(sessions) == 2
     finally:
         services.close()
+
+
+@pytest.mark.real_lean
+@pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
+def test_real_runtime_serves_first_lsp_call_when_lake_materializes_manifest(
+    tmp_path,
+    runtime_dir,
+):
+    project = tmp_path / "cold-lsp-project"
+    project.mkdir()
+    (project / "lean-toolchain").write_text("leanprover/lean4:v4.32.2\n")
+    (project / "lakefile.toml").write_text(
+        'name = "ColdLspFixture"\nversion = "0.1.0"\n'
+    )
+    source = project / "Main.lean"
+    source.write_text("example : False := by\n  trivial\n")
+    manifest = project / "lake-manifest.json"
+    client = LeanRuntimeClient(
+        socket_path=runtime_dir / "cold-lsp.sock",
+        startup_timeout=15,
+        response_timeout=900,
+    )
+
+    assert not manifest.exists()
+    try:
+        result = client.request(
+            "lsp.diagnostics",
+            {"project_dir": str(project), "file_path": str(source)},
+        )
+
+        assert "1 error(s)" in result
+        assert manifest.is_file()
+    finally:
+        client.stop()

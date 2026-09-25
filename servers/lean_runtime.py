@@ -28,6 +28,7 @@ from typing import Any, Generic, TypeVar
 
 from servers import (
     ProjectFingerprint,
+    is_initial_manifest_materialization,
     lean_project_fingerprint,
     resolve_lean_file,
     resolve_lean_project_dir,
@@ -281,6 +282,10 @@ class ProjectResourceCache(Generic[T]):
     ``deadline_factory`` receives the lease's absolute monotonic deadline.  It
     lets a resource's own startup protocol share the cache admission deadline
     without breaking existing one-argument factories.
+
+    ``accept_startup_fingerprint`` permits a narrow, caller-defined transition
+    caused by startup itself. The accepted fingerprint becomes the resource's
+    generation; later validation remains strict.
     """
 
     def __init__(
@@ -292,6 +297,9 @@ class ProjectResourceCache(Generic[T]):
         idle_seconds: float,
         is_valid: Callable[[T], bool] | None = None,
         deadline_factory: Callable[[Path, float], T] | None = None,
+        accept_startup_fingerprint: (
+            Callable[[ProjectFingerprint, ProjectFingerprint], bool] | None
+        ) = None,
         start_sweeper: bool = True,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -303,6 +311,7 @@ class ProjectResourceCache(Generic[T]):
         self._idle_seconds = idle_seconds
         self._is_valid = is_valid
         self._deadline_factory = deadline_factory
+        self._accept_startup_fingerprint = accept_startup_fingerprint
         self._clock = clock
         self._entries: dict[Path, _CacheEntry[T]] = {}
         self._retiring: dict[Path, T] = {}
@@ -458,6 +467,21 @@ class ProjectResourceCache(Generic[T]):
             if entry is not None and entry.resource is resource:
                 entry.invalid = True
                 self._condition.notify_all()
+
+    def leased_fingerprint(self, root: Path, resource: T) -> ProjectFingerprint:
+        """Return the exact project generation attached to an active lease."""
+        with self._condition:
+            entry = self._entries.get(root)
+            if (
+                entry is None
+                or entry.resource is not resource
+                or entry.invalid
+                or not entry.active
+            ):
+                raise ProjectResourceBusyError(
+                    f"shared Lean project lease became unavailable: {root}"
+                )
+            return entry.fingerprint
 
     def evict_idle(self) -> int:
         """Close every inactive entry older than the configured TTL."""
@@ -791,7 +815,7 @@ class ProjectResourceCache(Generic[T]):
                 factory_outcome.append((False, error))
             else:
                 try:
-                    disposition = self._settle_created_resource(
+                    disposition, settled_fingerprint = self._settle_created_resource(
                         root,
                         resource,
                         fingerprint=fingerprint,
@@ -800,7 +824,9 @@ class ProjectResourceCache(Generic[T]):
                 except BaseException as error:
                     factory_outcome.append((False, error))
                 else:
-                    factory_outcome.append((True, (resource, disposition)))
+                    factory_outcome.append(
+                        (True, (resource, disposition, settled_fingerprint))
+                    )
             future.set_result(None)
 
         creator: threading.Thread | None = None
@@ -843,7 +869,7 @@ class ProjectResourceCache(Generic[T]):
         if not succeeded:
             assert isinstance(outcome, BaseException)
             raise outcome.with_traceback(outcome.__traceback__)
-        created, disposition = outcome
+        created, disposition, settled_fingerprint = outcome
 
         if disposition == "closed":
             raise RuntimeError("project resource cache closed during startup")
@@ -855,7 +881,7 @@ class ProjectResourceCache(Generic[T]):
             root,
             created,
             lease_token=lease_token,
-            fingerprint=fingerprint,
+            fingerprint=settled_fingerprint,
             deadline=deadline,
         )
 
@@ -866,23 +892,34 @@ class ProjectResourceCache(Generic[T]):
         *,
         fingerprint: ProjectFingerprint,
         required_fingerprint: ProjectFingerprint | None,
-    ) -> str:
+    ) -> tuple[str, ProjectFingerprint]:
         """Publish a valid result or retain ownership until it is retired."""
         fingerprint_error: BaseException | None = None
         try:
             current_fingerprint = lean_project_fingerprint(root)
+            accepted_fingerprint = fingerprint
+            if (
+                current_fingerprint != fingerprint
+                and self._accept_startup_fingerprint is not None
+                and self._accept_startup_fingerprint(
+                    fingerprint, current_fingerprint
+                )
+            ):
+                accepted_fingerprint = current_fingerprint
         except OSError:
             current_fingerprint = None
+            accepted_fingerprint = fingerprint
         except BaseException as error:
             current_fingerprint = None
+            accepted_fingerprint = fingerprint
             fingerprint_error = error
         try:
             with self._condition:
                 if self._closed:
                     disposition = "closed"
-                elif current_fingerprint != fingerprint or (
+                elif current_fingerprint != accepted_fingerprint or (
                     required_fingerprint is not None
-                    and current_fingerprint != required_fingerprint
+                    and required_fingerprint != fingerprint
                 ):
                     disposition = "changed"
                 elif root in self._entries or root in self._retiring:
@@ -891,7 +928,7 @@ class ProjectResourceCache(Generic[T]):
                     disposition = "published"
                     self._entries[root] = _CacheEntry(
                         resource=resource,
-                        fingerprint=fingerprint,
+                        fingerprint=accepted_fingerprint,
                         last_used=self._clock(),
                     )
                 if disposition != "published":
@@ -918,7 +955,7 @@ class ProjectResourceCache(Generic[T]):
                 )
             if cleanup_error is not None:
                 raise cleanup_error.with_traceback(cleanup_error.__traceback__)
-        return disposition
+        return disposition, accepted_fingerprint
 
     def _retain_created_resource(self, root: Path, resource: T) -> None:
         """Recover ownership when settlement is interrupted mid-publication."""
@@ -1297,6 +1334,7 @@ class LeanRuntimeServices:
             deadline_factory=(
                 None if lsp_factory is not None else default_lsp_deadline_factory
             ),
+            accept_startup_fingerprint=is_initial_manifest_materialization,
             start_sweeper=start_sweepers,
         )
 
@@ -1381,6 +1419,9 @@ class LeanRuntimeServices:
                 required_fingerprint=fingerprint,
             ) as session:
                 assert session is not None
+                leased_fingerprint = self.lsp_projects.leased_fingerprint(
+                    root, session
+                )
                 try:
                     diagnostics = session.get_diagnostics(
                         str(path),
@@ -1389,7 +1430,7 @@ class LeanRuntimeServices:
                     self._require_lsp_fingerprint(
                         root,
                         path,
-                        fingerprint,
+                        leased_fingerprint,
                         file_fingerprint,
                         deadline=deadline,
                     )
@@ -1418,6 +1459,9 @@ class LeanRuntimeServices:
                 required_fingerprint=fingerprint,
             ) as session:
                 assert session is not None
+                leased_fingerprint = self.lsp_projects.leased_fingerprint(
+                    root, session
+                )
                 try:
                     result = session.hover(
                         str(path),
@@ -1428,7 +1472,7 @@ class LeanRuntimeServices:
                     self._require_lsp_fingerprint(
                         root,
                         path,
-                        fingerprint,
+                        leased_fingerprint,
                         file_fingerprint,
                         deadline=deadline,
                     )

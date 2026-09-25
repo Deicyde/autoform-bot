@@ -984,6 +984,78 @@ def test_run_disposable_rejects_project_change_before_dispatch(tmp_path, monkeyp
     assert response == {"repl_error": "Lean project changed before REPL dispatch"}
 
 
+@pytest.mark.parametrize("materialized_during", ["startup", "execution"])
+def test_run_disposable_accepts_initial_lake_manifest_materialization(
+    tmp_path,
+    monkeypatch,
+    materialized_during,
+):
+    config = tmp_path / "lakefile.toml"
+    config.write_text('name = "Fixture"\n', encoding="utf-8")
+    manifest = tmp_path / "lake-manifest.json"
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+    calls = []
+
+    def start(*args, **kwargs):
+        if materialized_during == "startup":
+            manifest.write_text('{"version": "1.1.0"}\n', encoding="utf-8")
+
+    def run_frame(*args, **kwargs):
+        calls.append(True)
+        if materialized_during == "execution":
+            manifest.write_text('{"version": "1.1.0"}\n', encoding="utf-8")
+        return {"env": 1, "messages": [], "sorries": []}
+
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", start)
+    monkeypatch.setattr(repl, "_run", run_frame)
+
+    assert repl.run_disposable("#check Nat", timeout=1) == {
+        "messages": [],
+        "sorries": [],
+    }
+    assert calls == [True]
+
+
+def test_run_disposable_rejects_manifest_edit_after_materialization(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "lakefile.toml").write_text('name = "Fixture"\n', encoding="utf-8")
+    manifest = tmp_path / "lake-manifest.json"
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+
+    def start(*args, **kwargs):
+        manifest.write_text('{"version": "1.1.0"}\n', encoding="utf-8")
+
+    def run_frame(*args, **kwargs):
+        replacement = tmp_path / "manifest.replacement"
+        replacement.write_text('{"version": "1.2.0"}\n', encoding="utf-8")
+        replacement.replace(manifest)
+        return {"env": 1, "messages": [], "sorries": []}
+
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", start)
+    monkeypatch.setattr(repl, "_run", run_frame)
+
+    response = repl.run_disposable("#check Nat", timeout=1)
+
+    assert response["outcome_unknown"] is True
+    assert "freshness changed" in response["repl_error"]
+
+
 @pytest.mark.parametrize("response_kind", ["success", "command_error", "stderr"])
 def test_run_disposable_reports_project_change_after_dispatch_as_unknown(
     tmp_path,

@@ -97,6 +97,39 @@ class TestProjectResolution:
 
         assert lean_project_fingerprint(project) != first
 
+    def test_only_initial_manifest_materialization_is_an_accepted_transition(
+        self, tmp_path
+    ):
+        from servers import (
+            is_initial_manifest_materialization,
+            lean_project_fingerprint,
+        )
+
+        project = make_lake_project(tmp_path)
+        before = lean_project_fingerprint(project)
+        manifest = project / "lake-manifest.json"
+        manifest.write_text('{"version": "1.1.0"}\n')
+        materialized = lean_project_fingerprint(project)
+
+        assert is_initial_manifest_materialization(before, materialized) is True
+        assert is_initial_manifest_materialization(materialized, materialized) is False
+
+        manifest.unlink()
+        manifest.mkdir()
+        assert (
+            is_initial_manifest_materialization(
+                before, lean_project_fingerprint(project)
+            )
+            is False
+        )
+
+        manifest.rmdir()
+        manifest.write_text('{"version": "1.1.0"}\n')
+        (project / "lakefile.toml").write_text('[package]\nname = "Changed"\n')
+        changed = lean_project_fingerprint(project)
+
+        assert is_initial_manifest_materialization(before, changed) is False
+
 
 # ---------------------------------------------------------------------------
 # REPL server
