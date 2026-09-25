@@ -41,7 +41,10 @@ def test_start_owns_a_posix_process_group(monkeypatch):
         repl_core.LeanReplConfig(
             warmup_imports=frozenset(),
             validate_imports=False,
-            child_lifetime_lock="/tmp/autoform-test-children.lock",
+            lifetime_locks=(
+                "/tmp/autoform-test-runtime.lock",
+                "/tmp/autoform-test-legacy.lock",
+            ),
         )
     )
 
@@ -54,8 +57,9 @@ def test_start_owns_a_posix_process_group(monkeypatch):
         "servers.process_supervisor",
     ]
     assert captured["args"][0][5:] == [
-        "/tmp/autoform-test-children.lock",
         "-",
+        "/tmp/autoform-test-runtime.lock",
+        "/tmp/autoform-test-legacy.lock",
         "--",
         "lake",
         "exe",

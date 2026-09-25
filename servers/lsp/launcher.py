@@ -33,10 +33,14 @@ def main(argv: list[str] | None = None) -> None:
             arguments[2:],
             clean_lake_environment(),
         )
-    if len(arguments) < 5 or arguments[3] != "--":
+    try:
+        separator = arguments.index("--")
+    except ValueError:
+        separator = -1
+    if separator < 3 or separator == len(arguments) - 1:
         raise SystemExit(
             "usage: python -m servers.lsp.launcher PID_FILE PARENT_PID "
-            "CHILD_LIFETIME_LOCK -- COMMAND [ARG ...]"
+            "LIFETIME_LOCK [LIFETIME_LOCK ...] -- COMMAND [ARG ...]"
         )
 
     identity_path = Path(arguments[0])
@@ -45,9 +49,9 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as error:
         raise SystemExit("PARENT_PID must be an integer") from error
     supervise_process(
-        arguments[4:],
+        arguments[separator + 1 :],
         parent_pid=parent_pid,
-        child_lifetime_lock=Path(arguments[2]),
+        lifetime_locks=tuple(Path(path) for path in arguments[2:separator]),
         identity_path=identity_path,
         environment=clean_lake_environment(),
     )

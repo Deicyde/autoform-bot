@@ -89,7 +89,10 @@ def fake_session(tmp_path: Path, monkeypatch):
         lsp.LspConfig(
             cwd=str(project),
             timeout=1,
-            child_lifetime_lock=str(tmp_path / "children.lock"),
+            lifetime_locks=(
+                str(tmp_path / "runtime.lifetime.lock"),
+                str(tmp_path / "legacy.lifetime.lock"),
+            ),
         ),
         client_factory=_FakeAsyncClient,
     )
@@ -133,7 +136,7 @@ def test_start_configures_pinned_client_and_supervised_command(fake_session) -> 
     assert client.kwargs["report_delay_ms"] is None
     command = client.kwargs["server_command"]
     assert command[:4] == [sys.executable, "-I", "-m", "servers.lsp.launcher"]
-    assert command[5:7] == [str(os.getpid()), session.config.child_lifetime_lock]
+    assert command[5:8] == [str(os.getpid()), *session.config.lifetime_locks]
     assert command[-3:] == ["--", "lake", "serve"]
     assert session.is_alive()
 

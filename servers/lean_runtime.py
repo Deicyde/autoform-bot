@@ -1719,7 +1719,7 @@ class LeanRuntimeServices:
         repl_factory: Callable[[Path], LeanReplPool] | None = None,
         lsp_factory: Callable[[Path], LeanLspSession] | None = None,
         start_sweepers: bool = True,
-        child_lifetime_lock: Path | None = None,
+        lifetime_locks: tuple[Path, ...] = (),
     ) -> None:
         self.config = config or LeanRuntimeConfig.from_environment()
         self.started_at = time.monotonic()
@@ -1731,11 +1731,7 @@ class LeanRuntimeServices:
                     repl_command=list(self.config.repl_command),
                     num_repls=self.config.repl_workers_per_project,
                     max_retries=0,
-                    child_lifetime_lock=(
-                        str(child_lifetime_lock)
-                        if child_lifetime_lock is not None
-                        else None
-                    ),
+                    lifetime_locks=tuple(str(path) for path in lifetime_locks),
                 )
             )
 
@@ -1745,11 +1741,7 @@ class LeanRuntimeServices:
                     cwd=str(project_dir),
                     lake_command=list(self.config.lsp_command),
                     timeout=self.config.lsp_timeout,
-                    child_lifetime_lock=(
-                        str(child_lifetime_lock)
-                        if child_lifetime_lock is not None
-                        else None
-                    ),
+                    lifetime_locks=tuple(str(path) for path in lifetime_locks),
                 )
             )
 
@@ -2202,30 +2194,23 @@ def serve(paths: RuntimePaths) -> None:
     _configure_logging(paths.log)
     import fcntl
 
-    child_lifetime_fd = os.open(
-        paths.child_lifetime_lock,
-        os.O_CREAT | os.O_RDWR,
-        0o600,
-    )
     lifetime_fds = []
     try:
-        # Start as the exclusive owner so direct ``serve`` invocations also
-        # drain an earlier crashed daemon's children. Downgrade only after the
-        # daemon locks are ours. Every live daemon then keeps a shared claim,
-        # preventing a replacement from fencing children while an admitted
-        # request can still create one.
-        fcntl.flock(child_lifetime_fd, fcntl.LOCK_EX)
+        # Claim the complete compatibility set exclusively before publishing
+        # this daemon, then retain shared ownership through cleanup. Existing
+        # clients still request these locks exclusively, while this daemon and
+        # all of its Lean children can hold shared claims concurrently.
         for path in dict.fromkeys(
             (paths.lifetime_lock, *paths.compatibility_lifetime_locks)
         ):
             lifetime_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
             lifetime_fds.append(lifetime_fd)
             fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
-        fcntl.flock(child_lifetime_fd, fcntl.LOCK_SH)
+        for lifetime_fd in lifetime_fds:
+            fcntl.flock(lifetime_fd, fcntl.LOCK_SH)
     except BaseException:
         for lifetime_fd in reversed(lifetime_fds):
             os.close(lifetime_fd)
-        os.close(child_lifetime_fd)
         raise
     services: LeanRuntimeServices | None = None
     server: LeanRuntimeServer | None = None
@@ -2242,7 +2227,13 @@ def serve(paths: RuntimePaths) -> None:
                 f"runtime {kind} already exists at {paths.socket}; use start/status/stop"
             )
 
-        services = LeanRuntimeServices(child_lifetime_lock=paths.child_lifetime_lock)
+        services = LeanRuntimeServices(
+            lifetime_locks=tuple(
+                dict.fromkeys(
+                    (paths.lifetime_lock, *paths.compatibility_lifetime_locks)
+                )
+            )
+        )
         server = LeanRuntimeServer(paths.socket, services)
         info = paths.socket.lstat()
         bound_identity = (info.st_dev, info.st_ino)
@@ -2278,14 +2269,12 @@ def serve(paths: RuntimePaths) -> None:
                 logger.info("Lean runtime %s stopped", os.getpid())
                 for lifetime_fd in reversed(lifetime_fds):
                     os.close(lifetime_fd)
-                os.close(child_lifetime_fd)
 
 
 def _paths_from_args(
     socket_path: str | None,
     log_path: str | None,
     lifetime_lock_path: str | None = None,
-    child_lifetime_lock_path: str | None = None,
     compatibility_lifetime_lock_paths: list[str] | None = None,
 ) -> RuntimePaths:
     paths = (
@@ -2296,7 +2285,6 @@ def _paths_from_args(
     if (
         log_path is None
         and lifetime_lock_path is None
-        and child_lifetime_lock_path is None
         and compatibility_lifetime_lock_paths is None
     ):
         return paths
@@ -2306,21 +2294,10 @@ def _paths_from_args(
         if lifetime_lock_path is None
         else Path(lifetime_lock_path).expanduser()
     )
-    child_lifetime_lock = (
-        paths.child_lifetime_lock
-        if child_lifetime_lock_path is None
-        else Path(child_lifetime_lock_path).expanduser()
-    )
     if not log.is_absolute():
         raise LeanRuntimeError("Lean runtime log path must be absolute")
     if not lifetime_lock.is_absolute():
         raise LeanRuntimeError("Lean runtime lifetime lock path must be absolute")
-    if not child_lifetime_lock.is_absolute():
-        raise LeanRuntimeError("Lean child lifetime lock path must be absolute")
-    if child_lifetime_lock.parent != paths.directory:
-        raise LeanRuntimeError(
-            "Lean child lifetime lock must stay in the runtime directory"
-        )
     compatibility_lifetime_locks = (
         paths.compatibility_lifetime_locks
         if compatibility_lifetime_lock_paths is None
@@ -2343,7 +2320,6 @@ def _paths_from_args(
         socket=paths.socket,
         lock=paths.lock,
         lifetime_lock=lifetime_lock,
-        child_lifetime_lock=child_lifetime_lock,
         log=log,
         compatibility_lifetime_locks=compatibility_lifetime_locks,
     )
@@ -2354,10 +2330,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--socket", help="override the Unix socket path")
     parser.add_argument("--log", help="override the rotating log path")
     parser.add_argument("--lifetime-lock", help="override the runtime lifetime lock")
-    parser.add_argument(
-        "--child-lifetime-lock",
-        help="override the shared Lean child lifetime lock",
-    )
     parser.add_argument(
         "--compatibility-lifetime-lock",
         action="append",
@@ -2374,7 +2346,6 @@ def main(argv: list[str] | None = None) -> None:
         args.socket,
         args.log,
         args.lifetime_lock,
-        args.child_lifetime_lock,
         args.compatibility_lifetime_lock,
     )
 

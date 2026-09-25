@@ -340,7 +340,7 @@ class LeanReplConfig:
     warmup_imports: frozenset[str] = WARMUP_IMPORTS
 
     repl_command: list[str] = field(default_factory=lambda: ["lake", "exe", "repl"])
-    child_lifetime_lock: str | None = None
+    lifetime_locks: tuple[str, ...] = ()
 
     # stdout is capped per response. stderr has no protocol framing, so its
     # ceiling applies to the entire process generation and resets on restart.
@@ -598,15 +598,15 @@ class LeanRepl:
 
         try:
             command = self.config.repl_command
-            if self.config.child_lifetime_lock is not None:
+            if self.config.lifetime_locks:
                 command = [
                     sys.executable,
                     "-I",
                     "-m",
                     "servers.process_supervisor",
                     str(os.getpid()),
-                    self.config.child_lifetime_lock,
                     "-",
+                    *self.config.lifetime_locks,
                     "--",
                     *command,
                 ]

@@ -21,8 +21,6 @@ from typing import NoReturn
 import psutil
 
 WATCHDOG_POLL_SECONDS = 0.1
-WATCHDOG_TERM_SECONDS = 0.5
-WATCHDOG_KILL_SECONDS = 1.0
 WATCHDOG_START_SECONDS = 5.0
 
 
@@ -55,16 +53,6 @@ def _group_has_live_members(process_group_id: int) -> bool:
     return False
 
 
-def _wait_for_group_exit(process_group_id: int, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while _group_has_live_members(process_group_id):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(WATCHDOG_POLL_SECONDS, remaining))
-    return True
-
-
 def _signal_group(process_group_id: int, signal_number: int) -> None:
     try:
         os.killpg(process_group_id, signal_number)
@@ -75,18 +63,10 @@ def _signal_group(process_group_id: int, signal_number: int) -> None:
             raise
 
 
-def _terminate_group_until_gone(process_group_id: int) -> None:
-    """Keep the child lock until the complete process group is dead."""
-    delay = WATCHDOG_POLL_SECONDS
+def _observe_group_until_gone(process_group_id: int) -> None:
+    """Retain lifetime ownership without signaling an unanchored group ID."""
     while _group_has_live_members(process_group_id):
-        _signal_group(process_group_id, signal.SIGTERM)
-        if _wait_for_group_exit(process_group_id, WATCHDOG_TERM_SECONDS):
-            return
-        _signal_group(process_group_id, signal.SIGKILL)
-        if _wait_for_group_exit(process_group_id, WATCHDOG_KILL_SECONDS):
-            return
-        time.sleep(delay)
-        delay = min(delay * 2, 1.0)
+        time.sleep(WATCHDOG_POLL_SECONDS)
 
 
 def _same_process(process: psutil.Process) -> bool:
@@ -102,9 +82,17 @@ def _monitor_until_cleanup(
     process_group_id: int,
 ) -> None:
     """Use cheap PID identity checks until full group cleanup is required."""
-    while _same_process(target) and _same_process(parent):
+    while _same_process(target):
+        if not _same_process(parent):
+            # The original group leader is still identity-verified at this
+            # point, so one immediate group kill cannot target a recycled PGID.
+            _signal_group(process_group_id, signal.SIGKILL)
+            _observe_group_until_gone(process_group_id)
+            return
         time.sleep(WATCHDOG_POLL_SECONDS)
-    _terminate_group_until_gone(process_group_id)
+    # Once the leader identity is gone, never signal the numeric PGID again.
+    # A replacement remains fenced until every residual member disappears.
+    _observe_group_until_gone(process_group_id)
 
 
 def _watch_parent(
@@ -127,10 +115,10 @@ def _watch_parent(
         os.close(ready_fd)
         _monitor_until_cleanup(parent, target, process_group_id)
     except BaseException:
-        # The watchdog must fail closed. If its own logic fails, make one last
-        # best-effort attempt and retain the shared lock until the group exits.
+        # The watchdog must fail closed. Once identity checks have failed, do
+        # not risk signaling a recycled process-group ID.
         try:
-            _terminate_group_until_gone(process_group_id)
+            _observe_group_until_gone(process_group_id)
         except BaseException:
             while _group_has_live_members(process_group_id):
                 time.sleep(1.0)
@@ -172,7 +160,7 @@ def supervise_process(
     command: list[str],
     *,
     parent_pid: int,
-    child_lifetime_lock: Path,
+    lifetime_locks: tuple[Path, ...],
     identity_path: Path | None = None,
     environment: dict[str, str] | None = None,
 ) -> NoReturn:
@@ -185,8 +173,10 @@ def supervise_process(
         raise ProcessSupervisorError("Lean runtime parent exited before child startup")
     if os.getpgrp() != os.getpid():
         raise ProcessSupervisorError("Lean process supervisor must be started in its own process group")
-    if not child_lifetime_lock.is_absolute():
-        raise ProcessSupervisorError("Lean child lifetime lock must be absolute")
+    if not lifetime_locks:
+        raise ProcessSupervisorError("Lean lifetime lock set must not be empty")
+    if any(not path.is_absolute() for path in lifetime_locks):
+        raise ProcessSupervisorError("Lean lifetime locks must be absolute")
 
     try:
         parent = psutil.Process(parent_pid)
@@ -195,9 +185,23 @@ def supervise_process(
 
     import fcntl
 
-    lifetime_fd = os.open(child_lifetime_lock, os.O_CREAT | os.O_RDWR, 0o600)
+    lifetime_fds: list[int] = []
     try:
-        fcntl.flock(lifetime_fd, fcntl.LOCK_SH)
+        for path in dict.fromkeys(lifetime_locks):
+            lifetime_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            lifetime_fds.append(lifetime_fd)
+            while True:
+                if os.getppid() != parent_pid or not _same_process(parent):
+                    raise ProcessSupervisorError("Lean runtime parent exited before child startup")
+                try:
+                    fcntl.flock(lifetime_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(WATCHDOG_POLL_SECONDS)
+                except OSError as error:
+                    if error.errno != errno.EACCES:
+                        raise
+                    time.sleep(WATCHDOG_POLL_SECONDS)
         if os.getppid() != parent_pid or not _same_process(parent):
             raise ProcessSupervisorError("Lean runtime parent exited before child startup")
         _start_watchdog(parent, os.getpid())
@@ -208,31 +212,38 @@ def supervise_process(
                 json.dumps({"pid": os.getpid(), "pgid": os.getpgrp()}),
                 encoding="utf-8",
             )
-        os.set_inheritable(lifetime_fd, True)
+        for lifetime_fd in lifetime_fds:
+            os.set_inheritable(lifetime_fd, True)
         if environment is None:
             os.execvp(command[0], command)
         os.execvpe(command[0], command, environment)
     finally:
-        os.close(lifetime_fd)
+        for lifetime_fd in reversed(lifetime_fds):
+            os.close(lifetime_fd)
     raise AssertionError("unreachable")
 
 
 def main(argv: list[str] | None = None) -> None:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if len(arguments) < 5 or arguments[3] != "--":
+    try:
+        separator = arguments.index("--")
+    except ValueError:
+        separator = -1
+    if separator < 3 or separator == len(arguments) - 1:
         raise SystemExit(
             "usage: python -m servers.process_supervisor "
-            "PARENT_PID CHILD_LIFETIME_LOCK IDENTITY_FILE|- -- COMMAND [ARG ...]"
+            "PARENT_PID IDENTITY_FILE|- LIFETIME_LOCK [LIFETIME_LOCK ...] "
+            "-- COMMAND [ARG ...]"
         )
     try:
         parent_pid = int(arguments[0])
     except ValueError as error:
         raise SystemExit("PARENT_PID must be an integer") from error
-    identity_path = None if arguments[2] == "-" else Path(arguments[2])
+    identity_path = None if arguments[1] == "-" else Path(arguments[1])
     supervise_process(
-        arguments[4:],
+        arguments[separator + 1 :],
         parent_pid=parent_pid,
-        child_lifetime_lock=Path(arguments[1]),
+        lifetime_locks=tuple(Path(path) for path in arguments[2:separator]),
         identity_path=identity_path,
     )
 

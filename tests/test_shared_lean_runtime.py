@@ -181,7 +181,6 @@ def test_default_runtime_ownership_paths_are_protocol_independent(
 
     assert paths.lock.name == f"lean-{INSTALL_PATH_ID}.lock"
     assert paths.lifetime_lock.name == f"lean-{INSTALL_PATH_ID}.lifetime.lock"
-    assert paths.child_lifetime_lock.name == f"lean-{INSTALL_PATH_ID}.children.lock"
     assert lean_client.LEGACY_LOCK_PROTOCOL_VERSIONS == (1,)
     assert paths.compatibility_lifetime_locks == (
         runtime_dir / f"lean-v1-{INSTALL_PATH_ID}.lifetime.lock",
@@ -2580,27 +2579,32 @@ def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
 
 
 @pytest.mark.daemon
-def test_daemon_holds_shared_child_fence_until_shutdown(runtime_dir, monkeypatch):
+def test_daemon_holds_shared_compatibility_fences_until_shutdown(
+    runtime_dir,
+    monkeypatch,
+):
     import fcntl
 
     socket_path = runtime_dir / "child-fence.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
     client = LeanRuntimeClient(socket_path=socket_path, startup_timeout=15)
     client.ensure_running()
-    child_lifetime_fd = os.open(
-        client.paths.child_lifetime_lock,
-        os.O_CREAT | os.O_RDWR,
-        0o600,
-    )
+    lifetime_fds = [
+        os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        for path in client._lifetime_lock_paths()
+    ]
     try:
-        with pytest.raises(BlockingIOError):
-            fcntl.flock(child_lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for lifetime_fd in lifetime_fds:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         client.stop()
 
-        fcntl.flock(child_lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for lifetime_fd in lifetime_fds:
+            fcntl.flock(lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
-        os.close(child_lifetime_fd)
+        for lifetime_fd in lifetime_fds:
+            os.close(lifetime_fd)
         try:
             client.stop()
         except LeanRuntimeUnavailable:
@@ -2693,12 +2697,8 @@ while True:
     monkeypatch.setenv("AUTOFORM_REPL_REQUEST_TIMEOUT", "30")
     monkeypatch.setenv("LEAN_LSP_TIMEOUT", "30")
     monkeypatch.setenv("AUTOFORM_MAX_LSP_REQUEST_SECONDS", "30")
-    socket_path = runtime_dir / f"orphan-{backend}.sock"
-    client = LeanRuntimeClient(
-        socket_path=socket_path,
-        response_timeout=90,
-        startup_timeout=15,
-    )
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
+    client = LeanRuntimeClient(response_timeout=90, startup_timeout=15)
     daemon_pid = client.ensure_running()["pid"]
     request_errors = []
 
@@ -2729,7 +2729,6 @@ while True:
     request_thread = threading.Thread(target=run_request)
     request_thread.start()
     replacement = LeanRuntimeClient(
-        socket_path=socket_path,
         response_timeout=90,
         startup_timeout=15,
     )
@@ -2744,21 +2743,53 @@ while True:
 
     replacement_thread = threading.Thread(target=start_replacement)
     child_pid = None
+    watcher_pid = None
+    legacy_lifetime_fd = None
     try:
         deadline = time.monotonic() + 10
         while not child_started.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert child_started.exists()
         child_pid = int(child_started.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            children = psutil.Process(child_pid).children()
+            if children:
+                watcher_pid = children[0].pid
+                break
+            time.sleep(0.01)
+        assert watcher_pid is not None
+        os.kill(watcher_pid, signal.SIGSTOP)
+        deadline = time.monotonic() + 2
+        while (
+            psutil.Process(watcher_pid).status() != psutil.STATUS_STOPPED
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert psutil.Process(watcher_pid).status() == psutil.STATUS_STOPPED
 
         os.kill(daemon_pid, signal.SIGKILL)
         os.waitpid(daemon_pid, 0)
+        legacy_lifetime_fd = os.open(
+            client.paths.compatibility_lifetime_locks[0],
+            os.O_CREAT | os.O_RDWR,
+            0o600,
+        )
+        import fcntl
+
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(
+                legacy_lifetime_fd,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
         replacement_thread.start()
         replacement_thread.join(timeout=0.2)
 
         assert replacement_thread.is_alive()
         assert _process_is_live(child_pid)
 
+        os.kill(watcher_pid, signal.SIGCONT)
+        watcher_pid = None
         replacement_thread.join(timeout=20)
         assert not replacement_thread.is_alive()
         assert replacement_errors == []
@@ -2766,6 +2797,13 @@ while True:
         assert replacement_status[0]["pid"] != daemon_pid
         assert not _process_is_live(child_pid)
     finally:
+        if watcher_pid is not None:
+            try:
+                os.kill(watcher_pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        if legacy_lifetime_fd is not None:
+            os.close(legacy_lifetime_fd)
         if replacement_thread.ident is not None:
             replacement_thread.join(timeout=20)
         request_thread.join(timeout=5)
@@ -2836,14 +2874,10 @@ def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, m
         assert current_pid != old_pid
         assert not old_socket.exists()
         lifetime_fd = os.open(current.paths.lifetime_lock, os.O_RDWR)
-        child_lifetime_fd = os.open(current.paths.child_lifetime_lock, os.O_RDWR)
         try:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            with pytest.raises(BlockingIOError):
-                fcntl.flock(child_lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
-            os.close(child_lifetime_fd)
             os.close(lifetime_fd)
     finally:
         current.stop()
