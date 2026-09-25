@@ -103,7 +103,7 @@ def fake_session(tmp_path: Path, monkeypatch):
 
 
 def test_leanclient_dependency_and_public_api_are_pinned() -> None:
-    assert lsp.DEFAULT_LSP_TIMEOUT == 180
+    assert lsp.DEFAULT_LSP_TIMEOUT == 360
     assert version("leanclient") == "0.13.2"
     constructor = inspect.signature(AsyncLeanLSPClient)
     for parameter in (

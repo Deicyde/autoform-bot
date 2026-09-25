@@ -72,8 +72,10 @@ process to start the runtime supplies those settings until it is stopped.
 `get_repl_status` reports a project pool as `warm` when its admission slots are
 cached; it does not mean a Lean REPL child is resident between calls.
 `AUTOFORM_REPL_REQUEST_TIMEOUT` and `LEAN_LSP_TIMEOUT` set the default
-end-to-end operation budgets. `AUTOFORM_MAX_REPL_REQUEST_SECONDS` and
-`AUTOFORM_MAX_LSP_REQUEST_SECONDS` cap those settings.
+end-to-end work budgets, including admission, startup, and execution.
+`AUTOFORM_MAX_REPL_REQUEST_SECONDS` and `AUTOFORM_MAX_LSP_REQUEST_SECONDS` cap
+those settings. Verified process cleanup uses reserved response-budget headroom
+after a failed or timed-out LSP request.
 `AUTOFORM_RUNTIME_RESPONSE_TIMEOUT` can raise the client/daemon response budget
 when a Lean operation and its verified child cleanup need more than the default
 15 minutes.

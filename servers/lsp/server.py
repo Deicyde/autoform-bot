@@ -37,7 +37,7 @@ from servers.lean_client import LeanRuntimeClient
 
 logger = getLogger(__name__)
 
-DEFAULT_LSP_TIMEOUT = 180
+DEFAULT_LSP_TIMEOUT = 360
 LSP_ABORT_TERM_SECONDS = 0.5
 LSP_ABORT_KILL_SECONDS = 1.0
 LSP_CLIENT_CLOSE_SECONDS = 6.0

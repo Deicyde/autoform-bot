@@ -46,6 +46,7 @@ from servers.lean_client import (
     runtime_paths_for_socket,
 )
 from servers.lsp.server import (
+    DEFAULT_LSP_TIMEOUT,
     LspConfig,
     LspBusyError,
     LeanLspSession,
@@ -66,7 +67,6 @@ T = TypeVar("T")
 
 DEFAULT_MAX_PROJECTS = 4
 DEFAULT_IDLE_SECONDS = 30 * 60
-DEFAULT_LSP_TIMEOUT = 180.0
 DEFAULT_MAX_LSP_REQUEST_SECONDS = 600.0
 DEFAULT_REPL_REQUEST_TIMEOUT = 180.0
 DEFAULT_MAX_REPL_REQUEST_SECONDS = 240.0
@@ -75,10 +75,7 @@ DEFAULT_MAX_CONNECTIONS = 64
 RUNTIME_SAFETY_SECONDS = 30.0
 TERMINAL_CLEANUP_RETRY_SECONDS = 0.05
 MAX_TERMINAL_CLEANUP_RETRY_SECONDS = 1.0
-# Conservative bounds for cleanup/startup work that surrounds one LSP call.
-# They keep the daemon's work inside the client's response deadline even when
-# an inactive project must be replaced first.
-LSP_STARTUP_BUDGET = 180.0
+# Conservative cleanup headroom after the end-to-end LSP work deadline.
 LSP_CLOSE_BUDGET = 65.0
 
 
@@ -219,7 +216,6 @@ class LeanRuntimeConfig:
             )
         if (
             LSP_CLOSE_BUDGET
-            + LSP_STARTUP_BUDGET
             + max_lsp_request_seconds
             + RUNTIME_SAFETY_SECONDS
             > response_timeout
@@ -1219,7 +1215,6 @@ class LeanRuntimeServices:
     ) -> None:
         self.config = config or LeanRuntimeConfig.from_environment()
         self.started_at = time.monotonic()
-        self.lsp_creation_budget = LSP_STARTUP_BUDGET + LSP_CLOSE_BUDGET
 
         def default_repl_factory(project_dir: Path) -> LeanReplPool:
             return LeanReplPool(
@@ -1231,15 +1226,26 @@ class LeanRuntimeServices:
                 )
             )
 
-        def default_lsp_factory(project_dir: Path) -> LeanLspSession:
-            session = LeanLspSession(
+        def new_lsp_session(project_dir: Path) -> LeanLspSession:
+            return LeanLspSession(
                 LspConfig(
                     cwd=str(project_dir),
                     lake_command=list(self.config.lsp_command),
                     timeout=self.config.lsp_timeout,
                 )
             )
+
+        def default_lsp_factory(project_dir: Path) -> LeanLspSession:
+            session = new_lsp_session(project_dir)
             session.start()
+            return session
+
+        def default_lsp_deadline_factory(
+            project_dir: Path,
+            deadline: float,
+        ) -> LeanLspSession:
+            session = new_lsp_session(project_dir)
+            session.start(deadline=deadline)
             return session
 
         def close_repl_pool(pool: LeanReplPool) -> None:
@@ -1259,6 +1265,9 @@ class LeanRuntimeServices:
             max_entries=self.config.max_projects,
             idle_seconds=self.config.idle_seconds,
             is_valid=lambda session: session.is_alive(),
+            deadline_factory=(
+                None if lsp_factory is not None else default_lsp_deadline_factory
+            ),
             start_sweeper=start_sweepers,
         )
 
@@ -1330,6 +1339,7 @@ class LeanRuntimeServices:
                     "node_total_workers": self.config.total_repl_workers,
                 }
         if method == "lsp.diagnostics":
+            deadline = time.monotonic() + self.config.lsp_timeout
             project_dir = self._string_param(params, "project_dir")
             file_path = self._string_param(params, "file_path")
             root, path = resolve_lean_file(project_dir, file_path)
@@ -1337,15 +1347,22 @@ class LeanRuntimeServices:
             file_fingerprint = self._lsp_file_fingerprint(path)
             with self.lsp_projects.lease(
                 str(root),
-                acquisition_timeout=self._acquisition_timeout(self.config.lsp_timeout),
-                creation_budget=self.lsp_creation_budget,
+                deadline=deadline,
+                creation_budget=0,
                 required_fingerprint=fingerprint,
             ) as session:
                 assert session is not None
                 try:
-                    diagnostics = session.get_diagnostics(str(path))
+                    diagnostics = session.get_diagnostics(
+                        str(path),
+                        deadline=deadline,
+                    )
                     self._require_lsp_fingerprint(
-                        root, path, fingerprint, file_fingerprint
+                        root,
+                        path,
+                        fingerprint,
+                        file_fingerprint,
+                        deadline=deadline,
                     )
                 except LspBusyError:
                     raise
@@ -1355,6 +1372,7 @@ class LeanRuntimeServices:
                     raise
             return format_lsp_diagnostics(diagnostics)
         if method == "lsp.hover":
+            deadline = time.monotonic() + self.config.lsp_timeout
             project_dir = self._string_param(params, "project_dir")
             file_path = self._string_param(params, "file_path")
             line = self._integer_param(params, "line")
@@ -1366,15 +1384,24 @@ class LeanRuntimeServices:
             file_fingerprint = self._lsp_file_fingerprint(path)
             with self.lsp_projects.lease(
                 str(root),
-                acquisition_timeout=self._acquisition_timeout(self.config.lsp_timeout),
-                creation_budget=self.lsp_creation_budget,
+                deadline=deadline,
+                creation_budget=0,
                 required_fingerprint=fingerprint,
             ) as session:
                 assert session is not None
                 try:
-                    result = session.hover(str(path), line, character)
+                    result = session.hover(
+                        str(path),
+                        line,
+                        character,
+                        deadline=deadline,
+                    )
                     self._require_lsp_fingerprint(
-                        root, path, fingerprint, file_fingerprint
+                        root,
+                        path,
+                        fingerprint,
+                        file_fingerprint,
+                        deadline=deadline,
                     )
                 except LspBusyError:
                     raise
@@ -1391,10 +1418,16 @@ class LeanRuntimeServices:
         path: Path,
         expected_project: ProjectFingerprint,
         expected_file: tuple[int, int, int, int, int, int],
+        *,
+        deadline: float,
     ) -> None:
         # Leanclient's diagnostics barrier owns imported-module freshness. This
         # fence separately prevents returning a result after the request's
         # project configuration or target file was replaced underneath it.
+        if time.monotonic() >= deadline:
+            raise ProjectResourceBusyError(
+                f"Lean LSP request budget expired before result validation: {root}"
+            )
         try:
             current_project = lean_project_fingerprint(root)
             current_file = LeanRuntimeServices._lsp_file_fingerprint(path)
@@ -1402,6 +1435,10 @@ class LeanRuntimeServices:
             raise ProjectResourceBusyError(
                 f"shared Lean project or target changed during LSP request: {root}"
             ) from error
+        if time.monotonic() >= deadline:
+            raise ProjectResourceBusyError(
+                f"Lean LSP request budget expired during result validation: {root}"
+            )
         if current_project != expected_project or current_file != expected_file:
             raise ProjectResourceBusyError(
                 f"shared Lean project or target changed during LSP request: {root}"
@@ -1452,14 +1489,6 @@ class LeanRuntimeServices:
                 logger.error("Lean LSP cleanup also failed: %s", lsp_error)
         if repl_error is not None:
             raise repl_error.with_traceback(repl_error.__traceback__)
-
-    def _acquisition_timeout(self, operation_timeout: float) -> float:
-        """Reserve enough of the RPC deadline for the admitted tool operation."""
-        return (
-            self.config.response_timeout
-            - operation_timeout
-            - RUNTIME_SAFETY_SECONDS
-        )
 
     @staticmethod
     def _string_param(

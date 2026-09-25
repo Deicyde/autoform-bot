@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from servers import lean_client
+from servers import lean_client, lean_runtime
 from servers.lean_client import (
     INSTALL_ID,
     INSTALL_PATH_ID,
@@ -2439,6 +2439,23 @@ def test_response_budget_must_leave_room_for_repl_cleanup(monkeypatch):
         LeanRuntimeConfig.from_environment()
 
 
+def test_response_budget_reserves_lsp_cleanup_but_not_a_second_startup_budget(
+    monkeypatch,
+):
+    boundary = (
+        lean_runtime.DEFAULT_MAX_LSP_REQUEST_SECONDS
+        + lean_runtime.LSP_CLOSE_BUDGET
+        + lean_runtime.RUNTIME_SAFETY_SECONDS
+    )
+    monkeypatch.setenv("AUTOFORM_RUNTIME_RESPONSE_TIMEOUT", str(boundary))
+
+    assert LeanRuntimeConfig.from_environment().response_timeout == boundary
+
+    monkeypatch.setenv("AUTOFORM_RUNTIME_RESPONSE_TIMEOUT", str(boundary - 1))
+    with pytest.raises(ValueError, match="AUTOFORM_MAX_LSP_REQUEST_SECONDS"):
+        LeanRuntimeConfig.from_environment()
+
+
 @pytest.mark.parametrize("timeout", [-1, 0, True, float("nan"), float("inf"), 241])
 def test_invalid_repl_timeout_never_warms_a_pool(tmp_path, timeout):
     project = make_lake_project(tmp_path, "timeout")
@@ -2460,6 +2477,67 @@ def test_invalid_repl_timeout_never_warms_a_pool(tmp_path, timeout):
         services.close()
 
 
+@pytest.mark.parametrize("method", ["lsp.diagnostics", "lsp.hover"])
+def test_lsp_dispatch_shares_one_deadline_with_start_and_operation(
+    tmp_path,
+    monkeypatch,
+    method,
+):
+    project = make_lake_project(tmp_path, f"deadline-{method.rsplit('.', 1)[1]}")
+    source = project / "Main.lean"
+    source.write_text("#check Nat\n")
+    events = []
+
+    class Session:
+        def __init__(self, config):
+            self.config = config
+            self.closed = False
+
+        def start(self, *, deadline=None):
+            events.append(("start", deadline))
+
+        def get_diagnostics(self, file_path, *, deadline=None):
+            events.append(("diagnostics", deadline))
+            return []
+
+        def hover(self, file_path, line, character, *, deadline=None):
+            events.append(("hover", deadline))
+            return "Nat : Type"
+
+        def is_alive(self):
+            return not self.closed
+
+        def close(self):
+            self.closed = True
+
+        def abort(self):
+            self.closed = True
+
+    monkeypatch.setattr(lean_runtime, "LeanLspSession", Session)
+    timeout = 2.0
+    services = LeanRuntimeServices(
+        runtime_config(lsp_timeout=timeout),
+        repl_factory=FakePool,
+        start_sweepers=False,
+    )
+    params = {"project_dir": str(project), "file_path": str(source)}
+    if method == "lsp.hover":
+        params.update({"line": 0, "character": 0})
+    before = time.monotonic()
+    try:
+        services.dispatch(method, params)
+        after = time.monotonic()
+    finally:
+        services.close()
+
+    assert [event[0] for event in events] == [
+        "start",
+        method.rsplit(".", 1)[1],
+    ]
+    assert events[0][1] == events[1][1]
+    assert before + timeout <= events[0][1] <= after + timeout
+
+
 def test_failed_lsp_session_is_replaced_on_the_next_call(tmp_path):
     from servers.lsp.server import LspProtocolError
 
@@ -2478,7 +2556,7 @@ def test_failed_lsp_session_is_replaced_on_the_next_call(tmp_path):
         def is_alive(self):
             return self.alive and not self.closed
 
-        def get_diagnostics(self, file_path):
+        def get_diagnostics(self, file_path, *, deadline=None):
             if self.number == 1:
                 self.alive = False
                 raise LspProtocolError("broken shared stream")
@@ -2527,11 +2605,11 @@ def test_lsp_result_is_rejected_when_request_inputs_change(
             os.utime(replacement, ns=(original_mtime, original_mtime))
             replacement.replace(target)
 
-        def get_diagnostics(self, file_path):
+        def get_diagnostics(self, file_path, *, deadline=None):
             self.change_input()
             return []
 
-        def hover(self, file_path, line, character):
+        def hover(self, file_path, line, character, *, deadline=None):
             self.change_input()
             return "Nat : Type"
 
