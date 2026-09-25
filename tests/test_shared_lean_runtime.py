@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -14,6 +16,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from servers import lean_client, lean_runtime
@@ -39,6 +42,14 @@ def make_lake_project(tmp_path, name: str):
     project.mkdir()
     (project / "lakefile.toml").write_text(f'[package]\nname = "{name}"\n')
     return project
+
+
+def _process_is_live(pid: int) -> bool:
+    try:
+        process = psutil.Process(pid)
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
 
 
 def test_runtime_identity_tracks_all_packaged_server_modules():
@@ -161,6 +172,7 @@ def test_default_runtime_ownership_paths_are_protocol_independent(
 
     assert paths.lock.name == f"lean-{INSTALL_PATH_ID}.lock"
     assert paths.lifetime_lock.name == f"lean-{INSTALL_PATH_ID}.lifetime.lock"
+    assert paths.child_lifetime_lock.name == f"lean-{INSTALL_PATH_ID}.children.lock"
     assert lean_client.LEGACY_LOCK_PROTOCOL_VERSIONS == (1,)
     assert paths.compatibility_lifetime_locks == (
         runtime_dir / f"lean-v1-{INSTALL_PATH_ID}.lifetime.lock",
@@ -2062,6 +2074,210 @@ def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
         client.stop()
 
 
+@pytest.mark.daemon
+def test_daemon_holds_shared_child_fence_until_shutdown(runtime_dir, monkeypatch):
+    import fcntl
+
+    socket_path = runtime_dir / "child-fence.sock"
+    monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
+    client = LeanRuntimeClient(socket_path=socket_path, startup_timeout=15)
+    client.ensure_running()
+    child_lifetime_fd = os.open(
+        client.paths.child_lifetime_lock,
+        os.O_CREAT | os.O_RDWR,
+        0o600,
+    )
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(child_lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        client.stop()
+
+        fcntl.flock(child_lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(child_lifetime_fd)
+        try:
+            client.stop()
+        except LeanRuntimeUnavailable:
+            pass
+
+
+@pytest.mark.daemon
+@pytest.mark.parametrize("backend", ["repl", "lsp"])
+def test_replacement_waits_for_orphaned_lean_child_after_daemon_sigkill(
+    tmp_path,
+    runtime_dir,
+    monkeypatch,
+    backend,
+):
+    project = make_lake_project(tmp_path, f"orphan-{backend}")
+    source = project / "Main.lean"
+    source.write_text("#check Nat\n", encoding="utf-8")
+    child_started = tmp_path / f"{backend}-child-started"
+    child_script = tmp_path / f"fake_{backend}.py"
+    if backend == "repl":
+        child_script.write_text(
+            """
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+sys.stdin.readline()
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+while True:
+    time.sleep(1)
+""",
+            encoding="utf-8",
+        )
+        command_name = "LEAN_REPL_CMD"
+    else:
+        child_script.write_text(
+            """
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+def read_message():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            raise SystemExit(0)
+        if line in (b"\\n", b"\\r\\n"):
+            break
+        name, value = line.decode("ascii").split(":", 1)
+        if name.lower() == "content-length":
+            length = int(value.strip())
+    if length is None:
+        raise SystemExit(2)
+    return json.loads(sys.stdin.buffer.read(length))
+
+def write_message(message):
+    body = json.dumps(message, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode() + b"\\r\\n\\r\\n" + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message.get("method") == "initialize":
+        write_message({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {}}})
+    elif message.get("method") == "textDocument/waitForDiagnostics":
+        Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+        while True:
+            time.sleep(1)
+""",
+            encoding="utf-8",
+        )
+        command_name = "LEAN_LSP_CMD"
+
+    command = " ".join(
+        shlex.quote(part)
+        for part in (sys.executable, str(child_script), str(child_started))
+    )
+    monkeypatch.setenv(command_name, command)
+    monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
+    monkeypatch.setenv("AUTOFORM_MAX_LEAN_PROJECTS", "1")
+    monkeypatch.setenv("AUTOFORM_REPL_REQUEST_TIMEOUT", "30")
+    monkeypatch.setenv("LEAN_LSP_TIMEOUT", "30")
+    monkeypatch.setenv("AUTOFORM_MAX_LSP_REQUEST_SECONDS", "30")
+    socket_path = runtime_dir / f"orphan-{backend}.sock"
+    client = LeanRuntimeClient(
+        socket_path=socket_path,
+        response_timeout=90,
+        startup_timeout=15,
+    )
+    daemon_pid = client.ensure_running()["pid"]
+    request_errors = []
+
+    def run_request():
+        try:
+            if backend == "repl":
+                client.request(
+                    "repl.run",
+                    {
+                        "project_dir": str(project),
+                        "code": "#check Nat",
+                        "timeout": 30,
+                    },
+                    autostart=False,
+                )
+            else:
+                client.request(
+                    "lsp.diagnostics",
+                    {
+                        "project_dir": str(project),
+                        "file_path": str(source),
+                    },
+                    autostart=False,
+                )
+        except BaseException as error:
+            request_errors.append(error)
+
+    request_thread = threading.Thread(target=run_request)
+    request_thread.start()
+    replacement = LeanRuntimeClient(
+        socket_path=socket_path,
+        response_timeout=90,
+        startup_timeout=15,
+    )
+    replacement_status = []
+    replacement_errors = []
+
+    def start_replacement():
+        try:
+            replacement_status.append(replacement.ensure_running())
+        except BaseException as error:
+            replacement_errors.append(error)
+
+    replacement_thread = threading.Thread(target=start_replacement)
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 10
+        while not child_started.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child_started.exists()
+        child_pid = int(child_started.read_text(encoding="utf-8"))
+
+        os.kill(daemon_pid, signal.SIGKILL)
+        os.waitpid(daemon_pid, 0)
+        replacement_thread.start()
+        replacement_thread.join(timeout=0.2)
+
+        assert replacement_thread.is_alive()
+        assert _process_is_live(child_pid)
+
+        replacement_thread.join(timeout=20)
+        assert not replacement_thread.is_alive()
+        assert replacement_errors == []
+        assert len(replacement_status) == 1
+        assert replacement_status[0]["pid"] != daemon_pid
+        assert not _process_is_live(child_pid)
+    finally:
+        if replacement_thread.ident is not None:
+            replacement_thread.join(timeout=20)
+        request_thread.join(timeout=5)
+        try:
+            replacement.stop()
+        except LeanRuntimeUnavailable:
+            pass
+        if child_pid is not None and _process_is_live(child_pid):
+            try:
+                os.killpg(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    assert not request_thread.is_alive()
+    assert len(request_errors) == 1
+
+
 def test_stop_waits_for_cleanup_after_runtime_socket_disappears(
     runtime_dir, monkeypatch
 ):
@@ -2115,10 +2331,14 @@ def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, m
         assert current_pid != old_pid
         assert not old_socket.exists()
         lifetime_fd = os.open(current.paths.lifetime_lock, os.O_RDWR)
+        child_lifetime_fd = os.open(current.paths.child_lifetime_lock, os.O_RDWR)
         try:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(child_lifetime_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
+            os.close(child_lifetime_fd)
             os.close(lifetime_fd)
     finally:
         current.stop()

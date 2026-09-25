@@ -13,6 +13,7 @@ import random
 import select
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -334,6 +335,7 @@ class LeanReplConfig:
     warmup_imports: frozenset[str] = WARMUP_IMPORTS
 
     repl_command: list[str] = field(default_factory=lambda: ["lake", "exe", "repl"])
+    child_lifetime_lock: str | None = None
 
     # stdout is capped per response. stderr has no protocol framing, so its
     # ceiling applies to the entire process generation and resets on restart.
@@ -590,8 +592,21 @@ class LeanRepl:
         env.update(self.config.env)
 
         try:
+            command = self.config.repl_command
+            if self.config.child_lifetime_lock is not None:
+                command = [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "servers.process_supervisor",
+                    str(os.getpid()),
+                    self.config.child_lifetime_lock,
+                    "-",
+                    "--",
+                    *command,
+                ]
             self.process = subprocess.Popen(
-                self.config.repl_command,
+                command,
                 cwd=self.cwd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

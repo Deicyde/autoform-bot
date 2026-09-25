@@ -96,6 +96,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             "autoform_cli/graph.py",
             "autoform_cli/visualize.py",
             "servers/lean_client.py",
+            "servers/process_supervisor.py",
             "servers/lean_runtime.py",
             "servers/lsp/launcher.py",
             "servers/lsp/server.py",

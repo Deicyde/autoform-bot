@@ -71,6 +71,7 @@ class LspConfig:
     cwd: str = "."
     lake_command: list[str] = field(default_factory=lambda: ["lake", "serve"])
     timeout: float = DEFAULT_LSP_TIMEOUT
+    child_lifetime_lock: str | None = None
 
 
 class LeanLspSession:
@@ -136,9 +137,18 @@ class LeanLspSession:
                     "-m",
                     "servers.lsp.launcher",
                     identity_name,
-                    "--",
-                    *self.config.lake_command,
                 ]
+                if self.config.child_lifetime_lock is not None:
+                    command.extend(
+                        (
+                            str(os.getpid()),
+                            self.config.child_lifetime_lock,
+                            "--",
+                        )
+                    )
+                else:
+                    command.append("--")
+                command.extend(self.config.lake_command)
 
                 async def start_client() -> None:
                     self._remaining(deadline)

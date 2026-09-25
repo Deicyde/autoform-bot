@@ -219,6 +219,7 @@ class RuntimePaths:
     socket: Path
     lock: Path
     lifetime_lock: Path
+    child_lifetime_lock: Path
     log: Path
     compatibility_lifetime_locks: tuple[Path, ...] = ()
 
@@ -277,6 +278,7 @@ def default_runtime_paths() -> RuntimePaths:
         # during migration by LeanRuntimeClient.
         lock=directory / f"lean-{INSTALL_PATH_ID}.lock",
         lifetime_lock=directory / f"lean-{INSTALL_PATH_ID}.lifetime.lock",
+        child_lifetime_lock=directory / f"lean-{INSTALL_PATH_ID}.children.lock",
         log=directory / f"lean-v{PROTOCOL_VERSION}-{INSTALL_ID}.log",
         compatibility_lifetime_locks=tuple(
             directory
@@ -299,6 +301,7 @@ def runtime_paths_for_socket(socket_path: str | os.PathLike[str]) -> RuntimePath
         socket=path,
         lock=path.with_suffix(".lock"),
         lifetime_lock=path.with_suffix(".lifetime.lock"),
+        child_lifetime_lock=path.with_suffix(".children.lock"),
         log=path.with_suffix(".log"),
     )
 
@@ -446,7 +449,7 @@ class LeanRuntimeClient:
             raise
         return lock_fds
 
-    def _lifetime_lock_paths(self) -> tuple[Path, ...]:
+    def _daemon_lifetime_lock_paths(self) -> tuple[Path, ...]:
         return tuple(
             dict.fromkeys(
                 (
@@ -455,6 +458,12 @@ class LeanRuntimeClient:
                 )
             )
         )
+
+    def _lifetime_lock_paths(self) -> tuple[Path, ...]:
+        # Acquire the child fence first. A crashed daemon's watchdog can then
+        # observe that the daemon-lifetime lock is free and retire its process
+        # group without deadlocking against a replacement.
+        return (self.paths.child_lifetime_lock, *self._daemon_lifetime_lock_paths())
 
     def _acquire_lifetime_locks(self, deadline: float) -> list[int]:
         lock_fds: list[int] = []
@@ -696,6 +705,8 @@ class LeanRuntimeClient:
             str(self.paths.log),
             "--lifetime-lock",
             str(self.paths.lifetime_lock),
+            "--child-lifetime-lock",
+            str(self.paths.child_lifetime_lock),
         ]
         for path in self.paths.compatibility_lifetime_locks:
             command.extend(("--compatibility-lifetime-lock", str(path)))

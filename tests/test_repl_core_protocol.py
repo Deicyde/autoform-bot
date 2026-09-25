@@ -30,6 +30,7 @@ def test_start_owns_a_posix_process_group(monkeypatch):
     process = Process()
 
     def popen(*args, **kwargs):
+        captured["args"] = args
         captured.update(kwargs)
         return process
 
@@ -40,11 +41,26 @@ def test_start_owns_a_posix_process_group(monkeypatch):
         repl_core.LeanReplConfig(
             warmup_imports=frozenset(),
             validate_imports=False,
+            child_lifetime_lock="/tmp/autoform-test-children.lock",
         )
     )
 
     repl.start()
 
+    assert captured["args"][0][:4] == [
+        sys.executable,
+        "-I",
+        "-m",
+        "servers.process_supervisor",
+    ]
+    assert captured["args"][0][5:] == [
+        "/tmp/autoform-test-children.lock",
+        "-",
+        "--",
+        "lake",
+        "exe",
+        "repl",
+    ]
     assert captured["start_new_session"] is True
     assert all(
         name not in captured["env"]

@@ -86,7 +86,11 @@ def fake_session(tmp_path: Path, monkeypatch):
     source = project / "Main.lean"
     source.write_text("#check Nat\n", encoding="utf-8")
     session = lsp.LeanLspSession(
-        lsp.LspConfig(cwd=str(project), timeout=1),
+        lsp.LspConfig(
+            cwd=str(project),
+            timeout=1,
+            child_lifetime_lock=str(tmp_path / "children.lock"),
+        ),
         client_factory=_FakeAsyncClient,
     )
     monkeypatch.setattr(session, "_read_process_identity", lambda: 999_999_999)
@@ -129,6 +133,7 @@ def test_start_configures_pinned_client_and_supervised_command(fake_session) -> 
     assert client.kwargs["report_delay_ms"] is None
     command = client.kwargs["server_command"]
     assert command[:4] == [sys.executable, "-I", "-m", "servers.lsp.launcher"]
+    assert command[5:7] == [str(os.getpid()), session.config.child_lifetime_lock]
     assert command[-3:] == ["--", "lake", "serve"]
     assert session.is_alive()
 
