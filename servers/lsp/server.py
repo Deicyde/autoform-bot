@@ -6,16 +6,28 @@ information independently from the REPL pool.
 
 from __future__ import annotations
 
-import json
+import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
+import errno
 import os
-import subprocess
+import signal
+import sys
+import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import psutil
+from leanclient.aio import (
+    AsyncLeanLSPClient,
+    LeanClientError,
+    LeanRequestTimeout,
+    LeanTransportError,
+)
 
 if TYPE_CHECKING:
     from fastmcp.server import FastMCP
@@ -25,17 +37,31 @@ from servers.lean_client import LeanRuntimeClient
 
 logger = getLogger(__name__)
 
-DEFAULT_LSP_TIMEOUT = 60
-MAX_LSP_HEADER_BYTES = 16 * 1024
-MAX_LSP_MESSAGE_BYTES = 16 * 1024 * 1024
+DEFAULT_LSP_TIMEOUT = 180
+LSP_ABORT_TERM_SECONDS = 0.5
+LSP_ABORT_KILL_SECONDS = 1.0
+LSP_CLIENT_CLOSE_SECONDS = 6.0
+LSP_LOOP_CLOSE_SECONDS = 1.0
+LSP_STARTUP_CLEANUP_RETRY_SECONDS = 0.05
+MAX_LSP_STARTUP_CLEANUP_RETRY_SECONDS = 1.0
 
 
 class LspProtocolError(RuntimeError):
     """The Lean language server returned or emitted invalid JSON-RPC state."""
 
+    def __init__(self, message: str, *, stderr_tail: str = "") -> None:
+        self.stderr_tail = stderr_tail
+        if stderr_tail:
+            message = f"{message}\nLean stderr tail:\n{stderr_tail}"
+        super().__init__(message)
+
 
 class LspBusyError(TimeoutError):
     """A queued operation could not enter the shared LSP session in time."""
+
+
+class LspCleanupError(LspProtocolError):
+    """The Lean language-server process group could not be proven dead."""
 
 
 @dataclass
@@ -48,145 +74,136 @@ class LspConfig:
 
 
 class LeanLspSession:
-    """Manages a Lean 4 language server subprocess via JSON-RPC."""
+    """Synchronous Autoform boundary around leanclient's async LSP client.
 
-    def __init__(self, config: LspConfig) -> None:
+    leanclient owns JSON-RPC framing, response routing, server requests, UTF-16
+    conversion, and Lean's diagnostics barrier. Autoform retains project
+    admission, absolute deadlines, environment isolation, and fail-closed
+    process-group cleanup.
+    """
+
+    def __init__(
+        self,
+        config: LspConfig,
+        *,
+        client_factory: Callable[..., AsyncLeanLSPClient] = AsyncLeanLSPClient,
+    ) -> None:
         self.config = config
-        self.process: subprocess.Popen | None = None
-        self._request_id = 0
-        self._lock = threading.Lock()
-        # A session has one stdout stream. Serialize the complete document
-        # lifecycle so concurrent MCP calls cannot race two readers against
-        # that stream or consume one another's diagnostics/responses.
+        self._client_factory = client_factory
+        self._client: AsyncLeanLSPClient | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: threading.Thread | None = None
+        self._loop_ready = threading.Event()
         self._operation_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._poisoned = True
+        self._process_group_id: int | None = None
+        self._identity_path: Path | None = None
 
     def start(self) -> None:
-        """Start the language server process."""
-        env = os.environ.copy()
-        env.pop("PYTHONPATH", None)
-
-        self.process = subprocess.Popen(
-            self.config.lake_command,
-            cwd=self.config.cwd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            env=env,
-        )
-
-        try:
-            # An initialize response must be an InitializeResult object. A
-            # timeout, JSON-RPC error, or malformed result means the backing
-            # Lean server is unusable, so do not expose an apparently healthy
-            # MCP server on top of it.
-            result = self._send_request("initialize", {
-                "processId": os.getpid(),
-                "capabilities": {},
-                "rootUri": Path(self.config.cwd).resolve().as_uri(),
-            })
-            if not isinstance(result, dict):
-                raise LspProtocolError(
-                    "LSP initialize returned a non-object result: "
-                    f"{result!r}"
+        """Start leanclient and verify the supervised Lean process identity."""
+        with self._lifecycle_lock:
+            if self._client is not None or self._loop is not None:
+                raise RuntimeError("Lean LSP session has already been started")
+            try:
+                self._start_loop()
+                descriptor, identity_name = tempfile.mkstemp(
+                    prefix="autoform-lsp-", suffix=".json"
                 )
+                os.close(descriptor)
+                self._identity_path = Path(identity_name)
+                command = [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "servers.lsp.launcher",
+                    identity_name,
+                    "--",
+                    *self.config.lake_command,
+                ]
 
-            self._send_notification("initialized", {})
-        except BaseException:
-            self._abort_process()
-            raise
+                async def start_client() -> None:
+                    client = self._client_factory(
+                        project_path=str(Path(self.config.cwd).resolve()),
+                        max_workers=1,
+                        request_timeout=self.config.timeout,
+                        check_version=True,
+                        server_command=command,
+                        report_delay_ms=None,
+                    )
+                    self._client = client
+                    await client.start()
 
-    def _abort_process(self) -> None:
-        """Force-close the backing process without attempting more JSON-RPC."""
-        process, self.process = self.process, None
-        if process is None or process.poll() is not None:
-            return
-        try:
-            process.kill()
-            process.wait(timeout=5)
-        except Exception:
-            pass
+                self._submit(start_client(), self.config.timeout, "starting Lean LSP")
+                identity = self._read_process_identity()
+                self._process_group_id = identity
+                self._poisoned = False
+            except BaseException:
+                # A failed initialize can still leave lake, the watchdog, or a
+                # worker alive. A factory exception is not inserted into the
+                # project cache, so this stack frame must retain ownership and
+                # retry cleanup until the group is verifiably gone.
+                self._cleanup_failed_start()
+                raise
 
     def close(self) -> None:
-        """Shut down the language server."""
-        if self.process and self.process.poll() is None:
-            try:
-                self._send_request("shutdown", {})
-                self._send_notification("exit", {})
-                self.process.wait(timeout=5)
-            except Exception:
-                self._abort_process()
-        self.process = None
+        """Close the client and return only after its process group is gone."""
+        with self._lifecycle_lock:
+            self._shutdown()
 
     def abort(self) -> None:
-        """Discard a protocol stream that can no longer be shared safely."""
-        self._abort_process()
+        """Discard a failed client and return only after its group is gone."""
+        with self._lifecycle_lock:
+            self._shutdown()
 
     def is_alive(self) -> bool:
-        """Return whether the cached language-server child can accept work."""
-        return self.process is not None and self.process.poll() is None
+        """Return whether the cached client and supervised process are usable."""
+        client = self._client
+        process_group_id = self._process_group_id
+        return (
+            client is not None
+            and not self._poisoned
+            and client.alive
+            and process_group_id is not None
+            and self._process_group_has_live_members(process_group_id)
+        )
 
     def get_diagnostics(self, file_path: str) -> list[dict]:
-        """Open a file and collect diagnostics from the language server."""
-        deadline = time.monotonic() + self.config.timeout
-        if not self._operation_lock.acquire(timeout=self.config.timeout):
-            raise LspBusyError(
-                f"timed out after {self.config.timeout:g}s waiting for the Lean LSP session"
-            )
-        try:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise LspBusyError(
-                    f"timed out after {self.config.timeout:g}s waiting for the Lean LSP session"
-                )
-            return self._get_diagnostics(file_path, timeout=remaining)
-        finally:
-            self._operation_lock.release()
-
-    def _get_diagnostics(self, file_path: str, *, timeout: float | None = None) -> list[dict]:
-        path = Path(file_path).resolve()
-        uri = path.as_uri()
-        operation_timeout = self.config.timeout if timeout is None else timeout
-        deadline = time.monotonic() + operation_timeout
-
-        try:
-            content = path.read_text()
-        except Exception as e:
-            return [{"severity": "error", "message": f"Cannot read file: {e}"}]
-
-        self._send_notification(
-            "textDocument/didOpen",
-            {
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": "lean4",
-                    "version": 1,
-                    "text": content,
-                }
-            },
-            timeout=self._remaining(deadline, operation_timeout),
+        """Return barrier-complete diagnostics for an in-project Lean file."""
+        return self._run_document_operation(
+            file_path,
+            lambda client, path, deadline: self._diagnostics(client, path, deadline),
         )
-
-        try:
-            # An empty published diagnostic list means the file is clean. No
-            # publication at all is a timeout/error and must never be conflated
-            # with that valid empty result.
-            return self._collect_diagnostics(
-                uri,
-                timeout=self._remaining(deadline, operation_timeout),
-            )
-        finally:
-            try:
-                remaining = deadline - time.monotonic()
-                if remaining > 0:
-                    self._send_notification(
-                        "textDocument/didClose",
-                        {"textDocument": {"uri": uri}},
-                        timeout=remaining,
-                    )
-            except Exception:
-                logger.warning("failed to close LSP document %s", uri, exc_info=True)
 
     def hover(self, file_path: str, line: int, character: int) -> str | None:
-        """Get hover information at a position."""
+        """Return hover text at a zero-indexed codepoint position."""
+        try:
+            result = self._run_document_operation(
+                file_path,
+                lambda client, path, deadline: self._hover(
+                    client, path, line, character, deadline
+                ),
+            )
+            if result is None:
+                return None
+            if not isinstance(result, dict) or "contents" not in result:
+                raise LspProtocolError(f"LSP hover returned malformed result: {result!r}")
+            contents = result["contents"]
+            if isinstance(contents, dict):
+                value = contents.get("value")
+                if not isinstance(value, str):
+                    raise LspProtocolError("LSP hover contents.value must be a string")
+                return value
+            return str(contents)
+        except LspProtocolError:
+            self.abort()
+            raise
+
+    def _run_document_operation(
+        self,
+        file_path: str,
+        operation: Callable[[AsyncLeanLSPClient, str, float], Awaitable[Any]],
+    ) -> Any:
         deadline = time.monotonic() + self.config.timeout
         if not self._operation_lock.acquire(timeout=self.config.timeout):
             raise LspBusyError(
@@ -198,299 +215,303 @@ class LeanLspSession:
                 raise LspBusyError(
                     f"timed out after {self.config.timeout:g}s waiting for the Lean LSP session"
                 )
-            return self._hover(file_path, line, character, timeout=remaining)
+            client = self._client
+            if client is None or self._poisoned or not client.alive:
+                raise LspProtocolError("Lean LSP session is no longer usable")
+            relative_path = self._relative_path(file_path)
+            try:
+                return self._submit(
+                    operation(client, relative_path, deadline),
+                    remaining,
+                    "running Lean LSP operation",
+                )
+            except (LspProtocolError, TimeoutError, OSError):
+                self.abort()
+                raise
         finally:
             self._operation_lock.release()
 
-    def _hover(
+    async def _diagnostics(
         self,
-        file_path: str,
+        client: AsyncLeanLSPClient,
+        path: str,
+        deadline: float,
+    ) -> list[dict]:
+        await client.open(path, wait=False)
+        try:
+            report = await client.diagnostics(
+                path,
+                fresh=True,
+                timeout=self._remaining(deadline),
+            )
+            diagnostics = list(report.items)
+            if report.fatal_error:
+                diagnostics.append(
+                    {
+                        "severity": 1,
+                        "message": "Lean reported a fatal file-processing error.",
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 0},
+                        },
+                        "source": "leanclient",
+                    }
+                )
+            return diagnostics
+        finally:
+            await client.close_file(path)
+
+    async def _hover(
+        self,
+        client: AsyncLeanLSPClient,
+        path: str,
         line: int,
         character: int,
-        *,
-        timeout: float = 30,
-    ) -> str | None:
-        path = Path(file_path).resolve()
-        content = path.read_text()
-        uri = path.as_uri()
-        deadline = time.monotonic() + timeout
-        self._send_notification(
-            "textDocument/didOpen",
-            {
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": "lean4",
-                    "version": 1,
-                    "text": content,
-                }
-            },
-            timeout=self._remaining(deadline, timeout),
-        )
+        deadline: float,
+    ) -> dict | None:
+        await client.open(path, wait=False)
         try:
-            result = self._send_request(
-                "textDocument/hover",
-                {
-                    "textDocument": {"uri": uri},
-                    "position": {"line": line, "character": character},
-                },
-                timeout=self._remaining(deadline, timeout),
-            )
+            await client.barrier(path, timeout=self._remaining(deadline))
+            return await client.hover(path, line, character, fresh=False)
         finally:
-            try:
-                remaining = deadline - time.monotonic()
-                if remaining > 0:
-                    self._send_notification(
-                        "textDocument/didClose",
-                        {"textDocument": {"uri": uri}},
-                        timeout=remaining,
-                    )
-            except Exception:
-                logger.warning("failed to close LSP document %s", uri, exc_info=True)
-        if result and "contents" in result:
-            contents = result["contents"]
-            if isinstance(contents, dict):
-                return contents.get("value", "")
-            return str(contents)
-        return None
+            await client.close_file(path)
 
-    def _send_request(self, method: str, params: dict, *, timeout: float = 30) -> Any:
-        """Send a JSON-RPC request and wait for response."""
-        deadline = time.monotonic() + timeout
-        with self._lock:
-            self._request_id += 1
-            msg = {
-                "jsonrpc": "2.0",
-                "id": self._request_id,
-                "method": method,
-                "params": params,
-            }
-            self._write_message(msg, timeout=self._remaining(deadline, timeout))
-            return self._read_response(
-                self._request_id,
-                timeout=self._remaining(deadline, timeout),
-            )
-
-    def _send_notification(
-        self,
-        method: str,
-        params: dict,
-        *,
-        timeout: float = 30,
-    ) -> None:
-        """Send a JSON-RPC notification (no response expected)."""
-        msg = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }
-        self._write_message(msg, timeout=timeout)
-
-    def _write_message(self, msg: dict, *, timeout: float = 30) -> None:
-        """Write a bounded JSON-RPC message without blocking past timeout."""
-        if not self.process or not self.process.stdin:
-            raise RuntimeError("LSP process not running")
-        body = json.dumps(msg).encode("utf-8")
-        if len(body) > MAX_LSP_MESSAGE_BYTES:
-            raise LspProtocolError(
-                f"LSP request exceeds {MAX_LSP_MESSAGE_BYTES} bytes"
-            )
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        data = header + body
-        data_view = memoryview(data)
-        stdin_fd = self.process.stdin.fileno()
-        os.set_blocking(stdin_fd, False)
-        deadline = time.monotonic() + timeout
-        offset = 0
-
-        import select as _select
-
-        while offset < len(data):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"timed out after {timeout:g}s writing an LSP message"
-                )
-            _, writable, _ = _select.select([], [stdin_fd], [], remaining)
-            if not writable:
-                raise TimeoutError(
-                    f"timed out after {timeout:g}s writing an LSP message"
-                )
-            try:
-                written = os.write(stdin_fd, data_view[offset:])
-            except BlockingIOError:
-                continue
-            if written <= 0:
-                raise LspProtocolError("LSP process closed stdin mid-message")
-            offset += written
-
-    def _read_response(self, request_id: int, timeout: float = 30) -> Any:
-        """Read JSON-RPC messages until we get the response for request_id."""
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            msg = self._read_message(timeout=remaining)
-            if msg and msg.get("id") == request_id:
-                if "error" in msg:
-                    error = msg["error"]
-                    if isinstance(error, dict):
-                        code = error.get("code", "unknown")
-                        message = error.get("message", "unspecified protocol error")
-                        data = error.get("data")
-                        detail = f" ({data!r})" if data is not None else ""
-                        raise LspProtocolError(
-                            f"LSP request {request_id} failed [{code}]: "
-                            f"{message}{detail}"
-                        )
-                    raise LspProtocolError(
-                        f"LSP request {request_id} returned malformed error: {error!r}"
-                    )
-                if "result" not in msg:
-                    raise LspProtocolError(
-                        f"LSP response {request_id} has neither result nor error"
-                    )
-                return msg["result"]
-        raise TimeoutError(
-            f"timed out after {timeout:g}s waiting for LSP response {request_id}"
-        )
-
-    def _read_message(self, timeout: float = 5) -> dict | None:
-        """Read one bounded JSON-RPC frame within one absolute deadline."""
-        if not self.process or not self.process.stdout:
-            return None
-
-        import select as _select
-
-        stdout_fd = self.process.stdout.fileno()
-        deadline = time.monotonic() + timeout
-
-        # Read Content-Length header, checking the deadline before every byte.
-        header = bytearray()
-        while b"\r\n\r\n" not in header:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if not header:
-                    return None
-                raise TimeoutError(
-                    f"timed out after {timeout:g}s reading an LSP header"
-                )
-            ready, _, _ = _select.select([stdout_fd], [], [], remaining)
-            if not ready:
-                if not header:
-                    return None
-                raise TimeoutError(
-                    f"timed out after {timeout:g}s reading an LSP header"
-                )
-            chunk = os.read(stdout_fd, 1)
-            if not chunk:
-                raise LspProtocolError("LSP process closed stdout mid-header")
-            header.extend(chunk)
-            if len(header) > MAX_LSP_HEADER_BYTES:
-                raise LspProtocolError(
-                    f"LSP header exceeds {MAX_LSP_HEADER_BYTES} bytes"
-                )
-
+    def _relative_path(self, file_path: str) -> str:
+        root = Path(self.config.cwd).resolve()
+        path = Path(file_path).resolve(strict=True)
         try:
-            header_lines = bytes(header[:-4]).decode("ascii").split("\r\n")
-        except UnicodeDecodeError as error:
-            raise LspProtocolError("LSP emitted a non-ASCII header") from error
-        content_lengths = [
-            value.strip()
-            for line in header_lines
-            if ":" in line
-            for name, value in [line.split(":", 1)]
-            if name.strip().lower() == "content-length"
-        ]
-        if len(content_lengths) != 1:
-            raise LspProtocolError(
-                f"LSP message has {len(content_lengths)} Content-Length headers"
-            )
-        try:
-            length = int(content_lengths[0])
+            relative = path.relative_to(root)
         except ValueError as error:
+            raise ValueError(f"LSP file must stay inside project root: {path}") from error
+        return relative.as_posix()
+
+    def _submit(self, awaitable: Awaitable[Any], timeout: float, operation: str) -> Any:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            if hasattr(awaitable, "close"):
+                awaitable.close()  # type: ignore[attr-defined]
+            raise LspProtocolError("Lean LSP event loop is not running")
+        future = asyncio.run_coroutine_threadsafe(awaitable, loop)
+        try:
+            return future.result(timeout=max(0.0, timeout))
+        except FutureTimeoutError as error:
+            future.cancel()
+            raise TimeoutError(f"timed out after {timeout:g}s {operation}") from error
+        except LeanRequestTimeout as error:
+            raise TimeoutError(str(error)) from error
+        except LeanTransportError as error:
             raise LspProtocolError(
-                f"invalid LSP Content-Length: {content_lengths[0]!r}"
+                f"leanclient failed: {error}",
+                stderr_tail=error.stderr_tail,
             ) from error
-        if length < 0:
-            raise LspProtocolError(f"invalid negative LSP Content-Length: {length}")
-        if length > MAX_LSP_MESSAGE_BYTES:
-            raise LspProtocolError(
-                f"LSP message exceeds {MAX_LSP_MESSAGE_BYTES} bytes"
+        except LeanClientError as error:
+            raise LspProtocolError(f"leanclient failed: {error}") from error
+
+    def _start_loop(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        self._loop_ready.clear()
+
+        def run() -> None:
+            asyncio.set_event_loop(loop)
+            self._loop_ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+
+        thread = threading.Thread(target=run, name="autoform-leanclient", daemon=False)
+        self._loop_thread = thread
+        try:
+            thread.start()
+        except BaseException:
+            self._loop = None
+            self._loop_thread = None
+            loop.close()
+            raise
+        if not self._loop_ready.wait(timeout=LSP_LOOP_CLOSE_SECONDS):
+            raise LspProtocolError("Lean LSP event loop failed to start")
+
+    def _shutdown(self) -> None:
+        self._poisoned = True
+        self._claim_published_process_group()
+        client = self._client
+        loop = self._loop
+        client_close_error: Exception | None = None
+        if client is not None and loop is not None and loop.is_running():
+            try:
+                self._submit(client.close(), LSP_CLIENT_CLOSE_SECONDS, "closing leanclient")
+            except Exception as error:
+                client_close_error = error
+                logger.warning("leanclient close failed; enforcing process cleanup", exc_info=True)
+        elif client is not None and self._process_group_id is None:
+            client_close_error = LspCleanupError(
+                "leanclient cannot be closed and no supervised process identity is available"
             )
 
-        # Read the body in available chunks, never blocking past the deadline.
-        body = bytearray()
-        while len(body) < length:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"timed out after {timeout:g}s reading an LSP body"
-                )
-            ready, _, _ = _select.select([stdout_fd], [], [], remaining)
-            if not ready:
-                raise TimeoutError(
-                    f"timed out after {timeout:g}s reading an LSP body"
-                )
-            chunk = os.read(stdout_fd, length - len(body))
-            if not chunk:
-                raise LspProtocolError("LSP process closed stdout mid-message")
-            body.extend(chunk)
+        # The launcher can publish its identity while leanclient is unwinding
+        # a partial start. Claim it again before deciding whether close alone
+        # established cleanup.
+        self._claim_published_process_group()
+        if self._process_group_id is None and client_close_error is not None:
+            raise LspCleanupError(
+                "could not verify cleanup after leanclient startup failed"
+            ) from client_close_error
 
+        # Do not dismantle the event loop or delete the identity file until the
+        # process boundary has been verified. A failed attempt remains fully
+        # retryable from the next cleanup pass.
+        self._terminate_process_group()
+        self._stop_loop()
+        self._remove_identity_file()
+        self._client = None
+        self._process_group_id = None
+
+    def _cleanup_failed_start(self) -> None:
+        """Keep ownership of a partial start until verified cleanup succeeds."""
+        delay = LSP_STARTUP_CLEANUP_RETRY_SECONDS
+        while True:
+            try:
+                self._shutdown()
+                return
+            except BaseException:
+                logger.exception(
+                    "Lean LSP startup cleanup remains incomplete; retaining ownership"
+                )
+            try:
+                time.sleep(delay)
+            except BaseException:
+                # Cleanup cannot be abandoned while this failed factory result
+                # has no cache entry that could own it.
+                continue
+            delay = min(delay * 2, MAX_LSP_STARTUP_CLEANUP_RETRY_SECONDS)
+
+    def _claim_published_process_group(self) -> None:
+        if self._process_group_id is not None or self._identity_path is None:
+            return
         try:
-            message = json.loads(bytes(body).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise LspProtocolError("LSP emitted an invalid JSON body") from error
-        if not isinstance(message, dict):
-            raise LspProtocolError("LSP JSON-RPC message is not an object")
-        return message
+            self._process_group_id = self._read_process_identity()
+        except LspCleanupError:
+            pass
+
+    def _stop_loop(self) -> None:
+        loop, thread = self._loop, self._loop_thread
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=LSP_LOOP_CLOSE_SECONDS)
+            if thread.is_alive():
+                raise LspCleanupError("timed out stopping leanclient's event-loop thread")
+        self._loop = None
+        self._loop_thread = None
+
+    def _read_process_identity(self) -> int:
+        path = self._identity_path
+        if path is None:
+            raise LspCleanupError("Lean LSP supervisor identity file was not created")
+        try:
+            import json
+
+            identity = json.loads(path.read_text(encoding="utf-8"))
+            pid = identity["pid"]
+            process_group_id = identity["pgid"]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise LspCleanupError("Lean LSP supervisor did not publish a valid identity") from error
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or isinstance(process_group_id, bool)
+            or not isinstance(process_group_id, int)
+            or pid <= 0
+            or process_group_id != pid
+        ):
+            raise LspCleanupError(f"invalid Lean LSP process identity: {identity!r}")
+        return process_group_id
+
+    def _terminate_process_group(self) -> None:
+        process_group_id = self._process_group_id
+        if (
+            process_group_id is None
+            or not self._process_group_has_live_members(process_group_id)
+        ):
+            return
+        self._signal_process_group(process_group_id, signal.SIGTERM)
+        if self._wait_for_group_exit(process_group_id, LSP_ABORT_TERM_SECONDS):
+            return
+        self._signal_process_group(process_group_id, signal.SIGKILL)
+        if not self._wait_for_group_exit(process_group_id, LSP_ABORT_KILL_SECONDS):
+            raise LspCleanupError(
+                f"Lean LSP process group {process_group_id} survived SIGKILL"
+            )
 
     @staticmethod
-    def _remaining(deadline: float, timeout: float) -> float:
+    def _process_group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except OSError as error:
+            if error.errno == errno.ESRCH:
+                return False
+            if error.errno == errno.EPERM:
+                return True
+            raise
+        return True
+
+    def _process_group_has_live_members(self, process_group_id: int) -> bool:
+        """Treat an all-zombie group as dead, including Darwin's EPERM case."""
+        if not self._process_group_exists(process_group_id):
+            return False
+        for candidate in psutil.process_iter(["pid", "status"]):
+            try:
+                if os.getpgid(candidate.info["pid"]) != process_group_id:
+                    continue
+                if candidate.info["status"] != psutil.STATUS_ZOMBIE:
+                    return True
+            except (ProcessLookupError, PermissionError, psutil.Error):
+                continue
+        return False
+
+    @staticmethod
+    def _signal_process_group(process_group_id: int, signal_number: int) -> None:
+        try:
+            os.killpg(process_group_id, signal_number)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            if error.errno != errno.ESRCH:
+                raise LspCleanupError(
+                    f"failed to signal Lean LSP process group {process_group_id}"
+                ) from error
+
+    def _wait_for_group_exit(self, process_group_id: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while self._process_group_has_live_members(process_group_id):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def _remove_identity_file(self) -> None:
+        path, self._identity_path = self._identity_path, None
+        if path is not None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError(f"LSP operation timed out after {timeout:g}s")
+            raise TimeoutError("Lean LSP operation exceeded its deadline")
         return remaining
-
-    def _collect_diagnostics(self, uri: str, timeout: float) -> list[dict]:
-        """Collect diagnostic notifications for a URI."""
-        diagnostics: list[dict] = []
-        deadline = time.monotonic() + timeout
-        received = False
-
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if received:
-                    return diagnostics
-                raise TimeoutError(
-                    f"timed out after {timeout:g}s waiting for diagnostics for {uri}"
-                )
-
-            # Before the first publication, keep waiting all the way to the
-            # configured deadline. After one arrives, a one-second quiet period
-            # is enough to treat the latest publication as final, while still
-            # respecting the same total deadline.
-            read_timeout = min(1 if received else 2, remaining)
-            msg = self._read_message(timeout=read_timeout)
-            if msg is None:
-                if received:
-                    return diagnostics
-                continue
-            if msg.get("method") == "textDocument/publishDiagnostics":
-                params = msg.get("params", {})
-                if not isinstance(params, dict):
-                    raise LspProtocolError(
-                        "publishDiagnostics params must be an object"
-                    )
-                published = params.get("diagnostics")
-                if not isinstance(published, list):
-                    raise LspProtocolError(
-                        "publishDiagnostics diagnostics must be a list"
-                    )
-                if params.get("uri") == uri:
-                    received = True
-                    diagnostics = published
 
 
 class LeanLspProjects:
@@ -581,7 +602,7 @@ def create_lsp_server(runtime: LeanRuntimeClient) -> FastMCP:
             project_dir: Absolute path to the Lake project root.
             file_path: Absolute path, or a path relative to project_dir, to a Lean file.
             line: Zero-indexed line number.
-            character: Zero-indexed character position.
+            character: Zero-indexed Unicode codepoint column.
         """
         return runtime.request(
             "lsp.hover",
