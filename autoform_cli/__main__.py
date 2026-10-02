@@ -23,6 +23,15 @@ from .project import ProjectCatalogError, inspect_project, load_release_catalog
 from .provenance import ProvenanceError, verify_plugin_provenance
 from .render import PublicationError, render_site
 from .scaffold import ScaffoldError, scaffold_project
+from .skeleton import (
+    DEFAULT_PROBE_TIMEOUT,
+    SkeletonError,
+    extract_skeletons,
+    format_report,
+    run_probe,
+    write_packets,
+    write_skeleton_report,
+)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -114,7 +123,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     article_ids.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
-    render = subparsers.add_parser
+    skeleton = subparsers.add_parser(
+        "skeleton",
+        help="extract what a reader must trust for each formalized statement",
+    )
+    skeleton.add_argument("blueprint_dir")
+    skeleton.add_argument(
+        "--lean-root",
+        type=Path,
+        required=True,
+        help="built Lean project whose declarations the blueprint names",
+    )
+    skeleton.add_argument(
+        "--node",
+        action="append",
+        dest="nodes",
+        metavar="ID",
+        help="restrict to one article id (repeatable)",
+    )
+    skeleton.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    skeleton.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="write the JSON report to this file instead of standard output",
+    )
+    skeleton.add_argument(
+        "--packets",
+        type=Path,
+        metavar="DIR",
+        help="also write one comment-stripped packet per skeleton for blind auditors",
+    )
+    skeleton.add_argument(
+        "--passages",
+        type=Path,
+        metavar="DIR",
+        help="with --packets: also write each article's cited source passage, for a faithfulness judge",
+    )
+    skeleton.add_argument(
+        "--timeout",
+        type=_positive_seconds,
+        metavar="SECONDS",
+        help=f"seconds the Lean probe may run (default {DEFAULT_PROBE_TIMEOUT:g}); "
+        "the Lake freshness check before it has its own budget",
+    )
 
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
@@ -144,6 +196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _claim(args)
     if args.command == "migrate":
         return _migrate(args)
+    if args.command == "skeleton":
+        return _skeleton(args)
     if args.command == "render":
         return _render(args)
     return 2
@@ -414,6 +468,90 @@ def _migrate(args: argparse.Namespace) -> int:
             if not entry.assigned:
                 print(f"  {entry.article_path}: {entry.article_id}")
     return 1 if args.check and not plan.complete else 0
+
+
+def _positive_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = 0.0
+    if not 0 < seconds < float("inf"):
+        raise argparse.ArgumentTypeError(f"expected a positive number of seconds, got {value!r}")
+    return seconds
+
+
+def _skeleton(args: argparse.Namespace) -> int:
+    if args.passages is not None and args.packets is None:
+        print("error: --passages requires --packets", file=sys.stderr)
+        return 2
+    if args.output is not None and args.packets is not None:
+        output = Path(os.path.abspath(args.output.expanduser()))
+        packet_outputs = [args.packets.expanduser().resolve()]
+        if args.passages is not None:
+            packet_outputs.append(args.passages.expanduser().resolve())
+        if any(
+            output == directory or output in directory.parents or directory in output.parents
+            for directory in packet_outputs
+        ):
+            print("error: --output must be disjoint from packet and passage directories", file=sys.stderr)
+            return 2
+    try:
+        report = extract_skeletons(
+            args.blueprint_dir,
+            lean_root=args.lean_root,
+            runner=None
+            if args.timeout is None
+            else lambda probe, root: run_probe(probe, root, timeout=args.timeout),
+            node_ids=tuple(args.nodes) if args.nodes else None,
+        )
+    except SkeletonError as exc:
+        for issue in exc.issues:
+            print(f"error: {issue}", file=sys.stderr)
+        return 2
+
+    if args.packets is not None and not report.clean:
+        print(
+            "error: refusing to publish review packets from an incomplete skeleton report",
+            file=sys.stderr,
+        )
+    elif args.packets is not None:
+        try:
+            written = write_packets(
+                report,
+                args.packets,
+                passages=args.passages,
+                report_path=args.output,
+            )
+        except SkeletonError as exc:
+            for issue in exc.issues:
+                print(f"error: {issue}", file=sys.stderr)
+            return 2
+        stream = sys.stderr if args.json else sys.stdout
+        print(f"{args.packets}: {len(written)} blind packet(s) written", file=stream)
+        if args.passages is not None:
+            cited = sum(1 for node in report.nodes if node.passage is not None)
+            print(f"{args.passages}: {cited} source passage(s) written", file=stream)
+    if args.output is not None and (args.packets is None or not report.clean):
+        try:
+            write_skeleton_report(report, args.output)
+        except SkeletonError as exc:
+            for issue in exc.issues:
+                print(f"error: {issue}", file=sys.stderr)
+            return 2
+    if args.output is not None:
+        declarations = sum(len(node.declarations) for node in report.nodes)
+        stream = sys.stderr if args.json else sys.stdout
+        print(
+            f"{args.output}: {declarations} skeleton(s) for {len(report.nodes)} article(s)",
+            file=stream,
+        )
+        for issue in report.unresolved:
+            print(f"error: {issue.message}", file=stream)
+    elif args.json:
+        print(report.to_json())
+    else:
+        print(format_report(report, lean_root=args.lean_root), end="")
+    return 0 if report.clean else 1
 
 
 def _claim_board(args: argparse.Namespace) -> ClaimBoard:

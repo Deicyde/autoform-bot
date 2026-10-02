@@ -34,6 +34,27 @@ def test_root_readme_uses_the_canonical_repository(repo_root: Path) -> None:
     assert "VivienCabannes/autoform-bot" not in readme
 
 
+def test_development_guidance_requires_fail_closed_local_safety(repo_root: Path) -> None:
+    development = (repo_root / "skills" / "develop-plugin" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(development.split())
+
+    assert "private declaration safety as fail-closed evidence" in normalized
+    assert "official user name" in normalized
+    assert "by source coordinates" in normalized
+
+
+def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> None:
+    review = (repo_root / "skills" / "agent-review" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(review.split())
+
+    assert "not reviewer authentication or an approval key" in normalized
+    assert "report as advisory" in normalized
+
+
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     example = repo_root / _EXAMPLE
     blueprint = example / "blueprint"
@@ -374,6 +395,8 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert "autoform init" in setup
     assert "references/thesis-review-case.md" in agent_review
     assert "references/roadmap-quality.md" in agent_review
+    assert "stale-build refusal" in agent_review
+    assert "drift checksum" in agent_review
     assert "autoform-visualize" in human_review
     assert "`approve`, `revise`, or\n`block`" in human_review
     for required in (
