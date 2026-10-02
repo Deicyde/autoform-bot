@@ -1,31 +1,12 @@
 """Extract the trusted surface of each formalized result: its skeleton.
 
-A theorem means what its *statement* means. To agree that a Lean declaration
-says what the blueprint claims, a reader has to read the statement and every
-definition the statement rests on, transitively -- and nothing else. Proofs are
-the kernel's problem. The skeleton is exactly that reading list: a few lines a
-person is expected to check, above a proof that may be orders of magnitude
-longer and is checked by the kernel instead.
-
-The closure is computed from elaborated terms, never from source text. A lexical
-pass cannot see through ``open``, notation, implicit instances, or auto-bound
-variables, and every miss silently shrinks the surface a reader is told to
-trust. So the module writes a small Lean program, runs it with ``lake env
-lean`` against the built project, and reads back one JSON line per declaration.
-Only the *type* of a theorem is entered; the type and the *body* of a
-definition are, because a definition's body is part of its meaning. Constants
-outside the project are the trusted base and are listed by name rather than
-expanded, so a reader sees that a statement uses Mathlib's notion rather than a
-homemade one.
-
-Generated companions -- constructors, projections, recursors, ``noConfusion``
-helpers, matchers -- are folded onto the declaration the reader sees in the
-source, so a structure appears once, as the ``structure`` block, rather than as
-five auto-generated names. Only companions that Lean's environment records as
-generated are folded; name spelling such as ``f.eq_1`` is not evidence.
-
-The output is deterministic and path-free like every other Autoform report: the
-same sources produce the same JSON, and nothing here writes into the vault.
+The skeleton is the reading list a person must check to agree that a Lean
+declaration says what the blueprint claims: its statement and, transitively,
+every project definition that statement rests on. Proofs are the kernel's
+problem. The closure comes from elaborated terms, read back from a small probe
+run with ``lake env lean``, never from source text. The output is deterministic
+and path-free, and nothing here writes into the vault. The rationale is in the
+``autoform skeleton`` section of ``autoform_cli/README.md``.
 """
 
 from __future__ import annotations
@@ -47,9 +28,9 @@ import threading
 import time
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import psutil
 
@@ -162,59 +143,35 @@ class TrustedDeclaration:
         return text.count("\n") + 1 if text else 0
 
     def as_dict(self) -> dict[str, object]:
-        return {
-            "depends": list(self.depends),
-            "end_line": self.end_line,
-            "kind": self.kind,
-            "module": self.module,
-            "name": self.name,
-            "path": self.path,
-            "raw_signature": self.raw_signature,
-            "signature": self.signature,
-            "semantic": self.semantic,
-            "source": self.source,
-            "source_comments": [list(item) for item in self.source_comments],
-            "source_withheld": self.source_withheld,
-            "start_line": self.start_line,
-        }
+        shown = asdict(self)
+        shown["depends"] = list(self.depends)
+        shown["source_comments"] = [list(item) for item in self.source_comments]
+        return shown
 
 
-@dataclass(frozen=True, slots=True)
-class DeclarationSkeleton:
-    """The trusted surface of one root declaration."""
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DeclarationSkeleton(TrustedDeclaration):
+    """The trusted surface of one root declaration.
 
-    name: str
-    kind: str
-    module: str
-    path: str | None
-    start_line: int | None
-    end_line: int | None
-    signature: str
-    #: The raw signature, so project printers cannot make ``HMul.hMul a b``
-    #: read as ``a + b``.
-    raw_signature: str
-    semantic: str
+    ``source`` is the declaration's own source when it is a definition, whose
+    body is its meaning; a theorem's source holds its proof, which is never
+    shown. ``source_withheld`` also covers a written statement that cannot
+    safely be shown.
+    """
+
     lean_version: str
-    depends: tuple[str, ...]
     trusted: tuple[TrustedDeclaration, ...]
     assumed: tuple[str, ...]
     assumed_semantics: tuple[tuple[str, str], ...]
     boundary_modules: tuple[tuple[str, str, str], ...]
     axioms: tuple[str, ...]
     axiom_semantics: tuple[tuple[str, str], ...]
-    #: The declaration's own source when it is a definition, whose body is its
-    #: meaning. A theorem's source holds its proof, which is never shown.
-    source: str | None = None
     #: The statement as written in the source, cut before its value. The
     #: elaborated signature is authoritative; this is what the author typed,
     #: shown beside it so neither form can hide what the other shows.
     statement: str | None = None
-    #: UTF-8 byte ranges of the comments in ``source`` and ``statement``.
-    source_comments: tuple[tuple[int, int], ...] = ()
+    #: UTF-8 byte ranges of the comments in ``statement``.
     statement_comments: tuple[tuple[int, int], ...] = ()
-    #: True when the declaration's source or written statement cannot safely
-    #: be shown, as for ``TrustedDeclaration.source_withheld``.
-    source_withheld: bool = False
 
     @property
     def defines(self) -> bool:
@@ -232,9 +189,7 @@ class DeclarationSkeleton:
     @property
     def skeleton_lines(self) -> int:
         """Lines a reader has to read: the signature plus every trusted span."""
-        own = self.source if self.source is not None else self.signature
-        head = own.count("\n") + 1 if own else 0
-        return head + sum(item.lines for item in self.trusted)
+        return self.lines + sum(item.lines for item in self.trusted)
 
     @property
     def hash(self) -> str:
@@ -313,30 +268,26 @@ class DeclarationSkeleton:
     def as_dict(self) -> dict[str, object]:
         """The report record, naming what the report's shared tables state once."""
 
-        return {
-            "assumed": list(self.assumed),
+        shown = {
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if not item.name.endswith("_semantics")
+        }
+        shown.update(
+            {
+                "assumed": list(self.assumed),
+                "axioms": list(self.axioms),
+                "depends": list(self.depends),
+                "source_comments": [list(item) for item in self.source_comments],
+                "statement_comments": [list(item) for item in self.statement_comments],
+            }
+        )
+        return shown | {
             "boundary_modules": list(dict.fromkeys(module for module, _, _ in self.boundary_modules)),
-            "axioms": list(self.axioms),
             "declaration_lines": self.declaration_lines,
-            "end_line": self.end_line,
             "evidence_hash": self.evidence_hash,
             "hash": self.hash,
-            "kind": self.kind,
-            "lean_version": self.lean_version,
-            "module": self.module,
-            "name": self.name,
-            "raw_signature": self.raw_signature,
-            "path": self.path,
-            "signature": self.signature,
-            "semantic": self.semantic,
-            "depends": list(self.depends),
             "skeleton_lines": self.skeleton_lines,
-            "source": self.source,
-            "source_comments": [list(item) for item in self.source_comments],
-            "source_withheld": self.source_withheld,
-            "start_line": self.start_line,
-            "statement": self.statement,
-            "statement_comments": [list(item) for item in self.statement_comments],
             "trusted": [item.name for item in self.trusted],
         }
 
@@ -432,11 +383,7 @@ class UnresolvedTarget:
         return f"{self.node_id}: {self.declaration}: {self.reason}"
 
     def as_dict(self) -> dict[str, str]:
-        return {
-            "declaration": self.declaration,
-            "node_id": self.node_id,
-            "reason": self.reason,
-        }
+        return asdict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,17 +401,8 @@ class SkeletonReport:
 
     @property
     def clean(self) -> bool:
-        expected = {
-            (node_id, declaration)
-            for node_id, declarations in self.targets
-            if node_id in self.selected_nodes
-            for declaration in declarations
-        }
-        actual = {
-            (node.node_id, declaration.name)
-            for node in self.nodes
-            for declaration in node.declarations
-        }
+        expected = {(target, name) for target, names in self.targets if target in self.selected_nodes for name in names}
+        actual = {(node.node_id, declaration.name) for node in self.nodes for declaration in node.declarations}
         return not self.unresolved and actual == expected
 
     def node(self, node_id: str) -> NodeSkeleton | None:
@@ -536,41 +474,21 @@ def load_skeleton_report(path: str | Path) -> SkeletonReport:
         not isinstance(data, dict)
         or data.get("schema") != SKELETON_SCHEMA
         or data.get("semantic_schema") != SEMANTIC_SCHEMA
-        or data.keys()
-        != {
-            "blueprint_hash",
-            "boundary_modules",
-            "nodes",
-            "schema",
-            "selection",
-            "semantic_schema",
-            "semantics",
-            "target_count",
-            "targets",
-            "trusted",
-            "unresolved",
-        }
     ):
         raise SkeletonError([f"{path} is not an {SKELETON_SCHEMA} report"])
-    blueprint_hash = data["blueprint_hash"]
+    blueprint_hash = data.get("blueprint_hash")
     if not isinstance(blueprint_hash, str) or not re.fullmatch(
         r"sha256:[0-9a-f]{64}", blueprint_hash
     ):
         raise SkeletonError([f"{path} contains an invalid blueprint hash"])
-    targets = _report_targets(data["targets"])
-    if type(data["target_count"]) is not int or data["target_count"] != len(targets):
-        raise SkeletonError([f"{path} contains an invalid target count"])
-    selection = data["selection"]
-    if not isinstance(selection, dict) or selection.keys() != {"mode", "node_count", "nodes"}:
+    targets = _report_targets(data.get("targets"))
+    selection = data.get("selection")
+    if not isinstance(selection, dict):
         raise SkeletonError([f"{path} contains malformed skeleton selection data"])
-    mode = selection["mode"]
-    if mode not in {"all", "filtered"}:
+    mode = selection.get("mode")
+    if mode not in ("all", "filtered"):
         raise SkeletonError([f"{path} contains an invalid skeleton selection mode"])
-    selected_nodes = _report_string_tuple(selection["nodes"], "selected articles")
-    if type(selection["node_count"]) is not int or selection["node_count"] != len(
-        selected_nodes
-    ):
-        raise SkeletonError([f"{path} contains an invalid selected article count"])
+    selected_nodes = _report_string_tuple(selection.get("nodes"), "selected articles")
     target_ids = tuple(node_id for node_id, _ in targets)
     if tuple(sorted(selected_nodes)) != selected_nodes or not set(selected_nodes) <= set(target_ids):
         raise SkeletonError([f"{path} contains an invalid skeleton article selection"])
@@ -578,37 +496,20 @@ def load_skeleton_report(path: str | Path) -> SkeletonReport:
         raise SkeletonError([f"{path} contains an incomplete all-article selection"])
     if mode == "filtered" and not selected_nodes:
         raise SkeletonError([f"{path} contains an empty filtered article selection"])
-    raw_nodes = data["nodes"]
-    unresolved = _report_unresolved(data["unresolved"])
+    raw_nodes = data.get("nodes")
+    unresolved = _report_unresolved(data.get("unresolved"))
     if not isinstance(raw_nodes, list):
         raise SkeletonError([f"{path} contains malformed skeleton report data"])
     declarations_by_node = dict(targets)
     tables = _report_tables(data)
-    used: dict[str, set[str]] = {table: set() for table in tables}
-    nodes = tuple(
-        _node_from_dict(node, targets=declarations_by_node, tables=tables, used=used) for node in raw_nodes
-    )
-    if any(used[table] != tables[table].keys() for table in tables):
-        raise SkeletonError([f"{path} contains unreferenced shared entries"])
-    if len({node.node_id for node in nodes}) != len(nodes):
-        raise SkeletonError([f"{path} contains duplicate skeleton article ids"])
+    nodes = tuple(_node_from_dict(node, targets=declarations_by_node, tables=tables) for node in raw_nodes)
     if tuple(node.node_id for node in nodes) != selected_nodes:
         raise SkeletonError([f"{path} does not contain exactly its selected articles"])
-    actual_targets: set[tuple[str, str]] = set()
-    for node in nodes:
-        expected = declarations_by_node[node.node_id]
-        actual = tuple(declaration.name for declaration in node.declarations)
-        if not set(actual) <= set(expected):
-            raise SkeletonError([f"{path} contains an untargeted declaration for {node.node_id}"])
-        actual_targets.update((node.node_id, declaration) for declaration in actual)
-    expected_targets = {
-        (node_id, declaration)
-        for node_id, declarations in targets
-        if node_id in selected_nodes
-        for declaration in declarations
-    }
-    unresolved_targets = {(issue.node_id, issue.declaration) for issue in unresolved}
-    if unresolved_targets != expected_targets - actual_targets:
+    expected = {(node_id, name) for node_id in selected_nodes for name in declarations_by_node[node_id]}
+    actual = {(node.node_id, declaration.name) for node in nodes for declaration in node.declarations}
+    if not actual <= expected:
+        raise SkeletonError([f"{path} contains an untargeted declaration"])
+    if {(issue.node_id, issue.declaration) for issue in unresolved} != expected - actual:
         raise SkeletonError([f"{path} contains mismatched unresolved declarations"])
     report = SkeletonReport(
         blueprint_hash=blueprint_hash,
@@ -618,6 +519,8 @@ def load_skeleton_report(path: str | Path) -> SkeletonReport:
         nodes=nodes,
         unresolved=unresolved,
     )
+    if report.to_json() != json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False):
+        raise SkeletonError([f"{path} is not a canonical {SKELETON_SCHEMA} report"])
     return report
 
 
@@ -628,7 +531,7 @@ def _report_targets(value: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
     for item in value:
         if not isinstance(item, dict) or item.keys() != {"declarations", "node_id"}:
             raise SkeletonError(["malformed target in skeleton report"])
-        node_id = _report_string(item["node_id"], "target article id")
+        node_id = _report_value(item["node_id"], "target article id")
         declarations = _report_string_tuple(
             item["declarations"], f"target declarations for {node_id}"
         )
@@ -650,9 +553,9 @@ def _report_unresolved(value: object) -> tuple[UnresolvedTarget, ...]:
             raise SkeletonError(["malformed unresolved declaration in skeleton report"])
         unresolved.append(
             UnresolvedTarget(
-                node_id=_report_string(item["node_id"], "unresolved article id"),
-                declaration=_report_string(item["declaration"], "unresolved declaration"),
-                reason=_report_string(item["reason"], "unresolved reason"),
+                node_id=_report_value(item["node_id"], "unresolved article id"),
+                declaration=_report_value(item["declaration"], "unresolved declaration"),
+                reason=_report_value(item["reason"], "unresolved reason"),
             )
         )
     keys = tuple((issue.node_id, issue.declaration) for issue in unresolved)
@@ -661,71 +564,12 @@ def _report_unresolved(value: object) -> tuple[UnresolvedTarget, ...]:
     return tuple(unresolved)
 
 
-_NODE_REPORT_FIELDS = frozenset(
-    {
-        "article_path",
-        "declarations",
-        "evidence_hash",
-        "hash",
-        "node_id",
-        "passage",
-        "passage_locator",
-        "review_hash",
-    }
-)
-_DECLARATION_REPORT_FIELDS = frozenset(
-    {
-        "assumed",
-        "boundary_modules",
-        "axioms",
-        "declaration_lines",
-        "depends",
-        "end_line",
-        "evidence_hash",
-        "hash",
-        "kind",
-        "lean_version",
-        "module",
-        "name",
-        "raw_signature",
-        "path",
-        "semantic",
-        "signature",
-        "skeleton_lines",
-        "source",
-        "source_comments",
-        "source_withheld",
-        "start_line",
-        "statement",
-        "statement_comments",
-        "trusted",
-    }
-)
-_TRUSTED_REPORT_FIELDS = frozenset(
-    {
-        "depends",
-        "end_line",
-        "kind",
-        "module",
-        "name",
-        "path",
-        "raw_signature",
-        "semantic",
-        "signature",
-        "source",
-        "source_comments",
-        "source_withheld",
-        "start_line",
-    }
-)
-
-
 def _report_tables(data: dict[str, object]) -> dict[str, dict[str, object]]:
     """Read the shared tables that report declarations refer to by name."""
 
     tables: dict[str, dict[str, object]] = {}
     for table in ("boundary_modules", "semantics", "trusted"):
-        value = data[table]
+        value = data.get(table)
         if not isinstance(value, dict):
             raise SkeletonError([f"malformed shared {table} table in skeleton report"])
         tables[table] = value
@@ -736,18 +580,16 @@ def _report_tables(data: dict[str, object]) -> dict[str, dict[str, object]]:
         if not isinstance(trusted, TrustedDeclaration) or trusted.name != name:
             raise SkeletonError([f"mismatched shared trusted declaration {name} in skeleton report"])
     for name, semantic in tables["semantics"].items():
-        _validate_semantic_material(_report_string(semantic, f"semantic material for {name}"), context=name)
-    tables["boundary_modules"] = {
-        module: _report_module_identities(
-            [[module, *file] if isinstance(file, list) else file for file in files]
-            if isinstance(files, list)
-            else files,
-            context=module,
-        )
-        for module, files in tables["boundary_modules"].items()
-    }
-    if not all(tables["boundary_modules"].values()):
-        raise SkeletonError(["empty shared module identity in skeleton report"])
+        _validate_semantic_material(_report_value(semantic, f"semantic material for {name}"), context=name)
+    modules: dict[str, object] = {}
+    for module, files in tables["boundary_modules"].items():
+        if not isinstance(files, list) or not files:
+            raise SkeletonError([f"invalid shared module identity for {module} in skeleton report"])
+        entries = _module_file_entries([[module, *f] if isinstance(f, list) else f for f in files], context=module)
+        if not all(re.fullmatch(r"sha256:[0-9a-f]{64}", digest) for _, _, digest in entries):
+            raise SkeletonError([f"invalid module identity for {module} in skeleton report"])
+        modules[module] = entries
+    tables["boundary_modules"] = modules
     return tables
 
 
@@ -756,23 +598,22 @@ def _node_from_dict(
     *,
     targets: dict[str, tuple[str, ...]],
     tables: dict[str, dict[str, object]],
-    used: dict[str, set[str]],
 ) -> NodeSkeleton:
-    if not isinstance(item, dict) or item.keys() != _NODE_REPORT_FIELDS:
+    if not isinstance(item, dict):
         raise SkeletonError(["malformed article in skeleton report"])
-    node_id = _report_string(item.get("node_id"), "article id")
-    article_path = _report_string(item.get("article_path"), f"article path for {node_id}")
+    node_id = _report_value(item.get("node_id"), "article id")
+    article_path = _report_value(item.get("article_path"), f"article path for {node_id}")
     raw_declarations = item.get("declarations")
     if not isinstance(raw_declarations, list):
         raise SkeletonError([f"malformed declarations for {node_id} in skeleton report"])
-    declarations = tuple(_declaration_from_dict(value, tables=tables, used=used) for value in raw_declarations)
+    declarations = tuple(_declaration_from_dict(value, tables=tables) for value in raw_declarations)
     if len({declaration.name for declaration in declarations}) != len(declarations):
         raise SkeletonError([f"duplicate declarations for {node_id} in skeleton report"])
-    passage = _report_optional_string(item.get("passage"), f"passage for {node_id}")
-    locator = _report_optional_string(item.get("passage_locator"), f"passage locator for {node_id}")
+    passage = _report_value(item.get("passage"), f"passage for {node_id}", optional=True)
+    locator = _report_value(item.get("passage_locator"), f"passage locator for {node_id}", optional=True)
     if (passage is None) != (locator is None):
         raise SkeletonError([f"mismatched passage fields for {node_id} in skeleton report"])
-    node = NodeSkeleton(
+    return NodeSkeleton(
         node_id=node_id,
         article_path=article_path,
         declarations=declarations,
@@ -780,30 +621,18 @@ def _node_from_dict(
         passage_locator=locator,
         complete={declaration.name for declaration in declarations} == set(targets.get(node_id, ())),
     )
-    if item.get("hash") != node.hash:
-        raise SkeletonError([f"invalid article hash for {node_id} in skeleton report"])
-    if item.get("evidence_hash") != node.evidence_hash:
-        raise SkeletonError([f"invalid article evidence hash for {node_id} in skeleton report"])
-    if item.get("review_hash") != node.review_hash:
-        raise SkeletonError([f"invalid article review hash for {node_id} in skeleton report"])
-    return node
 
 
-def _declaration_from_dict(
-    item: object, *, tables: dict[str, dict[str, object]], used: dict[str, set[str]]
-) -> DeclarationSkeleton:
-    if not isinstance(item, dict) or item.keys() != _DECLARATION_REPORT_FIELDS:
+def _declaration_from_dict(item: object, *, tables: dict[str, dict[str, object]]) -> DeclarationSkeleton:
+    if not isinstance(item, dict):
         raise SkeletonError(["malformed declaration in skeleton report"])
-    name = _report_string(item.get("name"), "declaration name")
-    kind = _report_kind(item.get("kind"), name)
-    semantic = _report_string(item.get("semantic"), f"semantic material for {name}")
-    _validate_semantic_material(semantic, context=name, kind=kind)
+    name = _report_value(item.get("name"), "declaration name")
+    own = _report_entry(item, name)
 
     def shared(field: str, table: str, what: str) -> list[tuple[str, object]]:
         names = _report_string_tuple(item.get(field), f"{field} for {name}")
         if not set(names) <= tables[table].keys():
             raise SkeletonError([f"mismatched {what} for {name}"])
-        used[table].update(names)
         return [(key, tables[table][key]) for key in names]
 
     assumed_semantics = tuple((key, str(value)) for key, value in shared("assumed", "semantics", "assumption semantics"))
@@ -821,97 +650,66 @@ def _declaration_from_dict(
     trusted = tuple(
         value for _, value in shared("trusted", "trusted", "trusted declarations") if isinstance(value, TrustedDeclaration)
     )
-    source = _report_optional_string(item.get("source"), f"source for {name}")
-    if kind in {"theorem", "axiom"} and source is not None:
-        raise SkeletonError([f"proof-bearing source is forbidden for {kind} {name}"])
-    source_withheld = _report_withheld(item.get("source_withheld"), source, name)
-    start_line = _report_optional_int(item.get("start_line"), f"start line for {name}")
-    entries = [(name, kind, source, start_line, source_withheld)]
-    entries += [(value.name, value.kind, value.source, value.start_line, value.source_withheld) for value in trusted]
-    for entry_name, entry_kind, entry_source, entry_start, withheld in entries:
-        missing_required = _source_required(
-            entry_name, entry_kind, entry_source, entry_start is not None
-        )
-        if missing_required and not (withheld and entry_start is not None):
-            raise SkeletonError([f"required source is missing for {entry_kind} {entry_name}"])
-    statement = _report_optional_string(item.get("statement"), f"statement for {name}")
-    declaration = DeclarationSkeleton(
-        name=name,
-        kind=kind,
-        module=_report_string(item.get("module"), f"module for {name}"),
-        path=_report_optional_string(item.get("path"), f"path for {name}"),
-        start_line=start_line,
-        end_line=_report_optional_int(item.get("end_line"), f"end line for {name}"),
-        signature=_report_string(item.get("signature"), f"signature for {name}"),
-        raw_signature=_report_string(item.get("raw_signature"), f"raw signature for {name}"),
-        semantic=semantic,
-        lean_version=_report_string(item.get("lean_version"), f"Lean version for {name}"),
-        depends=_report_string_tuple(item.get("depends"), f"dependencies for {name}"),
+    statement = _report_value(item.get("statement"), f"statement for {name}", optional=True)
+    return DeclarationSkeleton(
+        **asdict(own),
+        lean_version=_report_value(item.get("lean_version"), f"Lean version for {name}"),
         trusted=trusted,
         assumed=assumed,
         assumed_semantics=assumed_semantics,
         boundary_modules=boundary_modules,
         axioms=axioms,
         axiom_semantics=axiom_semantics,
-        source=source,
         statement=statement,
-        source_comments=_comment_ranges(item.get("source_comments"), source, context=f"the source of {name}"),
         statement_comments=_comment_ranges(
             item.get("statement_comments"), statement, context=f"the statement of {name}"
         ),
-        source_withheld=source_withheld,
     )
-    _validate_report_ranges(declaration.start_line, declaration.end_line, context=name)
-    if item.get("hash") != declaration.hash:
-        raise SkeletonError([f"invalid declaration hash for {name} in skeleton report"])
-    if item.get("evidence_hash") != declaration.evidence_hash:
-        raise SkeletonError([f"invalid declaration evidence hash for {name} in skeleton report"])
-    if item.get("declaration_lines") != declaration.declaration_lines:
-        raise SkeletonError([f"invalid declaration line count for {name} in skeleton report"])
-    if item.get("skeleton_lines") != declaration.skeleton_lines:
-        raise SkeletonError([f"invalid skeleton line count for {name} in skeleton report"])
-    return declaration
 
 
 def _trusted_from_dict(item: object, *, root: str) -> TrustedDeclaration:
-    if not isinstance(item, dict) or item.keys() != _TRUSTED_REPORT_FIELDS:
+    if not isinstance(item, dict):
         raise SkeletonError([f"malformed trusted declaration for {root}"])
-    name = _report_string(item.get("name"), f"trusted declaration name for {root}")
+    return _report_entry(item, _report_value(item.get("name"), f"trusted declaration name for {root}"))
+
+
+def _report_entry(item: dict[str, object], name: str) -> TrustedDeclaration:
+    """Read the fields every reported declaration has, with their source invariants."""
+
     kind = _report_kind(item.get("kind"), name)
-    semantic = _report_string(item.get("semantic"), f"semantic material for {name}")
+    semantic = _report_value(item.get("semantic"), f"semantic material for {name}")
     _validate_semantic_material(semantic, context=name, kind=kind)
-    source = _report_optional_string(item.get("source"), f"source for {name}")
+    source = _report_value(item.get("source"), f"source for {name}", optional=True)
     if kind in {"theorem", "axiom"} and source is not None:
         raise SkeletonError([f"proof-bearing source is forbidden for {kind} {name}"])
-    trusted = TrustedDeclaration(
+    withheld = _report_withheld(item.get("source_withheld"), source, name)
+    start = _report_value(item.get("start_line"), f"start line for {name}", int, optional=True)
+    end = _report_value(item.get("end_line"), f"end line for {name}", int, optional=True)
+    if (start is None) != (end is None) or (start is not None and end is not None and (start < 1 or end < start)):
+        raise SkeletonError([f"invalid source range for {name} in skeleton report"])
+    if _source_required(name, kind, source, start is not None) and not (withheld and start is not None):
+        raise SkeletonError([f"required source is missing for {kind} {name}"])
+    return TrustedDeclaration(
         name=name,
         kind=kind,
-        module=_report_string(item.get("module"), f"module for {name}"),
-        path=_report_optional_string(item.get("path"), f"path for {name}"),
-        start_line=_report_optional_int(item.get("start_line"), f"start line for {name}"),
-        end_line=_report_optional_int(item.get("end_line"), f"end line for {name}"),
-        signature=_report_string(item.get("signature"), f"signature for {name}"),
-        raw_signature=_report_string(item.get("raw_signature"), f"raw signature for {name}"),
+        module=_report_value(item.get("module"), f"module for {name}"),
+        path=_report_value(item.get("path"), f"path for {name}", optional=True),
+        start_line=start,
+        end_line=end,
+        signature=_report_value(item.get("signature"), f"signature for {name}"),
+        raw_signature=_report_value(item.get("raw_signature"), f"raw signature for {name}"),
         semantic=semantic,
         depends=_report_string_tuple(item.get("depends"), f"dependencies for {name}"),
         source=source,
         source_comments=_comment_ranges(item.get("source_comments"), source, context=f"the source of {name}"),
-        source_withheld=_report_withheld(item.get("source_withheld"), source, name),
+        source_withheld=withheld,
     )
-    _validate_report_ranges(trusted.start_line, trusted.end_line, context=name)
-    return trusted
 
 
-def _report_string(value: object, context: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise SkeletonError([f"invalid {context} in skeleton report"])
-    return value
-
-
-def _report_optional_string(value: object, context: str) -> str | None:
-    if value is None:
+def _report_value(value: object, context: str, kind: type = str, *, optional: bool = False):
+    if value is None and optional:
         return None
-    if not isinstance(value, str):
+    if type(value) is not kind or (kind is str and not optional and not value):
         raise SkeletonError([f"invalid {context} in skeleton report"])
     return value
 
@@ -919,14 +717,6 @@ def _report_optional_string(value: object, context: str) -> str | None:
 def _report_withheld(value: object, source: str | None, name: str) -> bool:
     if type(value) is not bool or (value and source is not None):
         raise SkeletonError([f"invalid withheld source flag for {name} in skeleton report"])
-    return value
-
-
-def _report_optional_int(value: object, context: str) -> int | None:
-    if value is None:
-        return None
-    if type(value) is not int:
-        raise SkeletonError([f"invalid {context} in skeleton report"])
     return value
 
 
@@ -942,21 +732,6 @@ def _report_kind(value: object, context: str) -> str:
     if not isinstance(value, str) or value not in _DECLARATION_KINDS:
         raise SkeletonError([f"invalid declaration kind for {context} in skeleton report"])
     return value
-
-
-def _report_module_identities(value: object, *, context: str) -> tuple[tuple[str, str, str], ...]:
-    entries = _module_file_entries(value, context=context)
-    for module, file_kind, digest in entries:
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-            raise SkeletonError([f"invalid {file_kind} identity for module {module} in skeleton report"])
-    return entries
-
-
-def _validate_report_ranges(start: int | None, end: int | None, *, context: str) -> None:
-    if (start is None) != (end is None) or (
-        start is not None and end is not None and (start < 1 or end < start)
-    ):
-        raise SkeletonError([f"invalid source range for {context} in skeleton report"])
 
 
 def _sha256_id(content: bytes) -> str:
@@ -1176,74 +951,22 @@ def _terminate_process_tree(
 ) -> None:
     """Best-effort termination of a command and every descendant observed."""
 
-    _remember_descendants(process, descendants)
-    _remember_tagged_processes(token, descendants, root_pid=process.pid)
-    children = [
-        child
-        for child in descendants.values()
-        if child.pid != process.pid and _process_is_alive(child)
-    ]
-    phase_start = time.perf_counter()
-    available = _remaining(deadline)
-    process_deadline = phase_start + available * 0.8
-    term_deadline = phase_start + available * 0.4
-    if os.name == "posix":
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    else:  # pragma: no cover - Windows-specific best effort
-        if process.poll() is None:
-            try:
-                process.terminate()
-            except OSError:
-                pass
-        for child in reversed(children):
-            try:
-                child.terminate()
-            except psutil.Error:
-                pass
-
-    if process.poll() is None:
-        try:
-            process.wait(timeout=_remaining(term_deadline))
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    if children and _remaining(term_deadline) > 0:
-        try:
-            psutil.wait_procs(children, timeout=_remaining(term_deadline))
-        except (psutil.Error, OSError):
-            pass
-
-    if os.name == "posix" and _process_group_is_alive(process.pid):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    _remember_tagged_processes(token, descendants, root_pid=process.pid)
-    for child in descendants.values():
-        if _process_is_alive(child):
-            try:
-                child.kill()
-            except psutil.Error:
-                pass
-    if process.poll() is None:
-        try:
-            process.kill()
-        except OSError:
-            pass
-    try:
-        process.wait(timeout=_remaining(process_deadline))
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    live_children = [
-        child for child in descendants.values() if _process_is_alive(child)
-    ]
-    if live_children and _remaining(process_deadline) > 0:
-        try:
-            psutil.wait_procs(live_children, timeout=_remaining(process_deadline))
-        except (psutil.Error, OSError):
-            pass
+    started, available = time.perf_counter(), _remaining(deadline)
+    for share, group_signal, method in ((0.4, "SIGTERM", "terminate"), (0.8, "SIGKILL", "kill")):
+        _remember_descendants(process, descendants)
+        _remember_tagged_processes(token, descendants, root_pid=process.pid)
+        live = [child for child in descendants.values() if child.pid != process.pid and _process_is_alive(child)]
+        if os.name == "posix":
+            with contextlib.suppress(OSError):
+                os.killpg(process.pid, getattr(signal, group_signal))
+        for target in ([process] if process.poll() is None else []) + live:
+            with contextlib.suppress(OSError, psutil.Error):
+                getattr(target, method)()
+        phase_deadline = started + available * share
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            process.wait(timeout=_remaining(phase_deadline))
+        with contextlib.suppress(OSError, psutil.Error):
+            psutil.wait_procs(live, timeout=_remaining(phase_deadline))
 
 
 class _CommandSignalled(BaseException):
@@ -1325,28 +1048,12 @@ def _signal_guard() -> contextlib.AbstractContextManager[_SignalGuard]:
     return _SignalGuard()
 
 
-def _run_bounded_command(
-    command: list[str],
-    *,
-    cwd: Path,
-    timeout: float,
-    context: str,
-    env: dict[str, str] | None = None,
-    output_limit: int = DEFAULT_PROBE_OUTPUT_LIMIT,
-) -> subprocess.CompletedProcess[str]:
+def _run_bounded_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
     """Run one command with bounded output, time, and descendant lifetime."""
 
     with _signal_guard() as guard:
         try:
-            return _run_registered_command(
-                command,
-                cwd=cwd,
-                timeout=timeout,
-                context=context,
-                env=env,
-                output_limit=output_limit,
-                guard=guard,
-            )
+            return _run_registered_command(command, guard=guard, **options)  # type: ignore[arg-type]
         finally:
             guard.disarm()
 
@@ -1358,24 +1065,18 @@ def _run_registered_command(
     timeout: float,
     context: str,
     env: dict[str, str] | None = None,
-    output_limit: int,
+    output_limit: int = DEFAULT_PROBE_OUTPUT_LIMIT,
     guard: _SignalGuard,
 ) -> subprocess.CompletedProcess[str]:
     if timeout <= 0:
         raise _CommandTimedOut([f"{context} timed out"])
     if output_limit < 1:
         raise ValueError("output_limit must be positive")
-    popen_options: dict[str, object] = {}
-    if os.name == "posix":
-        popen_options["start_new_session"] = True
-    elif os.name == "nt":  # pragma: no cover - Windows-specific best effort
-        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     process: subprocess.Popen[bytes] | None = None
     readers: list[threading.Thread] = []
     chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
     capture_lock = threading.Lock()
     overflow = threading.Event()
-    reader_failure = threading.Event()
     reader_errors: list[BaseException] = []
     captured = 0
 
@@ -1395,12 +1096,15 @@ def _run_registered_command(
                     captured = min(output_limit + 1, captured + len(block))
         except (OSError, ValueError) as exc:
             reader_errors.append(exc)
-            reader_failure.set()
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 stream.close()  # type: ignore[attr-defined]
-            except OSError:
-                pass
+
+    def check_output() -> None:
+        if reader_errors:
+            raise SkeletonError([f"{context} output could not be read: {reader_errors[0]}"])
+        if overflow.is_set():
+            raise SkeletonError([f"{context} exceeded the {output_limit}-byte output limit"])
 
     descendants: dict[tuple[int, float], psutil.Process] = {}
     token = secrets.token_hex(16)
@@ -1408,8 +1112,6 @@ def _run_registered_command(
     process_env[_PROCESS_TOKEN_ENV] = token
     deadline = time.monotonic() + timeout
     cleanup_deadline: float | None = None
-    failure: SkeletonError | None = None
-    terminated = False
     try:
         try:
             process = subprocess.Popen(
@@ -1420,7 +1122,8 @@ def _run_registered_command(
                 stderr=subprocess.PIPE,
                 env=process_env,
                 close_fds=True,
-                **popen_options,
+                start_new_session=os.name == "posix",
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             )
         except OSError as exc:
             raise SkeletonError([f"{context} failed: {exc}"]) from exc
@@ -1432,62 +1135,19 @@ def _run_registered_command(
             readers.append(reader)
         while process.poll() is None:
             _remember_descendants(process, descendants)
-            if reader_failure.is_set():
-                failure = SkeletonError(
-                    [f"{context} output could not be read: {reader_errors[0]}"]
-                )
-                break
-            if overflow.is_set():
-                failure = SkeletonError(
-                    [f"{context} exceeded the {output_limit}-byte output limit"]
-                )
-                break
+            check_output()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                failure = _CommandTimedOut([f"{context} timed out after {timeout:g} seconds"])
-                break
+                raise _CommandTimedOut([f"{context} timed out after {timeout:g} seconds"])
             overflow.wait(min(0.05, remaining))
         _remember_descendants(process, descendants)
         _remember_tagged_processes(token, descendants, root_pid=process.pid)
-        live_descendants = any(
-            _process_is_alive(descendant) for descendant in descendants.values()
-        )
-        live_group = _process_group_is_alive(process.pid)
-        if failure is None and (live_descendants or live_group):
-            failure = SkeletonError([f"{context} left descendant processes running"])
+        if _process_group_is_alive(process.pid) or any(map(_process_is_alive, descendants.values())):
+            raise SkeletonError([f"{context} left descendant processes running"])
         cleanup_deadline = time.perf_counter() + _PROCESS_TERMINATION_GRACE
-        if failure is not None:
-            _terminate_process_tree(
-                process,
-                descendants,
-                deadline=cleanup_deadline,
-                token=token,
-            )
-            terminated = True
-        reader_deadline = cleanup_deadline
-        if failure is None:
-            reader_start = time.perf_counter()
-            reader_deadline = reader_start + _remaining(cleanup_deadline) * 0.2
-        if not _join_readers(readers, deadline=reader_deadline):
-            if failure is None:
-                failure = SkeletonError(
-                    [f"{context} left descendant processes holding its output pipes open"]
-                )
-            if not terminated:
-                _terminate_process_tree(
-                    process,
-                    descendants,
-                    deadline=cleanup_deadline,
-                    token=token,
-                )
-                terminated = True
-            _join_readers(readers, deadline=cleanup_deadline)
-        if failure is not None:
-            raise failure
-        if overflow.is_set():
-            raise SkeletonError([f"{context} exceeded the {output_limit}-byte output limit"])
-        if reader_errors:
-            raise SkeletonError([f"{context} output could not be read: {reader_errors[0]}"])
+        if not _join_readers(readers, deadline=time.perf_counter() + _PROCESS_TERMINATION_GRACE * 0.2):
+            raise SkeletonError([f"{context} left descendant processes holding its output pipes open"])
+        check_output()
         try:
             stdout = b"".join(chunks["stdout"]).decode("utf-8")
             stderr = b"".join(chunks["stderr"]).decode("utf-8")
@@ -1495,26 +1155,18 @@ def _run_registered_command(
             raise SkeletonError([f"{context} emitted invalid UTF-8 output"]) from exc
         return subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
     except BaseException:
+        guard.disarm()
         if cleanup_deadline is None:
             cleanup_deadline = time.perf_counter() + _PROCESS_TERMINATION_GRACE
-        if process is not None and not terminated:
-            _terminate_process_tree(
-                process,
-                descendants,
-                deadline=cleanup_deadline,
-                token=token,
-            )
+        if process is not None:
+            _terminate_process_tree(process, descendants, deadline=cleanup_deadline, token=token)
         _join_readers(readers, deadline=cleanup_deadline)
         raise
     finally:
         try:
             if process is not None:
-                for index, stream in enumerate((process.stdout, process.stderr)):
-                    if stream is None:
-                        continue
-                    if index < len(readers) and readers[index].is_alive():
-                        continue
-                    else:
+                for reader, stream in zip(readers + [None, None], (process.stdout, process.stderr)):
+                    if stream is not None and not (reader and reader.is_alive()):
                         stream.close()
         finally:
             # A re-raised exception retains this frame.  Drop Popen so its
@@ -1546,10 +1198,8 @@ def lean_libraries(lean_root: str | Path) -> tuple[LeanLibrary, ...]:
     """
 
     root = Path(lean_root).expanduser().resolve()
-    toml = root / "lakefile.toml"
-    toml_snapshot = _read_snapshot_file(toml)
-    lakefile = root / "lakefile.lean"
-    lakefile_snapshot = _read_snapshot_file(lakefile)
+    toml_snapshot = _read_snapshot_file(root / "lakefile.toml")
+    lakefile_snapshot = _read_snapshot_file(root / "lakefile.lean")
     if toml_snapshot is not None:
         text = toml_snapshot[0]
     elif lakefile_snapshot is not None:
@@ -1605,19 +1255,10 @@ def module_of(path: Path, libraries: tuple[LeanLibrary, ...]) -> str | None:
     """Return the Lean module name of a source file, or ``None`` if no library holds it."""
 
     resolved = path.resolve()
-    best: tuple[int, str] | None = None
-    for library in libraries:
-        try:
-            relative = resolved.relative_to(library.src_dir)
-        except ValueError:
-            continue
-        if relative.suffix != ".lean":
-            continue
-        module = ".".join(relative.with_suffix("").parts)
-        depth = len(library.src_dir.parts)
-        if best is None or depth > best[0]:
-            best = (depth, module)
-    return None if best is None else best[1]
+    held = [lib.src_dir for lib in libraries if resolved != lib.src_dir and resolved.is_relative_to(lib.src_dir)]
+    if resolved.suffix != ".lean" or not held:
+        return None
+    return ".".join(resolved.relative_to(max(held, key=lambda src_dir: len(src_dir.parts))).with_suffix("").parts)
 
 
 def path_of(module: str, libraries: tuple[LeanLibrary, ...], lean_root: Path) -> str | None:
@@ -1627,15 +1268,11 @@ def path_of(module: str, libraries: tuple[LeanLibrary, ...], lean_root: Path) ->
     for library in libraries:
         candidate = library.src_dir.joinpath(*parts).with_suffix(".lean")
         if candidate.is_file():
-            return _relative(candidate, lean_root)
+            try:
+                return candidate.resolve().relative_to(lean_root.resolve()).as_posix()
+            except ValueError:
+                return candidate.name
     return None
-
-
-def _relative(path: Path, root: Path) -> str:
-    try:
-        return path.resolve().relative_to(root.resolve()).as_posix()
-    except ValueError:
-        return path.name
 
 
 # --------------------------------------------------------------------------- #
@@ -1643,7 +1280,7 @@ def _relative(path: Path, root: Path) -> str:
 # --------------------------------------------------------------------------- #
 
 def _probe_template() -> str:
-    """The Lean probe, kept beside the other generated-file sources under templates/."""
+    """The Lean probe source, kept under probes/ beside this module."""
 
     return (Path(__file__).parent / "probes" / "skeleton_probe.lean").read_text(encoding="utf-8")
 
@@ -1683,6 +1320,10 @@ def _lean_name(name: str) -> str:
     return result
 
 
+_LEAN_NAME_PART = r"«([^»]+)»|([^.\s«»]+)"
+_LEAN_NAME = re.compile(rf"(?:{_LEAN_NAME_PART})(?:\.(?:{_LEAN_NAME_PART}))*")
+
+
 def _lean_name_parts(name: str) -> tuple[tuple[str, bool], ...]:
     """Parse the dot-separated surface spelling of a Lean ``Name``.
 
@@ -1691,33 +1332,9 @@ def _lean_name_parts(name: str) -> tuple[tuple[str, bool], ...]:
     of generated Lean syntax.
     """
 
-    parts: list[tuple[str, bool]] = []
-    index = 0
-    while index < len(name):
-        if name[index] == "«":
-            close = name.find("»", index + 1)
-            if close < 0 or close == index + 1:
-                raise SkeletonError([f"invalid Lean declaration name: {name!r}"])
-            parts.append((name[index + 1 : close], True))
-            index = close + 1
-        else:
-            end = name.find(".", index)
-            end = len(name) if end < 0 else end
-            part = name[index:end]
-            if not part or any(character.isspace() for character in part) or "«" in part or "»" in part:
-                raise SkeletonError([f"invalid Lean declaration name: {name!r}"])
-            parts.append((part, False))
-            index = end
-        if index == len(name):
-            break
-        if name[index] != ".":
-            raise SkeletonError([f"invalid Lean declaration name: {name!r}"])
-        index += 1
-        if index == len(name):
-            raise SkeletonError([f"invalid Lean declaration name: {name!r}"])
-    if not parts:
-        raise SkeletonError(["invalid empty Lean declaration name"])
-    return tuple(parts)
+    if not _LEAN_NAME.fullmatch(name):
+        raise SkeletonError([f"invalid Lean declaration name: {name!r}"])
+    return tuple((quoted, True) if quoted else (plain, False) for quoted, plain in re.findall(_LEAN_NAME_PART, name))
 
 
 def _probe_modules(probe: str) -> tuple[str, ...]:
@@ -1755,11 +1372,10 @@ def _check_artifacts_fresh(
         timeout=timeout,
         context="cannot verify Lean build freshness",
     )
+    detail = (result.stderr or result.stdout).strip()
     if result.returncode == _LAKE_NO_BUILD_EXIT:
-        detail = (result.stderr or result.stdout).strip()
         raise SkeletonError([f"Lean build artifacts are stale; run `lake build` before extracting skeletons\n{detail}"])
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
         raise SkeletonError(
             [
                 f"cannot verify Lean build freshness: `lake --rehash --no-build build` exited with status "
@@ -1943,18 +1559,14 @@ def _expand_probe_material(tables: dict[str, dict[str, object]]) -> Callable[[ob
     fragments: dict[int, list[object]] = {}
     for name, pieces in tables.pop("fragment").items():
         number = int(name) if name.isdecimal() and name.isascii() else -1
-        if str(number) != name or not isinstance(pieces, list) or not _material_pieces(pieces, below=number):
+        if str(number) != name or not _material_pieces(pieces, below=number):
             raise SkeletonError([f"the skeleton probe emitted a malformed fragment {name}"])
         fragments[number] = pieces
     remaining = _PROBE_MATERIAL_LIMIT
 
     def expand(pieces: object, context: str) -> str:
         nonlocal remaining
-        if (
-            not isinstance(pieces, list)
-            or not _material_pieces(pieces, below=None)
-            or not all(isinstance(piece, str) or piece in fragments for piece in pieces)
-        ):
+        if not _material_pieces(pieces, below=None):
             raise SkeletonError([f"the skeleton probe emitted invalid semantic material for {context}"])
         text: list[str] = []
         stack = [iter(pieces)]
@@ -1969,8 +1581,10 @@ def _expand_probe_material(tables: dict[str, dict[str, object]]) -> Callable[[ob
                         [f"the skeleton probe's semantic material exceeds {_PROBE_MATERIAL_LIMIT} characters"]
                     )
                 text.append(piece)
-            elif isinstance(piece, int):
+            elif piece in fragments:
                 stack.append(iter(fragments[piece]))
+            else:
+                raise SkeletonError([f"the skeleton probe emitted invalid semantic material for {context}"])
         return "".join(text)
 
     semantics = tables["semantic"]
@@ -2040,13 +1654,12 @@ def _resolve_probe_record(
     resolved["boundary_modules"] = [
         [module, *file] if isinstance(file, list) else file
         for module, files in entries("boundary_modules", "module")
-        if isinstance(files, list)
-        for file in files
+        for file in files  # type: ignore[attr-defined]
     ]
     return resolved
 
 
-def _validate_probe_record(record: dict[str, object], *, root: str, checked: set[int] | None = None) -> None:
+def _validate_probe_record(record: dict[str, object], *, root: str, checked: set[int]) -> None:
     found = record.get("found")
     if type(found) is not bool:
         raise SkeletonError([f"the skeleton probe emitted a non-boolean found field for {root}"])
@@ -2058,9 +1671,8 @@ def _validate_probe_record(record: dict[str, object], *, root: str, checked: set
     _require_kind(record.get("kind"), context=root)
     _require_nonempty_string(record.get("lean_version"), field="lean_version", context=root)
     _require_semantic(record, context=root, kind=str(record["kind"]))
-    _require_nonempty_string(record.get("module"), field="module", context=root)
-    _require_nonempty_string(record.get("signature"), field="signature", context=root)
-    _require_nonempty_string(record.get("raw_signature"), field="raw_signature", context=root)
+    for field in ("module", "signature", "raw_signature"):
+        _require_nonempty_string(record.get(field), field=field, context=root)
     _require_range(record.get("range"), context=root)
     _require_probe_source(record.get("source"), kind=str(record["kind"]), context=root)
     _require_probe_comments(record, "source", "source_comments", context=root)
@@ -2070,30 +1682,18 @@ def _validate_probe_record(record: dict[str, object], *, root: str, checked: set
     _require_probe_comments(record, "statement_source", "statement_comments", context=root)
     for field in ("depends", "assumed", "axioms"):
         _require_string_list(record.get(field), field=field, context=root)
-    _require_semantic_pairs(
-        record.get("assumed_semantics"),
-        names=record["assumed"],
-        field="assumed_semantics",
-        context=root,
-    )
-    boundary_modules = _require_module_files(record.get("boundary_modules"), context=root)
+    for name, semantic in record["assumed_semantics"]:  # type: ignore[attr-defined]
+        _validate_semantic_material(semantic, context=name)
+    boundary_modules = _module_file_entries(record.get("boundary_modules"), context=root)
     if record["assumed"] and not boundary_modules:
         raise SkeletonError([f"the skeleton probe omitted boundary module files for {root}"])
-    _require_semantic_pairs(
-        record.get("axiom_semantics"),
-        names=record["axioms"],
-        field="axiom_semantics",
-        context=root,
-    )
-    trusted = record.get("trusted")
-    if not isinstance(trusted, list) or not all(isinstance(item, dict) for item in trusted):
-        raise SkeletonError([f"the skeleton probe emitted an invalid trusted field for {root}"])
+    for name, semantic in record["axiom_semantics"]:  # type: ignore[attr-defined]
+        _validate_semantic_material(semantic, context=name)
     seen: set[str] = set()
-    for item in trusted:
-        if checked is None or id(item) not in checked:
+    for item in record["trusted"]:  # type: ignore[attr-defined]
+        if id(item) not in checked:
             _validate_trusted_record(item, root=root)
-            if checked is not None:
-                checked.add(id(item))
+            checked.add(id(item))
         name = item["name"]
         if name in seen:
             raise SkeletonError([f"the skeleton probe emitted duplicate trusted declaration {name} for {root}"])
@@ -2109,9 +1709,8 @@ def _validate_trusted_record(record: dict[str, object], *, root: str) -> None:
     _require_nonempty_string(record.get("source_name"), field="source_name", context=context)
     _require_kind(record.get("kind"), context=context)
     _require_semantic(record, context=context, kind=str(record["kind"]))
-    _require_nonempty_string(record.get("module"), field="module", context=context)
-    _require_nonempty_string(record.get("signature"), field="signature", context=context)
-    _require_nonempty_string(record.get("raw_signature"), field="raw_signature", context=context)
+    for field in ("module", "signature", "raw_signature"):
+        _require_nonempty_string(record.get(field), field=field, context=context)
     _require_range(record.get("range"), context=context)
     _require_probe_source(record.get("source"), kind=str(record["kind"]), context=context)
     _require_probe_comments(record, "source", "source_comments", context=context)
@@ -2230,12 +1829,9 @@ def _shown_source(
 
 
 def _require_range(value: object, *, context: str) -> None:
-    if value is None:
-        return
-    if not isinstance(value, list) or len(value) != 2:
-        raise SkeletonError([f"the skeleton probe emitted an invalid range for {context}"])
-    start, end = value
-    if type(start) is not int or type(end) is not int or start < 1 or end < start:
+    if value is not None and not (
+        isinstance(value, list) and len(value) == 2 and all(type(line) is int for line in value) and 1 <= value[0] <= value[1]
+    ):
         raise SkeletonError([f"the skeleton probe emitted an invalid range for {context}"])
 
 
@@ -2246,108 +1842,64 @@ def _require_string_list(value: object, *, field: str, context: str) -> None:
         raise SkeletonError([f"the skeleton probe emitted duplicate {field} entries for {context}"])
 
 
-def _validate_semantic_material(
-    semantic: str, *, context: str, kind: str | None = None
-) -> None:
+_SEMANTIC_SHAPES = (
+    frozenset({"safety", "type"}),
+    frozenset({"safety", "type", "value"}),
+    frozenset({"constructors", "safety", "type"}),
+)
+_KIND_SEMANTIC_SHAPE = {
+    **dict.fromkeys(("def", "instance", "opaque"), _SEMANTIC_SHAPES[1]),
+    **dict.fromkeys(("class", "inductive", "structure"), _SEMANTIC_SHAPES[2]),
+}
+
+
+def _validate_semantic_material(semantic: str, *, context: str, kind: str | None = None) -> None:
+    shapes = _SEMANTIC_SHAPES if kind is None else (_KIND_SEMANTIC_SHAPE.get(kind, _SEMANTIC_SHAPES[0]),)
     try:
         payload = json.loads(semantic)
-    except (json.JSONDecodeError, RecursionError) as exc:
-        raise SkeletonError([f"invalid elaborated semantic material for {context}"]) from exc
-    if not isinstance(payload, dict) or payload.keys() != {"generated", "root"}:
+    except (json.JSONDecodeError, RecursionError):
+        payload = None
+    generated = payload.get("generated") if isinstance(payload, dict) else None
+    entries = generated if isinstance(generated, list) else []
+    if not (
+        isinstance(payload, dict)
+        and payload.keys() == {"generated", "root"}
+        and _semantic_payload_ok(payload["root"], shapes)
+        and isinstance(generated, list)
+        and all(
+            isinstance(entry, dict)
+            and entry.keys() == {"material", "name"}
+            and _valid_semantic_name(entry["name"])
+            and _semantic_payload_ok(entry["material"], _SEMANTIC_SHAPES)
+            for entry in entries
+        )
+        and len({json.dumps(entry["name"], sort_keys=True, separators=(",", ":")) for entry in entries})
+        == len(entries)
+    ):
         raise SkeletonError([f"invalid elaborated semantic material for {context}"])
-    expected = _semantic_keys_for_kind(kind) if kind is not None else None
-    _validate_semantic_payload(payload["root"], context=context, expected=expected)
-    generated = payload["generated"]
-    if not isinstance(generated, list):
-        raise SkeletonError([f"invalid elaborated semantic material for {context}"])
-    names: list[str] = []
-    for entry in generated:
-        if (
-            not isinstance(entry, dict)
-            or entry.keys() != {"material", "name"}
-            or not _valid_semantic_name(entry["name"])
-        ):
-            raise SkeletonError([f"invalid elaborated semantic material for {context}"])
-        names.append(json.dumps(entry["name"], sort_keys=True, separators=(",", ":")))
-        _validate_semantic_payload(entry["material"], context=context, expected=None)
-    if len(names) != len(set(names)):
-        raise SkeletonError([f"invalid elaborated semantic material for {context}"])
+
+
+def _semantic_payload_ok(payload: object, shapes: tuple[frozenset[str], ...]) -> bool:
+    return isinstance(payload, dict) and payload.keys() in shapes and payload["safety"] in {"safe", "unsafe", "partial"}
 
 
 def _valid_semantic_name(value: object) -> bool:
-    depth = 0
-    while value is not None:
+    for _ in range(257):
+        if value is None:
+            return True
         if not isinstance(value, dict) or len(value) != 1:
             return False
-        if "str" in value:
-            pair = value["str"]
-            if (
-                not isinstance(pair, list)
-                or len(pair) != 2
-                or not isinstance(pair[1], str)
-            ):
-                return False
-        elif "num" in value:
-            pair = value["num"]
-            if (
-                not isinstance(pair, list)
-                or len(pair) != 2
-                or type(pair[1]) is not int
-                or pair[1] < 0
-            ):
-                return False
-        else:
+        ((tag, pair),) = value.items()
+        if not (isinstance(pair, list) and len(pair) == 2):
+            return False
+        if not (tag == "str" and isinstance(pair[1], str) or tag == "num" and type(pair[1]) is int and pair[1] >= 0):
             return False
         value = pair[0]
-        depth += 1
-        if depth > 256:
-            return False
-    return True
-
-
-def _semantic_keys_for_kind(kind: str) -> set[str]:
-    return {
-        "def": {"safety", "type", "value"},
-        "instance": {"safety", "type", "value"},
-        "opaque": {"safety", "type", "value"},
-        "class": {"constructors", "safety", "type"},
-        "inductive": {"constructors", "safety", "type"},
-        "structure": {"constructors", "safety", "type"},
-    }.get(kind, {"safety", "type"})
-
-
-def _validate_semantic_payload(
-    payload: object, *, context: str, expected: set[str] | None
-) -> None:
-    allowed = (
-        {"safety", "type"},
-        {"safety", "type", "value"},
-        {"constructors", "safety", "type"},
-    )
-    if not isinstance(payload, dict) or (
-        expected is not None and payload.keys() != expected
-    ) or (expected is None and set(payload) not in allowed):
-        raise SkeletonError([f"invalid elaborated semantic material for {context}"])
-    if payload.get("safety") not in {"safe", "unsafe", "partial"}:
-        raise SkeletonError([f"invalid elaborated semantic material for {context}"])
+    return False
 
 
 def _semantic_pairs(value: object) -> tuple[tuple[str, str], ...]:
-    if not isinstance(value, list):
-        raise SkeletonError(["invalid semantic identities in skeleton report"])
-    pairs: list[tuple[str, str]] = []
-    for item in value:
-        if (
-            not isinstance(item, list)
-            or len(item) != 2
-            or not all(isinstance(part, str) and part for part in item)
-        ):
-            raise SkeletonError(["invalid semantic identities in skeleton report"])
-        _validate_semantic_material(item[1], context=item[0])
-        pairs.append((item[0], item[1]))
-    if len({name for name, _ in pairs}) != len(pairs):
-        raise SkeletonError(["duplicate semantic identities in skeleton report"])
-    return tuple(pairs)
+    return tuple(map(tuple, value))  # type: ignore[call-overload]
 
 
 def _local_safety_issue(source_name: str, semantic: str) -> str | None:
@@ -2362,27 +1914,6 @@ def _local_safety_issue(source_name: str, semantic: str) -> str | None:
     if any(isinstance(material, dict) and material.get("safety") == "partial" for material in materials):
         return f"partial declaration {source_name} cannot be included in a trusted skeleton"
     return None
-
-
-def _require_semantic_pairs(
-    value: object,
-    *,
-    names: object,
-    field: str,
-    context: str,
-) -> None:
-    try:
-        pairs = _semantic_pairs(value)
-    except SkeletonError as exc:
-        raise SkeletonError(
-            [f"the skeleton probe emitted an invalid {field} field for {context}"]
-        ) from exc
-    pair_names = [name for name, _ in pairs]
-    matches = isinstance(names, list) and pair_names == names
-    if not matches:
-        raise SkeletonError(
-            [f"the skeleton probe emitted mismatched {field} entries for {context}"]
-        )
 
 
 def _module_file_entries(value: object, *, context: str) -> tuple[tuple[str, str, str], ...]:
@@ -2405,10 +1936,6 @@ def _module_file_entries(value: object, *, context: str) -> tuple[tuple[str, str
     return tuple(entries)
 
 
-def _require_module_files(value: object, *, context: str) -> tuple[tuple[str, str, str], ...]:
-    return _module_file_entries(value, context=context)
-
-
 def _hash_module_files(
     value: object,
     *,
@@ -2420,9 +1947,7 @@ def _hash_module_files(
 
     identities: list[tuple[str, str, str]] = []
     for module, file_kind, raw_path in _module_file_entries(value, context="probe output"):
-        path = Path(raw_path)
-        if not path.is_absolute():
-            path = lean_root / path
+        path = lean_root / raw_path
         try:
             resolved = path.resolve(strict=True)
             key = (file_kind, str(resolved))
@@ -2431,33 +1956,17 @@ def _hash_module_files(
                 before = resolved.stat()
                 content = resolved.read_bytes()
                 after = resolved.stat()
-                identity_before = (
-                    before.st_dev,
-                    before.st_ino,
-                    before.st_size,
-                    before.st_mtime_ns,
-                    before.st_ctime_ns,
-                )
-                identity_after = (
-                    after.st_dev,
-                    after.st_ino,
-                    after.st_size,
-                    after.st_mtime_ns,
-                    after.st_ctime_ns,
-                )
-                if identity_before != identity_after or (
-                    snapshot_started_ns is not None
-                    and max(after.st_mtime_ns, after.st_ctime_ns) > snapshot_started_ns
-                ):
-                    raise SkeletonError(
-                        [f"assumed module {module} changed during skeleton extraction; retry after the build is idle"]
-                    )
-                digest = _sha256_id(file_kind.encode("utf-8") + b"\0" + content)
-                cache[key] = digest
-        except SkeletonError:
-            raise
         except (OSError, RuntimeError) as exc:
             raise SkeletonError([f"cannot bind assumed module {module} to {file_kind} file {path}: {exc}"]) from exc
+        if digest is None:
+            identity = [(m.st_dev, m.st_ino, m.st_size, m.st_mtime_ns, m.st_ctime_ns) for m in (before, after)]
+            if identity[0] != identity[1] or (
+                snapshot_started_ns is not None and max(after.st_mtime_ns, after.st_ctime_ns) > snapshot_started_ns
+            ):
+                raise SkeletonError(
+                    [f"assumed module {module} changed during skeleton extraction; retry after the build is idle"]
+                )
+            digest = cache[key] = _sha256_id(file_kind.encode("utf-8") + b"\0" + content)
         identities.append((module, file_kind, digest))
     return tuple(identities)
 
@@ -2509,12 +2018,10 @@ def extract_skeletons(
             ["Lean project configuration changed while skeletons were being extracted; retry after the project is idle"]
         )
     try:
-        current_graph = load_graph(graph.blueprint_dir)
-    except GraphValidationError as exc:
-        raise SkeletonError(
-            ["the blueprint changed while skeletons were being extracted; retry after the project is idle"]
-        ) from exc
-    if _graph_snapshot(current_graph) != graph_snapshot:
+        current_graph: Graph | None = load_graph(graph.blueprint_dir)
+    except GraphValidationError:
+        current_graph = None
+    if current_graph is None or _graph_snapshot(current_graph) != graph_snapshot:
         raise SkeletonError(
             ["the blueprint changed while skeletons were being extracted; retry after the project is idle"]
         )
@@ -2718,15 +2225,11 @@ def source_passage(node: Node, blueprint: Path, *, issues: list[str] | None = No
         parsed = urlsplit(target)
         if parsed.scheme or parsed.netloc:
             continue
-        path = parsed.path
-        fragment = parsed.fragment
-        match = _LINE_LOCATOR.fullmatch(fragment or "")
-        if match is None or not path or path.endswith(".md"):
+        match = _LINE_LOCATOR.fullmatch(parsed.fragment)
+        if match is None or not parsed.path or parsed.path.endswith(".md"):
             continue
-        candidate = (node.path.parent / path).resolve()
-        try:
-            candidate.relative_to(blueprint.resolve())
-        except ValueError:
+        candidate = (node.path.parent / parsed.path).resolve()
+        if not candidate.is_relative_to(blueprint.resolve()):
             return broken(target, "points outside the blueprint")
         try:
             captured = _read_snapshot_file(candidate)
@@ -2751,10 +2254,8 @@ def source_passage(node: Node, blueprint: Path, *, issues: list[str] | None = No
 
 
 def _article_path(node: Node, graph: Graph) -> str:
-    try:
-        return node.path.relative_to(graph.blueprint_dir).as_posix()
-    except ValueError:
-        return node.path.name
+    path = node.path
+    return path.relative_to(graph.blueprint_dir).as_posix() if path.is_relative_to(graph.blueprint_dir) else path.name
 
 
 def _declaration(
@@ -2766,21 +2267,13 @@ def _declaration(
     module_hashes: dict[tuple[str, str], str],
     snapshot_started_ns: int | None,
 ) -> DeclarationSkeleton:
-    trusted_records = record.get("trusted")
-    trusted = [
-        _trusted(item, libraries=libraries, lean_root=lean_root, index=index)
-        for item in (trusted_records if isinstance(trusted_records, list) else [])
-        if isinstance(item, dict)
-    ]
+    trusted = [_trusted(item, libraries=libraries, lean_root=lean_root, index=index) for item in record["trusted"]]
     name = str(record["root"])
-    semantic = str(record["semantic"])
-    module = str(record.get("module") or "")
-    start, end = _range(record.get("range"))
-    source, source_comments, source_withheld = _shown_source(
-        _optional_probe_string(record.get("source")), record.get("source_comments"), name=name
-    )
+    module = str(record["module"])
+    start, end = record["range"] or (None, None)
+    source, source_comments, source_withheld = _shown_source(record["source"], record["source_comments"], name=name)
     written, written_comments, statement_withheld = _shown_source(
-        _optional_probe_string(record.get("statement_source")), record.get("statement_comments"), name=name
+        record["statement_source"], record["statement_comments"], name=name
     )
     if written is None and source is None and start is not None:
         statement_withheld = True
@@ -2794,20 +2287,20 @@ def _declaration(
         context=f"the statement of {name}",
     )
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
-    declaration = DeclarationSkeleton(
+    return DeclarationSkeleton(
         name=name,
-        kind=str(record.get("kind") or "unknown"),
+        kind=str(record["kind"]),
         module=module,
         path=path,
         start_line=start,
         end_line=end,
-        signature=str(record.get("signature") or ""),
+        signature=str(record["signature"]),
         raw_signature=str(record["raw_signature"]),
-        semantic=semantic,
+        semantic=str(record["semantic"]),
         lean_version=str(record["lean_version"]),
-        depends=tuple(_strings(record.get("depends"))),
+        depends=tuple(record["depends"]),
         trusted=tuple(_dependency_order(trusted)),
-        assumed=tuple(_strings(record.get("assumed"))),
+        assumed=tuple(record["assumed"]),
         assumed_semantics=_semantic_pairs(record.get("assumed_semantics")),
         boundary_modules=_hash_module_files(
             record.get("boundary_modules"),
@@ -2815,7 +2308,7 @@ def _declaration(
             cache=module_hashes,
             snapshot_started_ns=snapshot_started_ns,
         ),
-        axioms=tuple(_strings(record.get("axioms"))),
+        axioms=tuple(record["axioms"]),
         axiom_semantics=_semantic_pairs(record.get("axiom_semantics")),
         source=source,
         statement=statement,
@@ -2823,7 +2316,6 @@ def _declaration(
         statement_comments=statement_comments,
         source_withheld=source_withheld,
     )
-    return declaration
 
 
 def _trusted(
@@ -2833,36 +2325,28 @@ def _trusted(
     lean_root: Path,
     index: SourceIndex,
 ) -> TrustedDeclaration:
-    name = str(item.get("name") or "")
-    semantic = str(item["semantic"])
-    module = str(item.get("module") or "")
-    start, end = _range(item.get("range"))
+    name = str(item["name"])
+    module = str(item["module"])
+    start, end = item["range"] or (None, None)
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
-    source, source_comments, source_withheld = _shown_source(
-        _optional_probe_string(item.get("source")), item.get("source_comments"), name=name
-    )
+    source, source_comments, source_withheld = _shown_source(item["source"], item["source_comments"], name=name)
     if source is None and start is None and _internal_detail(name):
         source_withheld = True
-    trusted = TrustedDeclaration(
+    return TrustedDeclaration(
         name=name,
-        kind=str(item.get("kind") or "unknown"),
+        kind=str(item["kind"]),
         module=module,
         path=path,
         start_line=start,
         end_line=end,
-        signature=str(item.get("signature") or ""),
+        signature=str(item["signature"]),
         raw_signature=str(item["raw_signature"]),
-        semantic=semantic,
-        depends=tuple(_strings(item.get("depends"))),
+        semantic=str(item["semantic"]),
+        depends=tuple(item["depends"]),
         source=source,
         source_comments=source_comments,
         source_withheld=source_withheld,
     )
-    return trusted
-
-
-def _optional_probe_string(value: object) -> str | None:
-    return value if isinstance(value, str) else None
 
 
 def _source_path(
@@ -2883,18 +2367,6 @@ def _source_path(
     return None if location is None else location.path.as_posix()
 
 
-def _range(value: object) -> tuple[int | None, int | None]:
-    if isinstance(value, list) and len(value) == 2 and all(isinstance(item, int) for item in value):
-        return value[0], value[1]
-    return None, None
-
-
-def _strings(value: object) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item) for item in value]
-
-
 def _dependency_order(items: list[TrustedDeclaration]) -> list[TrustedDeclaration]:
     """Order trusted declarations so each is read after what it rests on.
 
@@ -2903,17 +2375,14 @@ def _dependency_order(items: list[TrustedDeclaration]) -> list[TrustedDeclaratio
 
     by_name = {item.name: item for item in items}
     order: list[TrustedDeclaration] = []
-    done: set[str] = set()
-    visiting: set[str] = set()
+    seen: set[str] = set()
 
     def visit(name: str) -> None:
-        if name in done or name in visiting or name not in by_name:
+        if name in seen or name not in by_name:
             return
-        visiting.add(name)
+        seen.add(name)
         for dependency in sorted(by_name[name].depends):
             visit(dependency)
-        visiting.discard(name)
-        done.add(name)
         order.append(by_name[name])
 
     for name in sorted(by_name):
@@ -2926,7 +2395,9 @@ def _dependency_order(items: list[TrustedDeclaration]) -> list[TrustedDeclaratio
 # --------------------------------------------------------------------------- #
 
 
-def source_excerpt(item: TrustedDeclaration | DeclarationSkeleton, lean_root: Path) -> str | None:
+def source_excerpt(
+    item: TrustedDeclaration | DeclarationSkeleton, lean_root: Path
+) -> str | None:
     """Return the source lines of ``item``, or ``None`` when they cannot be read."""
 
     if item.path is None or item.start_line is None or item.end_line is None:
@@ -2954,8 +2425,7 @@ def format_report(report: SkeletonReport, *, lean_root: Path | None = None) -> s
     for node in report.nodes:
         if len(node.declarations) > 1:
             article = node.hash or "none: a declaration is unresolved"
-            out.append(f"## {node.node_id} · article skeleton {article}")
-            out.append("")
+            out += [f"## {node.node_id} · article skeleton {article}", ""]
         for declaration in node.declarations:
             out.append(f"== {node.node_id} · {declaration.kind} {declaration.name}")
             out.extend(f"   {line}" for line in declaration.signature.splitlines())
@@ -2966,26 +2436,22 @@ def format_report(report: SkeletonReport, *, lean_root: Path | None = None) -> s
                 out.extend(f"   {line}" for line in declaration.statement.splitlines())
             if declaration.source_withheld or (declaration.source is None and declaration.statement is None):
                 out.append(f"   {_NOT_SHOWN}")
-            out.append("")
-            out.append(f"   {_trust_summary(declaration)} · skeleton {declaration.hash}")
+            out += ["", f"   {_trust_summary(declaration)} · skeleton {declaration.hash}"]
             if declaration.assumed:
                 out.append(f"   assumes: {', '.join(declaration.assumed)}")
             out.append(f"   axioms: {', '.join(declaration.axioms) if declaration.axioms else 'none'}")
             for item in declaration.trusted:
-                out.append("")
-                out.append(f"   -- {item.kind} {item.name}  ({_where(item)})")
+                out += ["", f"   -- {item.kind} {item.name}  ({_where(item)})"]
                 out.extend(f"   -- {line}" for line in item.signature.splitlines())
-                excerpt = item.source
-                if excerpt is None:
+                if item.source is None:
                     out.extend(f"   {line}" for line in item.signature.splitlines())
                     if item.source_withheld:
                         out.append(f"   {_NOT_SHOWN}")
                 else:
-                    out.extend(f"   {line}" for line in excerpt.splitlines())
+                    out.extend(f"   {line}" for line in item.source.splitlines())
             out.append("")
         if not node.declarations:
-            out.append(f"== {node.node_id} · no skeleton")
-            out.append("")
+            out += [f"== {node.node_id} · no skeleton", ""]
     for issue in report.unresolved:
         out.append(f"error: {issue.message}")
     return "\n".join(out).rstrip("\n") + "\n"
@@ -3005,32 +2471,16 @@ def _output_identity(path: Path) -> tuple[int, int, str] | None:
         return None
     except OSError as exc:
         raise SkeletonError([f"cannot inspect skeleton output {path}: {exc}"]) from exc
-    if path.is_symlink():
-        raise SkeletonError([f"refusing symlink packet output: {path}"])
     digest = hashlib.sha256()
-    if path.is_file():
-        try:
-            digest.update(b"file\0")
-            digest.update(path.read_bytes())
-        except OSError as exc:
-            raise SkeletonError([f"cannot inspect skeleton output {path}: {exc}"]) from exc
-        return metadata.st_dev, metadata.st_ino, digest.hexdigest()
-    if not path.is_dir():
-        raise SkeletonError([f"skeleton output is not a regular file or directory: {path}"])
-    digest.update(b"directory\0")
     try:
-        for child in sorted(path.rglob("*"), key=lambda candidate: candidate.relative_to(path).as_posix()):
-            relative = child.relative_to(path).as_posix()
+        for child in [path, *sorted(path.rglob("*"))] if stat.S_ISDIR(metadata.st_mode) else [path]:
             if child.is_symlink():
                 raise SkeletonError([f"refusing symlink packet output: {child}"])
-            digest.update(relative.encode("utf-8"))
-            digest.update(b"\0")
+            digest.update(child.relative_to(path).as_posix().encode("utf-8") + b"\0")
             if child.is_dir():
                 digest.update(b"directory\0")
             elif child.is_file():
-                digest.update(b"file\0")
-                digest.update(child.read_bytes())
-                digest.update(b"\0")
+                digest.update(b"file\0" + child.read_bytes() + b"\0")
             else:
                 raise SkeletonError([f"refusing special file in packet output: {child}"])
     except OSError as exc:
@@ -3050,19 +2500,15 @@ def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] |
     except OSError as exc:
         raise SkeletonError([f"cannot inspect skeleton output {path}: {exc}"]) from exc
     manifest = path / PACKET_MANIFEST
-    if manifest.is_symlink() or not manifest.is_file():
-        raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"])
     try:
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"]) from exc
-    if not isinstance(payload, dict):
-        raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"])
-    entries = payload.get(kind)
-    if (
-        payload.get("kind") != kind
-        or (kind, payload.get("schema")) not in MANAGED_OUTPUT_SCHEMAS
-        or not isinstance(entries, list)
+        payload = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = None
+    if not (
+        isinstance(payload, dict)
+        and payload.get("kind") == kind
+        and (kind, payload.get("schema")) in MANAGED_OUTPUT_SCHEMAS
+        and isinstance(payload.get(kind), list)
     ):
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"])
     return identity
@@ -3081,89 +2527,51 @@ def _safe_node_path(node_id: str) -> Path:
 
 
 def _packet_filename(name: str) -> str:
-    pieces: list[str] = []
-    for character in name:
-        if character.isascii() and (character.isalnum() or character in {".", "_", "-"}):
-            pieces.append(character)
-        else:
-            pieces.extend(f"%{byte:02X}" for byte in character.encode("utf-8"))
-    encoded = "".join(pieces)
+    encoded = quote(name, safe="").replace("~", "%7E")
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
     if not encoded or len(os.fsencode(encoded)) > 180:
         encoded = "declaration"
     return f"{encoded}--{digest}.lean"
 
 
-def _stage_output(destination: Path) -> Path:
+def _stage_output(destination: Path, content: str | None = None) -> Path:
+    """Create a same-directory stage, a directory or a file of ``content``, with the old mode."""
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    existing_mode: int | None = None
+    stage = destination.with_name(f".{destination.name}.autoform-stage-{secrets.token_hex(8)}")
+    # Created exclusively before the cleanup below owns it, so a name collision never removes a foreign path.
+    stream = stage.mkdir() if content is None else stage.open("x", encoding="utf-8")
     try:
-        if not destination.is_symlink() and destination.is_dir():
-            existing_mode = destination.stat().st_mode & 0o7777
-    except OSError as exc:
-        raise SkeletonError([f"cannot inspect skeleton output {destination}: {exc}"]) from exc
-    for _ in range(100):
-        stage = destination.with_name(
-            f".{destination.name}.autoform-stage-{secrets.token_hex(8)}"
-        )
-        try:
-            stage.mkdir()
-        except FileExistsError:
-            continue
-        try:
-            if existing_mode is not None:
-                stage.chmod(existing_mode)
-        except OSError:
-            shutil.rmtree(stage, ignore_errors=True)
-            raise
-        return stage
-    raise SkeletonError([f"cannot allocate staging directory beside {destination}"])
+        if stream is not None:
+            with stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        if not destination.is_symlink() and (destination.is_dir() if content is None else destination.is_file()):
+            stage.chmod(stat.S_IMODE(destination.stat().st_mode))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            _remove_output(stage)
+        raise
+    return stage
 
 
-def _stage_report_output(
-    report: SkeletonReport,
-    destination: Path,
-) -> tuple[Path, tuple[int, int, str] | None]:
+def _stage_report_output(report: SkeletonReport, destination: Path) -> tuple[Path, tuple[int, int, str] | None]:
     """Write a report to a same-directory stage and capture the old identity."""
 
     identity = _output_identity(destination)
-    existing_mode: int | None = None
-    if identity is not None:
-        if not destination.is_file():
-            raise SkeletonError([f"report output exists and is not a regular file: {destination}"])
-        existing_mode = destination.stat().st_mode & 0o7777
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    for _ in range(100):
-        stage = destination.with_name(
-            f".{destination.name}.autoform-stage-{secrets.token_hex(8)}"
-        )
-        try:
-            with stage.open("x", encoding="utf-8") as stream:
-                stream.write(report.to_json() + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            if existing_mode is not None:
-                stage.chmod(existing_mode)
-        except FileExistsError:
-            continue
-        except BaseException:
-            stage.unlink(missing_ok=True)
-            raise
-        return stage, identity
-    raise SkeletonError([f"cannot allocate staging file beside {destination}"])
+    if identity is not None and not destination.is_file():
+        raise SkeletonError([f"report output exists and is not a regular file: {destination}"])
+    return _stage_output(destination, report.to_json() + "\n"), identity
 
 
 def _remove_output(path: Path) -> None:
     """Remove one transaction-owned file or directory without following links."""
 
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return
-    if stat.S_ISDIR(metadata.st_mode):
+    if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)
     else:
-        path.unlink()
+        path.unlink(missing_ok=True)
 
 
 def _rename_no_replace(source: Path, destination: Path) -> None:
@@ -3174,38 +2582,16 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
         return
 
     library = ctypes.CDLL(None, use_errno=True)
-    source_bytes = os.fsencode(source)
-    destination_bytes = os.fsencode(destination)
-    if sys.platform.startswith("linux"):
-        try:
-            rename = library.renameat2
-        except AttributeError as exc:
-            raise SkeletonError(
-                ["atomic no-replace rename is unavailable on this Linux system"]
-            ) from exc
-        rename.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        rename.restype = ctypes.c_int
-        result = rename(-100, source_bytes, -100, destination_bytes, 1)
-    elif sys.platform == "darwin":
-        try:
-            rename = library.renamex_np
-        except AttributeError as exc:
-            raise SkeletonError(
-                ["atomic no-replace rename is unavailable on this macOS system"]
-            ) from exc
-        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
-        rename.restype = ctypes.c_int
-        result = rename(source_bytes, destination_bytes, 0x00000004)
-    else:
-        raise SkeletonError(
-            [f"atomic no-replace rename is unsupported on {sys.platform}"]
-        )
+    source_bytes, destination_bytes = os.fsencode(source), os.fsencode(destination)
+    try:
+        if sys.platform.startswith("linux"):
+            result = library.renameat2(-100, source_bytes, -100, destination_bytes, 1)
+        elif sys.platform == "darwin":
+            result = library.renamex_np(source_bytes, destination_bytes, 0x00000004)
+        else:
+            raise AttributeError(sys.platform)
+    except AttributeError as exc:
+        raise SkeletonError([f"atomic no-replace rename is unavailable on {sys.platform}"]) from exc
     if result != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), destination)
@@ -3230,31 +2616,19 @@ def _preflight_output_installs(
     checked: set[tuple[int, int]] = set()
     for destination, stage, _ in outputs:
         try:
-            stage_metadata = stage.lstat()
-            device = destination.parent.stat().st_dev
+            key = (stat.S_IFMT(stage.lstat().st_mode), destination.parent.stat().st_dev)
         except OSError as exc:
             raise SkeletonError([f"cannot inspect skeleton output stage {stage}: {exc}"]) from exc
-        artifact_kind = stat.S_IFMT(stage_metadata.st_mode)
-        if artifact_kind not in {stat.S_IFREG, stat.S_IFDIR}:
+        if key[0] not in {stat.S_IFREG, stat.S_IFDIR}:
             raise SkeletonError([f"skeleton output stage is not a file or directory: {stage}"])
-        key = (device, artifact_kind)
         if key in checked:
             continue
         checked.add(key)
-        probe_root = Path(
-            tempfile.mkdtemp(
-                prefix=f".{destination.name}.autoform-preflight-",
-                dir=destination.parent,
-            )
-        )
+        probe_root = Path(tempfile.mkdtemp(prefix=f".{destination.name}.autoform-preflight-", dir=destination.parent))
         source = probe_root / "source"
-        target = probe_root / "target"
         try:
-            if artifact_kind == stat.S_IFREG:
-                source.touch(exist_ok=False)
-            else:
-                source.mkdir()
-            _install_output(source, target)
+            source.touch(exist_ok=False) if key[0] == stat.S_IFREG else source.mkdir()
+            _install_output(source, probe_root / "target")
         except BaseException:
             try:
                 _remove_output(probe_root)
@@ -3307,18 +2681,13 @@ def _replace_outputs(
             installs[destination] = (stage, stage_identity)
             _install_output(stage, destination)
     except BaseException as exc:
-        conflicts: set[Path] = set()
         rollback_issues: list[str] = []
-        for destination, (stage, expected) in reversed(installs.items()):
+        for destination, (_, expected) in reversed(installs.items()):
             try:
-                stage_identity = _output_identity(stage)
                 destination_identity = _output_identity(destination)
-                if stage_identity == expected and destination_identity is None:
+                if destination_identity is None:
                     continue
                 if destination_identity != expected:
-                    if destination_identity is None:
-                        continue
-                    conflicts.add(destination)
                     rollback_issues.append(
                         f"published output changed during rollback and was preserved at {destination}"
                     )
@@ -3340,27 +2709,19 @@ def _replace_outputs(
                         f"could not remove rolled-back output preserved for recovery at {quarantine}: {cleanup_exc}"
                     )
             except (OSError, SkeletonError) as rollback_exc:
-                if _output_identity(destination) is not None:
-                    conflicts.add(destination)
                 rollback_issues.append(
                     f"could not roll back skeleton output {destination}: {rollback_exc}"
                 )
         for destination, (backup, expected) in backups.items():
-            if destination in conflicts:
-                rollback_issues.append(f"previous output was preserved for recovery at {backup}")
-                continue
             try:
                 backup_identity = _output_identity(backup)
                 destination_identity = _output_identity(destination)
                 if backup_identity is not None and destination_identity is None:
                     _install_output(backup, destination)
-                elif backup_identity == expected:
-                    rollback_issues.append(f"previous output was preserved for recovery at {backup}")
-                elif backup_identity is None and destination_identity == expected:
-                    continue
                 elif backup_identity is not None:
-                    rollback_issues.append(f"changed backup was preserved for recovery at {backup}")
-                else:
+                    state = "previous output" if backup_identity == expected else "changed backup"
+                    rollback_issues.append(f"{state} was preserved for recovery at {backup}")
+                elif destination_identity != expected:
                     rollback_issues.append(
                         f"could not find previous skeleton output for {destination} during rollback"
                     )
@@ -3375,59 +2736,45 @@ def _replace_outputs(
     for backup, expected in backups.values():
         try:
             backup_identity = _output_identity(backup)
-            if backup_identity is None:
-                warnings.warn(
-                    f"skeleton output backup disappeared before cleanup: {backup}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            if backup_identity == expected:
+                _remove_output(backup)
                 continue
-            if backup_identity != expected:
-                warnings.warn(
-                    f"skeleton output backup changed before cleanup and was preserved at {backup}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                continue
-            _remove_output(backup)
-        except (OSError, SkeletonError) as cleanup_exc:
-            warnings.warn(
-                f"could not remove previous skeleton output preserved at {backup}: {cleanup_exc}",
-                RuntimeWarning,
-                stacklevel=2,
+            message = (
+                f"skeleton output backup disappeared before cleanup: {backup}"
+                if backup_identity is None
+                else f"skeleton output backup changed before cleanup and was preserved at {backup}"
             )
+        except (OSError, SkeletonError) as cleanup_exc:
+            message = f"could not remove previous skeleton output preserved at {backup}: {cleanup_exc}"
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
-    first_resolved = first.resolve()
-    second_resolved = second.resolve()
-    return (
-        first_resolved == second_resolved
-        or first_resolved in second_resolved.parents
-        or second_resolved in first_resolved.parents
-    )
+    first, second = first.resolve(), second.resolve()
+    return first.is_relative_to(second) or second.is_relative_to(first)
+
+
+def _output_path(value: str | Path, kind: str) -> Path:
+    requested = Path(value).expanduser()
+    if requested.is_symlink():
+        raise SkeletonError([f"refusing symlink {kind} output: {requested}"])
+    return Path(os.path.abspath(requested))
 
 
 def write_skeleton_report(report: SkeletonReport, destination: str | Path) -> Path:
     """Failure-atomically replace one JSON skeleton report."""
 
-    requested = Path(destination).expanduser()
-    if requested.is_symlink():
-        raise SkeletonError([f"refusing symlink report output: {requested}"])
-    output = Path(os.path.abspath(requested))
+    output = _output_path(destination, "report")
     stage: Path | None = None
     try:
         stage, identity = _stage_report_output(report, output)
         _replace_outputs([(output, stage, identity)])
-        stage = None
     except OSError as exc:
         raise SkeletonError([f"could not prepare skeleton report output: {exc}"]) from exc
     finally:
         if stage is not None:
-            try:
+            with contextlib.suppress(OSError):
                 _remove_output(stage)
-            except OSError:
-                pass
     return output
 
 
@@ -3460,24 +2807,11 @@ def write_packets(
             ["refusing to publish review packets from an incomplete skeleton report"]
         )
 
-    requested_root = Path(directory).expanduser()
-    if requested_root.is_symlink():
-        raise SkeletonError([f"refusing symlink packet output: {requested_root}"])
-    root = Path(os.path.abspath(requested_root))
-    requested_passages = Path(passages).expanduser() if passages is not None else None
-    if requested_passages is not None and requested_passages.is_symlink():
-        raise SkeletonError([f"refusing symlink packet output: {requested_passages}"])
-    passages_root = (
-        Path(os.path.abspath(requested_passages)) if requested_passages is not None else None
-    )
+    root = _output_path(directory, "packet")
+    passages_root = None if passages is None else _output_path(passages, "packet")
     if passages_root is not None and _paths_overlap(root, passages_root):
         raise SkeletonError(["packet and passage output directories must be disjoint"])
-    requested_report = Path(report_path).expanduser() if report_path is not None else None
-    if requested_report is not None and requested_report.is_symlink():
-        raise SkeletonError([f"refusing symlink report output: {requested_report}"])
-    report_destination = (
-        Path(os.path.abspath(requested_report)) if requested_report is not None else None
-    )
+    report_destination = None if report_path is None else _output_path(report_path, "report")
     if report_destination is not None and (
         _paths_overlap(root, report_destination)
         or (passages_root is not None and _paths_overlap(passages_root, report_destination))
@@ -3505,12 +2839,10 @@ def write_packets(
             node_path = _safe_node_path(node.node_id)
             passage_path: str | None = None
             if passages_stage is not None and node.passage is not None:
-                passage_relative = node_path / "passage.txt"
-                target = passages_stage / passage_relative
-                target.parent.mkdir(parents=True, exist_ok=True)
+                passage_path = (node_path / "passage.txt").as_posix()
+                (passages_stage / node_path).mkdir(parents=True, exist_ok=True)
                 passage_bytes = (node.passage + "\n").encode("utf-8")
-                target.write_bytes(passage_bytes)
-                passage_path = passage_relative.as_posix()
+                (passages_stage / passage_path).write_bytes(passage_bytes)
                 passage_manifest.append(
                     {
                         "hash": _sha256_id(passage_bytes),
@@ -3519,20 +2851,17 @@ def write_packets(
                         "review_hash": node.review_hash,
                     }
                 )
+            article_relative = node_path / ARTICLE_PACKET
             if node.declarations:
-                article_relative = node_path / ARTICLE_PACKET
-                article = packet_stage / article_relative
-                article.parent.mkdir(parents=True, exist_ok=True)
-                article.write_text(node.blind_text(), encoding="utf-8")
+                (packet_stage / node_path).mkdir(parents=True, exist_ok=True)
+                (packet_stage / article_relative).write_text(node.blind_text(), encoding="utf-8")
                 written.append(root / article_relative)
             for declaration in node.declarations:
                 relative = node_path / _packet_filename(declaration.name)
-                path = packet_stage / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(declaration.blind_text(), encoding="utf-8")
+                (packet_stage / relative).write_text(declaration.blind_text(), encoding="utf-8")
                 written.append(root / relative)
                 entry = {
-                    "article_packet": (node_path / ARTICLE_PACKET).as_posix(),
+                    "article_packet": article_relative.as_posix(),
                     "article_packet_hash": node.evidence_hash,
                     "declaration": declaration.name,
                     "hash": declaration.hash,
@@ -3545,47 +2874,26 @@ def write_packets(
                     entry["passage"] = passage_path
                     entry["passage_locator"] = node.passage_locator or ""
                 manifest.append(entry)
-        (packet_stage / PACKET_MANIFEST).write_text(
-            json.dumps(
-                {"kind": "packets", "packets": manifest, "schema": PACKET_SCHEMA},
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        if passages_stage is not None:
-            (passages_stage / PACKET_MANIFEST).write_text(
-                json.dumps(
-                    {
-                        "kind": "passages",
-                        "passages": passage_manifest,
-                        "schema": PASSAGE_SCHEMA,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+        for stage, kind, entries, schema in (
+            (packet_stage, "packets", manifest, PACKET_SCHEMA),
+            (passages_stage, "passages", passage_manifest, PASSAGE_SCHEMA),
+        ):
+            if stage is not None:
+                payload = json.dumps({"kind": kind, kind: entries, "schema": schema}, indent=2, sort_keys=True)
+                (stage / PACKET_MANIFEST).write_text(payload + "\n", encoding="utf-8")
         outputs = [(root, packet_stage, root_identity)]
         if passages_root is not None and passages_stage is not None:
             outputs.append((passages_root, passages_stage, passages_identity))
         if report_destination is not None and report_stage is not None:
             outputs.append((report_destination, report_stage, report_identity))
         _replace_outputs(outputs)
-        packet_stage = None
-        passages_stage = None
-        report_stage = None
     except OSError as exc:
         raise SkeletonError([f"could not prepare skeleton output: {exc}"]) from exc
     finally:
         for stage in (packet_stage, passages_stage, report_stage):
             if stage is not None:
-                try:
+                with contextlib.suppress(OSError):
                     _remove_output(stage)
-                except OSError:
-                    pass
     return written
 
 
