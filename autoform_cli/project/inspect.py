@@ -299,9 +299,14 @@ def _snapshot_project(
         attempt_diagnostics: list[ProjectDiagnostic] = []
         snapshot: dict[str, _SnapshotEntry] = {}
         changed = False
-        lean_config_present = (
-            _relative_status(root_descriptor, "lakefile.lean") != "missing"
+        lean_config_status, lean_config_metadata = _relative_info(
+            root_descriptor, "lakefile.lean"
         )
+        lean_config_generation = (
+            lean_config_status,
+            _metadata_identity(lean_config_metadata),
+        )
+        lean_config_present = lean_config_status != "missing"
         for relative in _DECISION_NODES:
             kind, severity = _DECISION_FILES.get(relative, ("project-path", "error"))
             status, metadata = _relative_info(root_descriptor, relative)
@@ -329,6 +334,9 @@ def _snapshot_project(
                     )
                 snapshot[relative] = _SnapshotEntry(status, None, identity)
 
+        lean_config_entry = snapshot["lakefile.lean"]
+        if (lean_config_entry.status, lean_config_entry.identity) != lean_config_generation:
+            changed = True
         for relative, entry in snapshot.items():
             status, metadata = _relative_info(root_descriptor, relative)
             if (status, _metadata_identity(metadata)) != (entry.status, entry.identity):

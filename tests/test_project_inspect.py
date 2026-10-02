@@ -1075,6 +1075,32 @@ def test_decision_files_come_from_one_generation(
     assert result.compatibility.release is None
 
 
+def test_lakefile_precedence_comes_from_the_same_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli.project import inspect as inspect_module
+
+    root = _project(tmp_path)
+    (root / "lakefile.lean").write_text("package Example\n", encoding="utf-8")
+    original_info = inspect_module._relative_info
+    removed = False
+
+    def removing_info(descriptor: int, relative: str):
+        nonlocal removed
+        info = original_info(descriptor, relative)
+        if relative == "lakefile.lean" and not removed:
+            removed = True
+            (root / "lakefile.lean").unlink()
+        return info
+
+    monkeypatch.setattr(inspect_module, "_relative_info", removing_info)
+    result = inspect_project(root)
+
+    assert removed
+    assert result.lake is not None
+    assert result.lake.format == "toml"
+
+
 def test_root_discovery_stays_bound_to_the_directory_it_opened(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
