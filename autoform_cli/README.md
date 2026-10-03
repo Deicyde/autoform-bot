@@ -4,6 +4,10 @@ The Autoform CLI validates, visualizes, and publishes the multilevel dependency
 graph embedded in `blueprint/roadmap/`. The Markdown book is the graph: no
 separate authored or generated graph file exists.
 
+This is an agent-facing interface. Normal project work starts from Autoform's
+skills in the user's preferred agent window; those agents invoke these commands
+as needed.
+
 ## Articles and containment
 
 Every Markdown file below `blueprint/roadmap/` is an article node. A

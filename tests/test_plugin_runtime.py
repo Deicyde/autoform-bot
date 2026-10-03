@@ -50,6 +50,14 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
 
     codex_manifest = json.loads((repo_root / ".codex-plugin/plugin.json").read_text())
     assert len(codex_manifest["interface"]["defaultPrompt"]) == 5
+    assert any(
+        "one invocation" in prompt and "persistent Goal" in prompt
+        for prompt in codex_manifest["interface"]["defaultPrompt"]
+    )
+    assert not any(
+        "claim-backed workers" in prompt
+        for prompt in codex_manifest["interface"]["defaultPrompt"]
+    )
     muse = json.loads((repo_root / ".muse-plugin/plugin.json").read_text())
     assert [command["id"] for command in muse["capabilities"]["commands"]] == [
         "setup",
