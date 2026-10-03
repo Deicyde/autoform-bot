@@ -20,7 +20,7 @@ from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .project import ProjectCatalogError, inspect_project, load_release_catalog
-from .provenance import ProvenanceError, verify_plugin_provenance
+from .provenance import ProvenanceError, resolve_plugin_provenance
 from .render import PublicationError, render_site
 from .scaffold import ScaffoldError, scaffold_project
 from .skeleton import (
@@ -45,12 +45,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     init.add_argument(
         "--autoform-source",
         default="",
-        help="Autoform Git source for generated workflows (default: verified installation source)",
+        help="Autoform Git source for generated workflows (default: recorded installation source)",
     )
     init.add_argument(
         "--autoform-ref",
         default="",
-        help="full commit SHA for generated workflows (default: verified installed commit)",
+        help="full commit SHA for generated workflows (default: recorded installed commit)",
     )
     init.add_argument("--force", action="store_true", help="overwrite files that already exist")
     init.add_argument("--json", action="store_true", help="write stable machine-readable output")
@@ -88,7 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     project_versions.add_argument("--json", action="store_true", help="write stable machine-readable output")
     project_provenance = project_subparsers.add_parser(
         "provenance",
-        help="verify Autoform installation contents observed during this invocation",
+        help="read Autoform's recorded immutable source and commit",
     )
     project_provenance.add_argument(
         "--json", action="store_true", help="write stable machine-readable output"
@@ -248,8 +248,8 @@ def _init(args: argparse.Namespace) -> int:
         sys.stdout.flush()
         print(
             "\nCI was not written: generated workflows install Autoform from a Git\n"
-            "ref, and this Autoform installation could not be verified. Re-run\n"
-            "from a verified installation or supply both provenance values:\n"
+            "ref, and this Autoform installation records no immutable pin. Re-run\n"
+            "from an identified installation or supply both provenance values:\n"
             "  autoform init --autoform-source <https-git-url> --autoform-ref <40-char-sha>",
             file=sys.stderr,
         )
@@ -324,7 +324,7 @@ def _doctor(args: argparse.Namespace) -> int:
 def _project(args: argparse.Namespace) -> int:
     if args.project_command == "provenance":
         try:
-            result = verify_plugin_provenance()
+            result = resolve_plugin_provenance()
         except ProvenanceError as error:
             if args.json:
                 print(

@@ -128,14 +128,14 @@ autoform init . --title "Finite Flat Group Schemes" \
   --repository-url https://github.com/owner/repo
 ```
 
-When neither provenance flag is supplied, `init` verifies the installed plugin
-and pins the generated workflows to its source and commit. To override that
+When neither provenance flag is supplied, `init` reads the source and commit
+recorded by the checkout or plugin host and pins the generated workflows to
+that identity. To override that
 pair, pass both `--autoform-source <https-git-url>` and `--autoform-ref <sha>`.
 A ref supplied alone is resolved against the canonical repository. Use
 `--force` to overwrite and `--json` for machine-readable output.
-Local template capture uses retained no-follow directory descriptors, so
-`init` currently fails closed on platforms without the required POSIX APIs,
-including Windows.
+Templates come from the same installed package that runs `init`; capture is
+bounded, link-free, and portable across supported platforms.
 
 Inspect a Lean project and list Autoform's bundled known-good release pairs:
 
@@ -161,25 +161,17 @@ elan, only the trimmed first line of `lean-toolchain` counts.
 `project versions` lists the bundled catalog of known-good Lean and Mathlib
 pairs. It is an allowlist, not a resolver.
 
-`project provenance` is the online step. It reads an exact plugin-root checkout,
-a bounded Codex installer record, or bounded Claude installation and marketplace
-records. It fetches the recorded commit and compares the complete installed
-tracked tree with that commit, allowing only exact host metadata recorded by the
-Claude registry. It reports a credential-free HTTPS source
-and full SHA only after all checks pass. Secure installed-tree comparison
-requires POSIX directory-descriptor and no-follow support; unsupported
-platforms, including Windows, return `project-provenance-unavailable`. A plain
-wheel cannot infer provenance. Installers must preserve the tracked tree;
-untracked files outside the exact cache/build-state allowlist fail closed. The
-decoded comparison is bounded to 20,000 entries and 64 MiB. Git cannot report
-promised blob sizes before transfer, so selected-object transfer is bounded by
-the shared 60-second deadline; file and aggregate limits are enforced while Git
-decodes those objects. The command attests only the installed file
-contents observed during that invocation. Files can change between individual
-reads or after the command returns. Generated CI does not consume live installed
-bytes: it checks out that exact commit, installs only hashed wheels from its
-verified `uv.lock`, and runs the verified source without building the Autoform
-package or resolving its build requirements.
+`project provenance` is a local identity lookup, not self-attestation. It reads
+the origin and HEAD of a clean plugin-root checkout, a bounded Codex installer
+record, a bounded Claude installation record plus its marketplace checkout, or
+an installer-provided `.autoform-provenance.json` sidecar. Every record present
+must name the same credential-free HTTPS source and full commit SHA. It does not
+fetch the repository, scan unrelated host files, or claim that running code can
+authenticate itself. A packaged build whose installer supplies no source record
+returns `project-provenance-unavailable`; pass an independently obtained source
+and SHA explicitly instead. Generated CI checks out the recorded commit,
+installs hashed wheels from its committed `uv.lock`, and runs that source without
+building the Autoform package or resolving its build requirements.
 
 Publishing a project runs four steps in order: validate, write the Mermaid
 graph into the vault, render the site source, then strict-build the site.

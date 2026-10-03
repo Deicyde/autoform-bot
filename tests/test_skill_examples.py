@@ -477,15 +477,16 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert (repo_root / "skills/agent-review/references/roadmap-quality.md").is_file()
 
 
-def test_setup_skill_uses_verified_plugin_provenance(repo_root: Path) -> None:
+def test_setup_skill_uses_recorded_plugin_provenance(repo_root: Path) -> None:
     setup = (repo_root / "skills/setup/SKILL.md").read_text(encoding="utf-8")
     readme = (repo_root / "README.md").read_text(encoding="utf-8")
 
     assert "autoform project provenance --json" in setup
-    assert "--autoform-source <VERIFIED_HTTPS_GIT_SOURCE>" in setup
-    assert "--autoform-ref <VERIFIED_40_CHAR_SHA>" in setup
-    assert "template capture and installed-tree verification" in setup
-    assert "require POSIX descriptor" in setup
+    assert "--autoform-source <RECORDED_HTTPS_GIT_SOURCE>" in setup
+    assert "--autoform-ref <RECORDED_40_CHAR_SHA>" in setup
+    assert "local lookup" in setup
+    assert "running plugin code cannot authenticate itself" in setup
+    assert "installed-tree verification" not in setup
     assert "plain directory copy" not in setup
     assert "scripts/workspace_inspector.py" not in setup
     assert "scripts/make_project.sh" not in setup

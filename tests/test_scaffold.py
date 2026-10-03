@@ -11,7 +11,6 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -23,7 +22,7 @@ from autoform_cli.coverage import load_coverage
 from autoform_cli.graph import load_graph
 from autoform_cli.scaffold import ScaffoldError, scaffold_project
 
-_REAL_VERIFIED_TEMPLATE_SNAPSHOT = scaffold_module._verified_template_snapshot
+_REAL_PLUGIN_PIN = scaffold_module.plugin_pin
 _EXPECTED = {
     ".github/autoform_audit.py",
     ".github/workflows/autoform-verify.yml",
@@ -43,24 +42,12 @@ _EXPECTED = {
 
 @pytest.fixture(autouse=True)
 def _disable_live_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
-    def unavailable():
-        raise scaffold_module.ProvenanceError("network provenance is disabled in unit tests")
-
-    monkeypatch.setattr(scaffold_module, "_verified_template_snapshot", unavailable)
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: ("", ""))
 
 
 def test_unpinned_scaffolding_is_offline_by_default(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from autoform_cli import provenance
-
-    monkeypatch.setattr(
-        provenance,
-        "_fetch_source_layout",
-        lambda *args, **kwargs: pytest.fail("unit scaffold attempted remote access"),
-    )
-
     result = scaffold_project(tmp_path, title="Offline")
 
     assert result.unpinned is True
@@ -347,17 +334,12 @@ def test_scaffolded_theme_defers_navigation_to_the_book(tmp_path: Path) -> None:
     assert "name: material" in mkdocs
 
 
-def test_generated_ci_uses_verified_plugin_pin(
+def test_generated_ci_uses_recorded_plugin_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = "https://example.test/autoform.git"
     ref = "1" * 40
-    snapshot = scaffold_module._filesystem_template_snapshot(scaffold_module._TEMPLATES)
-    monkeypatch.setattr(
-        scaffold_module,
-        "_verified_template_snapshot",
-        lambda: (source, ref, snapshot),
-    )
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: (source, ref))
 
     scaffold_project(tmp_path, title="Finite Flat")
     verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
@@ -475,70 +457,6 @@ def test_locked_dependency_sync_does_not_build_the_project(tmp_path: Path) -> No
     assert environment_python.is_file()
 
 
-def test_scaffold_writes_the_verified_template_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    templates = tmp_path / "templates"
-    shutil.copytree(scaffold_module._TEMPLATES, templates)
-    static = templates / "blueprint/javascripts/mathjax.js"
-    verified_content = static.read_bytes()
-    source = "https://example.test/autoform.git"
-    ref = "1" * 40
-
-    def verified_snapshot():
-        entries = tuple(
-            (
-                path.relative_to(templates).as_posix(),
-                path.read_bytes(),
-                stat.S_IMODE(path.stat().st_mode),
-            )
-            for path in sorted(templates.rglob("*"))
-            if path.is_file()
-        )
-        static.write_bytes(b"mutated after verification\n")
-        return source, ref, entries
-
-    monkeypatch.setattr(scaffold_module, "_TEMPLATES", templates)
-    monkeypatch.setattr(
-        scaffold_module,
-        "_verified_template_snapshot",
-        verified_snapshot,
-    )
-    monkeypatch.setattr(
-        scaffold_module,
-        "plugin_pin",
-        lambda: verified_snapshot()[:2],
-    )
-
-    scaffold_project(tmp_path / "project", title="Finite Flat")
-
-    written = tmp_path / "project/blueprint/javascripts/mathjax.js"
-    assert written.read_bytes() == verified_content
-
-
-def test_verified_scaffolding_does_not_read_the_live_template_tree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = "https://example.test/autoform.git"
-    ref = "1" * 40
-    snapshot = (("README.md", b"verified\n", 0o644),)
-    monkeypatch.setattr(
-        scaffold_module,
-        "_verified_template_snapshot",
-        lambda: (source, ref, snapshot),
-    )
-    monkeypatch.setattr(
-        scaffold_module,
-        "_filesystem_template_snapshot",
-        lambda root: pytest.fail(f"read live template tree: {root}"),
-    )
-
-    scaffold_project(tmp_path, title="Finite Flat")
-
-    assert (tmp_path / "README.md").read_bytes() == b"verified\n"
-
-
-@pytest.mark.skipif(os.name != "posix", reason="safe local template reads are POSIX-only")
 def test_local_template_snapshot_rejects_symlinks_without_reading_them(tmp_path: Path) -> None:
     templates = tmp_path / "templates"
     templates.mkdir()
@@ -546,11 +464,10 @@ def test_local_template_snapshot_rejects_symlinks_without_reading_them(tmp_path:
     secret.write_bytes(b"must not be copied\n")
     (templates / "README.md").symlink_to(secret)
 
-    with pytest.raises(ScaffoldError, match="templates cannot be read safely"):
+    with pytest.raises(ScaffoldError, match="contains a link"):
         scaffold_module._filesystem_template_snapshot(templates)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="safe local template reads are POSIX-only")
 def test_local_template_snapshot_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -559,45 +476,11 @@ def test_local_template_snapshot_is_bounded(
     (templates / "README.md").write_bytes(b"oversized")
     monkeypatch.setattr(scaffold_module, "_MAX_TEMPLATE_FILE_BYTES", 4)
 
-    with pytest.raises(ScaffoldError, match="templates cannot be read safely"):
+    with pytest.raises(ScaffoldError, match="too large"):
         scaffold_module._filesystem_template_snapshot(templates)
 
 
-def test_verified_template_snapshot_comes_from_the_fetched_commit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from autoform_cli import provenance
-
-    verified = provenance.PluginProvenance(
-        "https://example.test/autoform.git",
-        "1" * 40,
-    )
-    layout = provenance._SourceLayout(
-        files={
-            "autoform_cli/__init__.py": provenance._ManifestEntry(0o100644, b"package\n"),
-            "autoform_cli/templates/README.md": provenance._ManifestEntry(
-                0o100755,
-                b"verified template\n",
-            ),
-        },
-        all_files=frozenset(),
-        roots=("autoform_cli",),
-        package_roots=("autoform_cli",),
-    )
-    monkeypatch.setattr(
-        provenance,
-        "_verify_plugin_layout",
-        lambda: (verified, layout),
-    )
-
-    assert _REAL_VERIFIED_TEMPLATE_SNAPSHOT() == (
-        verified.source,
-        verified.revision,
-        (("README.md", b"verified template\n", 0o755),),
-    )
-
-
-def test_scaffold_pin_delegates_to_verified_provenance(
+def test_scaffold_pin_delegates_to_recorded_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from autoform_cli import provenance
@@ -605,7 +488,7 @@ def test_scaffold_pin_delegates_to_verified_provenance(
     expected = ("https://example.test/autoform.git", "1" * 40)
     monkeypatch.setattr(provenance, "plugin_pin", lambda: expected)
 
-    assert scaffold_module.plugin_pin() == expected
+    assert _REAL_PLUGIN_PIN() == expected
 
 
 def test_explicit_pin_overrides_without_discovering_provenance(
@@ -613,7 +496,7 @@ def test_explicit_pin_overrides_without_discovering_provenance(
 ) -> None:
     monkeypatch.setattr(
         scaffold_module,
-        "_verified_template_snapshot",
+        "plugin_pin",
         lambda: pytest.fail("explicit provenance must not trigger discovery"),
     )
     scaffold_project(
@@ -638,10 +521,7 @@ def test_no_ci_rather_than_a_guessed_pin(tmp_path: Path, monkeypatch: pytest.Mon
     """
     from autoform_cli import scaffold as scaffold_module
 
-    def unavailable():
-        raise scaffold_module.ProvenanceError("unavailable")
-
-    monkeypatch.setattr(scaffold_module, "_verified_template_snapshot", unavailable)
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: ("", ""))
     result = scaffold_module.scaffold_project(tmp_path, title="Finite Flat")
 
     assert result.unpinned is True
@@ -663,7 +543,7 @@ def test_a_ref_alone_restores_ci_without_discovering_provenance(
 
     monkeypatch.setattr(
         scaffold_module,
-        "_verified_template_snapshot",
+        "plugin_pin",
         lambda: pytest.fail("an explicit ref must not trigger provenance discovery"),
     )
     result = scaffold_module.scaffold_project(tmp_path, title="Finite Flat", autoform_ref="2" * 40)
@@ -687,7 +567,7 @@ def test_a_mutable_ref_is_refused(ref: str, tmp_path: Path, monkeypatch: pytest.
 
     monkeypatch.setattr(
         scaffold_module,
-        "_verified_template_snapshot",
+        "plugin_pin",
         lambda: pytest.fail("invalid input must not trigger provenance discovery"),
     )
     with pytest.raises(scaffold_module.ScaffoldError) as caught:
@@ -705,7 +585,7 @@ def test_an_explicit_source_overrides_the_default(
 
     monkeypatch.setattr(
         scaffold_module,
-        "_verified_template_snapshot",
+        "plugin_pin",
         lambda: pytest.fail("an explicit source must not trigger provenance discovery"),
     )
     scaffold_module.scaffold_project(
@@ -770,12 +650,7 @@ def test_an_unsafe_plugin_pin_fails_closed_without_persisting_credentials(
     from autoform_cli import scaffold as scaffold_module
 
     secret_source = "https://token:secret@example.test/autoform.git"
-    snapshot = scaffold_module._filesystem_template_snapshot(scaffold_module._TEMPLATES)
-    monkeypatch.setattr(
-        scaffold_module,
-        "_verified_template_snapshot",
-        lambda: (secret_source, "2" * 40, snapshot),
-    )
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: (secret_source, "2" * 40))
 
     result = scaffold_module.scaffold_project(tmp_path, title="Finite Flat")
 
@@ -855,7 +730,7 @@ def test_a_source_without_a_ref_does_not_borrow_this_checkouts_commit(
 
     monkeypatch.setattr(
         scaffold_module,
-        "_verified_template_snapshot",
+        "plugin_pin",
         lambda: pytest.fail("an explicit source must not trigger provenance discovery"),
     )
     result = scaffold_module.scaffold_project(

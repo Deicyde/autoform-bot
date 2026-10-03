@@ -18,15 +18,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .provenance import (
-    ProvenanceError,
-    _directory_flags,
-    _open_root,
-    _read_bounded_regular,
-    _require_root_identity,
-    _stat_signature,
-    normalize_git_source,
-)
+from .provenance import normalize_git_source
 
 _TEMPLATES = Path(__file__).resolve().parent / "templates"
 
@@ -55,102 +47,80 @@ def _normalize_autoform_source(source: str, *, allow_github_scp: bool = False) -
 
 
 def plugin_pin() -> tuple[str, str]:
-    """Return verified all-or-nothing provenance for legacy callers."""
+    """Return recorded all-or-nothing provenance for legacy callers."""
 
-    from .provenance import plugin_pin as verified_plugin_pin
+    from .provenance import plugin_pin as recorded_plugin_pin
 
-    return verified_plugin_pin()
+    return recorded_plugin_pin()
 
 
 def _filesystem_template_snapshot(root: Path) -> _TemplateSnapshot:
-    """Read bounded regular templates through retained directory descriptors."""
+    """Capture one bounded, link-free snapshot of the packaged templates."""
 
     entries: list[tuple[str, bytes, int]] = []
     entry_count = 0
     byte_count = 0
 
-    def visit(descriptor: int, prefix: str, depth: int) -> None:
+    def visit(directory: Path, prefix: str, depth: int) -> None:
         nonlocal entry_count, byte_count
         if depth > _MAX_TEMPLATE_DEPTH:
-            raise ProvenanceError("The local Autoform template tree is too deep.")
-        names = os.listdir(descriptor)
-        entry_count += len(names)
-        if entry_count > _MAX_TEMPLATE_ENTRIES or any(
-            not isinstance(name, str)
-            or not name
-            or name in {".", ".."}
-            or "/" in name
-            or "\\" in name
-            for name in names
-        ):
-            raise ProvenanceError("The local Autoform template tree is invalid.")
-        for name in sorted(names):
+            raise ScaffoldError(["local Autoform template tree is too deep"])
+        children = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        entry_count += len(children)
+        if entry_count > _MAX_TEMPLATE_ENTRIES:
+            raise ScaffoldError(["local Autoform template tree is too large"])
+        for child in children:
+            name = child.name
+            if not name or name in {".", ".."} or "/" in name or "\\" in name:
+                raise ScaffoldError(["local Autoform template tree is invalid"])
             relative = f"{prefix}/{name}" if prefix else name
-            before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            before = child.stat(follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode):
+                raise ScaffoldError(["local Autoform template tree contains a link"])
             if stat.S_ISDIR(before.st_mode):
-                child = os.open(name, _directory_flags(), dir_fd=descriptor)
-                try:
-                    opened = os.fstat(child)
-                    if _stat_signature(opened) != _stat_signature(before):
-                        raise ProvenanceError("The local Autoform template tree changed.")
-                    if name != "__pycache__":
-                        visit(child, relative, depth + 1)
-                    current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                    if _stat_signature(current) != _stat_signature(opened):
-                        raise ProvenanceError("The local Autoform template tree changed.")
-                finally:
-                    os.close(child)
+                if name != "__pycache__":
+                    visit(Path(child.path), relative, depth + 1)
                 continue
             if not stat.S_ISREG(before.st_mode):
-                raise ProvenanceError("The local Autoform template tree contains a link.")
+                raise ScaffoldError(["local Autoform template tree contains a special file"])
             if name.endswith(".pyc"):
                 continue
-            read = _read_bounded_regular(
-                descriptor,
-                name,
-                limit=_MAX_TEMPLATE_FILE_BYTES,
-                message="The local Autoform template tree is invalid.",
-            )
-            if read is None:
-                raise ProvenanceError("The local Autoform template tree changed.")
-            content, metadata = read
+            if before.st_size > _MAX_TEMPLATE_FILE_BYTES:
+                raise ScaffoldError(["local Autoform template tree is too large"])
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(child.path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                ):
+                    raise ScaffoldError(["local Autoform template tree changed"])
+                with os.fdopen(descriptor, "rb", closefd=False) as source:
+                    content = source.read(_MAX_TEMPLATE_FILE_BYTES + 1)
+                if len(content) != opened.st_size or len(content) > _MAX_TEMPLATE_FILE_BYTES:
+                    raise ScaffoldError(["local Autoform template tree changed"])
+            finally:
+                os.close(descriptor)
             byte_count += len(content)
             if byte_count > _MAX_TEMPLATE_TOTAL_BYTES:
-                raise ProvenanceError("The local Autoform template tree is too large.")
-            entries.append((relative, content, stat.S_IMODE(metadata.st_mode)))
+                raise ScaffoldError(["local Autoform template tree is too large"])
+            entries.append((relative, content, stat.S_IMODE(opened.st_mode)))
 
-    descriptor: int | None = None
     try:
-        selected, descriptor = _open_root(root)
-        visit(descriptor, "", 0)
-        _require_root_identity(selected, descriptor)
-    except (MemoryError, OSError, ProvenanceError) as error:
+        before = root.lstat()
+        if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            raise ScaffoldError(["local Autoform template tree is invalid"])
+        visit(root, "", 0)
+        after = root.lstat()
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            raise ScaffoldError(["local Autoform template tree changed"])
+    except ScaffoldError:
+        raise
+    except (MemoryError, OSError) as error:
         raise ScaffoldError(["local Autoform templates cannot be read safely"]) from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
     return tuple(entries)
-
-
-def _verified_template_snapshot() -> tuple[str, str, _TemplateSnapshot]:
-    """Return template bytes from the same remote commit as the verified pin."""
-
-    from .provenance import _verify_plugin_layout
-
-    verified, layout = _verify_plugin_layout()
-    prefix = "autoform_cli/templates/"
-    entries = tuple(
-        (
-            relative.removeprefix(prefix),
-            entry.content,
-            stat.S_IMODE(entry.mode),
-        )
-        for relative, entry in sorted(layout.files.items())
-        if relative.startswith(prefix)
-    )
-    if not entries:
-        raise ProvenanceError("The verified Autoform commit does not contain scaffold templates.")
-    return verified.source, verified.revision, entries
 
 
 class ScaffoldError(ValueError):
@@ -299,14 +269,8 @@ def scaffold_project(
     if issues:
         raise ScaffoldError(issues)
 
-    pinned_source, pinned_ref = "", ""
-    if given_source or given_ref:
-        template_snapshot = _filesystem_template_snapshot(_TEMPLATES)
-    else:
-        try:
-            pinned_source, pinned_ref, template_snapshot = _verified_template_snapshot()
-        except ProvenanceError:
-            template_snapshot = _filesystem_template_snapshot(_TEMPLATES)
+    template_snapshot = _filesystem_template_snapshot(_TEMPLATES)
+    pinned_source, pinned_ref = ("", "") if given_source or given_ref else plugin_pin()
     safe_pinned_source = _normalize_autoform_source(pinned_source, allow_github_scp=True)
     if safe_pinned_source is None or not _FULL_SHA.fullmatch(pinned_ref.lower()):
         pinned_source, pinned_ref = "", ""

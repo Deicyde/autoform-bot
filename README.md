@@ -94,7 +94,7 @@ plugin development and debugging, not as a required user workflow.
 | Command | Purpose |
 | --- | --- |
 | `autoform init` | Scaffold the blueprint and site; add CI when immutably pinned. |
-| `autoform project provenance` | Verify the installed plugin against its recorded commit. |
+| `autoform project provenance` | Read the immutable source and commit recorded by Git or the plugin host. |
 | `autoform check` | Validate Markdown structure and dependencies. |
 | `autoform audit` | Audit completeness and checked facts. |
 | `autoform doctor` | Diagnose the local blueprint contract. |
