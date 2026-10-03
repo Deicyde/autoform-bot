@@ -147,11 +147,12 @@ autoform project provenance --json
 the network. Compatibility is decided by the toolchain and the Mathlib commit
 the manifest locks, which is what `lake build` uses: `supported` when that pair
 is in the bundled catalog, `unlisted` when it is not, and `indeterminate` when
-either is unknown (no manifest, no Mathlib, or an unreadable file). A
-`.lake/package-overrides.json` entry for Mathlib replaces the manifest's, and a
-`lakefile.toml` that requests a different Mathlib than the lock gets a
-`lake-manifest-stale` warning. `lakefile.lean` takes precedence, as in Lake,
-but is never evaluated, so its package name and targets are not reported.
+either is unknown (no manifest, no Mathlib, a path-based Mathlib, or any file
+error). A `.lake/package-overrides.json` entry for Mathlib replaces the
+manifest's, and a `lakefile.toml` that requests a different Mathlib than the
+lock gets a `lake-manifest-stale` warning. `lakefile.lean` takes precedence, as
+in Lake, but is never evaluated, so its projects stay `indeterminate`. As in
+elan, only the trimmed first line of `lean-toolchain` counts.
 
 `project versions` lists the bundled catalog of known-good Lean and Mathlib
 pairs. It is an allowlist, not a resolver.
