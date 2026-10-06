@@ -1248,3 +1248,20 @@ carrier paths directly, without rereading files or resolving their paths again.
 This lets the Brain index and Autoform catalog consume the same source capture.
 `import_annotations(paths, output=..., include=..., exclude=..., project=...)`
 is the discovery-plus-catalog convenience API.
+
+These commands currently form an interchange bridge. Import followed by
+`export-annotations` is not an annotation round trip: export derives links from
+roadmap execution targets, while import retains external records in the catalog
+archive. Neither graph loading nor article rendering currently attaches those
+retained records to the original informal articles.
+
+The proposed native direction keeps Markdown wiki articles as independent
+informal sources and stores companion associations separately. Native attachment
+lookup would show retained links on the corresponding article and serve the
+original records, preserving their revisions and carrier bases. Stable article
+identity alone does not make an old selector valid against revised prose.
+Generated evidence pages remain views, and ordinary paper citations remain
+separate relationships. Autoform's checked execution targets, assertions,
+dependencies and reviews remain workflow data; arbitrary imported FCA links do
+not replace or establish them. Moving that workflow metadata out of Markdown is
+a separate refactor, not a prerequisite for independent articles with attachments.
