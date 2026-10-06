@@ -60,6 +60,8 @@ Autoform keeps the roadmap and dependency graph as Markdown under
 [blueprint format and CLI reference](autoform_cli/README.md) for the complete
 format and command contracts, or browse the
 [Cabannes thesis example](skills/setup/assets/cabannes-thesis-project/README.md).
+Committed article-to-Lean links can also be exchanged as independent
+[companion annotations](autoform_cli/README.md#companion-annotation-export).
 
 ## Development
 

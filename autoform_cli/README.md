@@ -1131,3 +1131,53 @@ directories must be disjoint.
 Every render writes `publication.json` with the source-content hash, Git ref,
 article and dependency counts, and available views. It contains no timestamp or
 absolute path, so identical inputs produce identical output files.
+
+## Companion annotation export
+
+A committed consumer project can exchange its informal–formal associations with
+WikiLean and other readers of the experimental FCA v2 single-annotation format:
+
+```bash
+autoform export-annotations /path/to/consumer \
+  --repo https://github.com/owner/consumer \
+  --commit <full-commit-sha> --output /path/to/new-companion --json
+formal-companion-annotations scan /path/to/new-companion/annotations
+```
+
+The exporter writes independent complete JSON records under `annotations/` and
+an operational `report.json` beside it. Scan the `annotations/` directory;
+`report.json` is not an annotation or a required manifest. Readers may regroup
+the records into other shard layouts. Every record has exactly one informal
+source and one formal target. This implementation follows the unpublished
+`2.0.0a2` draft at Formal Companion Annotations commit
+`6be1da39be6fae5c384393fb812530beee07911e` (the single-record schema), not the old graph-shaped RC proposal.
+No FCA package is required to run Autoform, preserving Python 3.10 support;
+install the draft reference checker separately for interchange validation.
+
+The source is the entire authored Markdown article, represented by `generic`
+mode and a commit-pinned raw GitHub URI. The formal target is a commit-pinned
+Lean source URI with an exact line fragment. The exporter requires an explicit
+repository identity and full commit; it verifies the captured article and
+linked Lean bytes against that local Git commit. It does not check whether the
+remote repository exists or the commit has been published. GitHub is currently
+the only supported host. Authored citations remain inside the article; this
+export does not invent locations inside a cited PDF, LaTeX file, or webpage.
+
+Articles naming declarations need durable `article_id` metadata. Each distinct
+local declaration produces a separate record; repeated names within one article
+produce one record. Annotation IDs include the repository, commit, article ID,
+and declaration name. The `org.autoform` extensions carry content hashes,
+declaration information, authored workflow assertions, and derived status.
+They are optional application data, not new core requirements. Resolution is
+lexical and marked `verification: not-performed`: export does not run Lean or
+establish correspondence, proof correctness, or human review.
+
+Missing identities, missing or ambiguous declarations, private/complex modifier
+forms, and external Mathlib declarations appear as omissions in the report.
+An external target needs a pinned library index before it can be exported.
+Invalid graphs and changes to referenced committed bytes fail the whole export.
+The output directory must be new; publication is atomic and never overwrites
+existing output. Identical inputs produce identical files. Exit 0 means all
+named associations were exported, 1 means an output was written with omissions
+(or no associations), and 2 means an input or output failure. No network request,
+proof worker, production write, or source mutation occurs.

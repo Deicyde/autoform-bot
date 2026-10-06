@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import status
+from .annotations import AnnotationExportError, export_annotations, write_annotation_shards
 from .article_identity import plan_article_ids
 from .audit import audit_blueprint
 from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_key
@@ -290,6 +291,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="fail when a 'lean:' declaration is not found in the Lean sources",
     )
 
+    annotations = subparsers.add_parser("export-annotations", help="export committed blueprint links as FCA v2 shards")
+    annotations.add_argument("target", nargs="?", default=".", help="project root or blueprint directory")
+    annotations.add_argument("--repo", required=True, help="explicit https://github.com/owner/repository identity")
+    annotations.add_argument("--commit", required=True, help="full immutable Git commit ID")
+    annotations.add_argument("--output", required=True, type=Path, help="new output directory; must not already exist")
+    annotations.add_argument("--json", action="store_true", help="write the export report as JSON")
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -312,9 +320,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _migrate(args)
     if args.command == "skeleton":
         return _skeleton(args)
+    if args.command == "export-annotations":
+        return _export_annotations(args)
     if args.command == "render":
         return _render(args)
     return 2
+
+
+def _export_annotations(args: argparse.Namespace) -> int:
+    try:
+        result = export_annotations(args.target, repo=args.repo, commit=args.commit)
+        destination = write_annotation_shards(result, args.output)
+    except (GraphValidationError, RuntimeProjectionError) as error:
+        for issue in error.issues:
+            print(f"error: {_human_text(issue)}", file=sys.stderr)
+        return 2
+    except AnnotationExportError as error:
+        print(f"error: {_human_text(error)}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, ValueError):
+        print("error: annotation inputs or output cannot be read or written", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result.report(), ensure_ascii=True, sort_keys=True))
+    else:
+        print(f"Exported {len(result.annotations)} annotations to {_human_text(destination / 'annotations')}")
+        for diagnostic in result.diagnostics:
+            print("omitted: " + _human_text(json.dumps(diagnostic, ensure_ascii=True)), file=sys.stderr)
+    return 1 if result.diagnostics else 0
 
 
 def _add_claim_board_arguments(parser: argparse.ArgumentParser) -> None:
