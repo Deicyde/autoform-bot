@@ -1,4 +1,4 @@
-"""Export committed blueprint associations as independent FCA v2 annotations.
+"""Export committed blueprint associations as independent FCA draft annotations.
 
 This is a derived interchange view. Markdown remains authoritative, and a
 lexical source link says nothing about proof completion or correspondence.
@@ -91,7 +91,7 @@ def _plain_public_declaration(content: bytes, declaration) -> bool:
 
 
 def export_annotations(project_or_blueprint: str | Path, *, repo: str, commit: str) -> AnnotationExport:
-    """Return one FCA v2 record per committed article/local Lean association.
+    """Return one FCA draft record per committed article/local Lean association.
 
     GitHub is the only supported host. The caller explicitly supplies repository
     identity; availability or ownership of that remote is not checked. Sources
@@ -160,7 +160,6 @@ def export_annotations(project_or_blueprint: str | Path, *, repo: str, commit: s
             target_uri = f"{repo}/blob/{commit}/{quote(lean_path, safe='/')}#L{declaration.line}"
             identity = json.dumps([repo, commit, node.article_id, name], ensure_ascii=True, separators=(",", ":"))
             annotations.append({
-                "version": 2,
                 "id": "urn:autoform:annotation:" + hashlib.sha256(identity.encode("ascii")).hexdigest(),
                 "source": {
                     "type": "generic", "uri": source_uri,

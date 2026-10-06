@@ -62,8 +62,8 @@ def test_committed_atomic_source_and_target_are_independent_records(consumer, tm
     assert result == export_annotations(project / "blueprint", repo=REPO, commit=revision)
     assert len(result.annotations) == 1
     record = result.annotations[0]
-    assert set(record) == {"version", "id", "source", "target", "extensions"}
-    assert record["version"] == 2
+    assert set(record) == {"id", "source", "target", "extensions"}
+    assert "version" not in record
     assert record["source"]["type"] == "generic"
     assert record["source"]["uri"].endswith(f"/{revision}/blueprint/roadmap/result.md")
     assert record["target"] == f"{REPO}/blob/{revision}/Consumer.lean#L2"

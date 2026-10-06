@@ -27,13 +27,13 @@ def shards(tmp_path: Path):
     nested = root / "nested"
     nested.mkdir(parents=True)
     records = [
-        {"version": 2, "id": "same", "source": {"type": "pdf", "uri": "../book.pdf"},
+        {"id": "same", "source": {"type": "pdf", "uri": "../book.pdf"},
          "location": {"page": 2, "rect": [0.1, 0.2, 0.3, 0.4]}, "target": "https://example.invalid/formal#one"},
-        {"version": 2, "id": "same", "source": {"type": "latex", "uri": "../book.tex"},
+        {"id": "same", "source": {"type": "latex", "uri": "../book.tex"},
          "location": {"label": "thm:one"}, "target": "urn:lean:Test.one"},
-        {"version": 2, "source": {"type": "html", "uri": "https://example.invalid/book"},
+        {"source": {"type": "html", "uri": "https://example.invalid/book"},
          "location": {"quote": {"exact": "Some statement."}}, "target": "../formal.html#two"},
-        {"version": 2, "source": {"type": "generic", "uri": "../image.svg"},
+        {"source": {"type": "generic", "uri": "../image.svg"},
          "location": {}, "target": "urn:lean:Test.three",
          "extensions": {"custom": {"large": 2**100, "values": [3, 2, 1]}}},
     ]
@@ -101,7 +101,7 @@ def test_invalid_selected_shard_aborts_all_and_explicit_filters_work(reference, 
 def test_untrusted_markup_and_unsafe_uris_are_inert(reference, tmp_path):
     from autoform_cli.markdown import site_converter
     text = '```\n<script>alert(1)</script>\n```\n[x](javascript:alert(1))'
-    record = {"version": 2, "id": text,
+    record = {"id": text,
               "source": {"type": "generic", "uri": "javascript:alert(1)"},
               "target": "data:text/html,<script>alert(2)</script>",
               "location": {"custom": text}, "extensions": {"untrusted": text}}
@@ -120,7 +120,7 @@ def test_untrusted_markup_and_unsafe_uris_are_inert(reference, tmp_path):
 
 def test_whole_source_is_distinct_from_explicit_generic_location(reference, tmp_path):
     shard = tmp_path / "input.json"
-    shard.write_text(json.dumps({"version": 2, "source": {"type": "generic", "uri": "urn:source"}, "target": "urn:formal"}))
+    shard.write_text(json.dumps({"source": {"type": "generic", "uri": "urn:source"}, "target": "urn:formal"}))
     output = tmp_path / "catalog"
     import_annotations([shard], output=output)
     assert "selects the whole informal source" in (output / "000001.md").read_text()
@@ -185,3 +185,14 @@ def test_project_catalog_refuses_symlink_ancestors(reference, shards, tmp_path):
     with pytest.raises(CompanionImportError, match="symbolic link"):
         import_annotations([root], output=sources / "alias/catalog", project=project)
     assert not (sources / "real/catalog").exists()
+
+
+def test_old_top_level_version_is_rejected_before_writing_catalog(reference, shards, tmp_path):
+    _root, records = shards
+    old = {"version": 2, **records[0]}
+    shard = tmp_path / "old-versioned.json"
+    shard.write_text(json.dumps(old))
+    output = tmp_path / "catalog"
+    with pytest.raises(CompanionImportError, match="reference validation"):
+        import_annotations([shard], output=output)
+    assert not output.exists()

@@ -292,7 +292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="fail when a 'lean:' declaration is not found in the Lean sources",
     )
 
-    annotations = subparsers.add_parser("export-annotations", help="export committed blueprint links as FCA v2 shards")
+    annotations = subparsers.add_parser("export-annotations", help="export committed blueprint links as FCA draft shards")
     annotations.add_argument("target", nargs="?", default=".", help="project root or blueprint directory")
     annotations.add_argument("--repo", required=True, help="explicit https://github.com/owner/repository identity")
     annotations.add_argument("--commit", required=True, help="full immutable Git commit ID")

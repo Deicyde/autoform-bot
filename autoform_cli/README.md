@@ -1135,7 +1135,7 @@ absolute path, so identical inputs produce identical output files.
 ## Companion annotation export
 
 A committed consumer project can exchange its informal–formal associations with
-WikiLean and other readers of the experimental FCA v2 single-annotation format:
+WikiLean and other readers of the unreleased FCA single-annotation format:
 
 ```bash
 autoform export-annotations /path/to/consumer \
@@ -1148,9 +1148,11 @@ The exporter writes independent complete JSON records under `annotations/` and
 an operational `report.json` beside it. Scan the `annotations/` directory;
 `report.json` is not an annotation or a required manifest. Readers may regroup
 the records into other shard layouts. Every record has exactly one informal
-source and one formal target. This implementation follows the unpublished
-`2.0.0a2` draft at Formal Companion Annotations commit
-`6be1da39be6fae5c384393fb812530beee07911e` (the single-record schema), not the old graph-shaped RC proposal.
+source and one formal target. This implementation follows the unreleased, unversioned
+single-record schema in Formal Companion Annotations' `schema/companion.schema.json`.
+Only `source` and `target` are required core fields; records carry no schema
+version number. `2.0.0a2` identifies the reference software package, not an
+annotation field.
 No FCA package is required to run Autoform, preserving Python 3.10 support;
 install the draft reference checker separately for interchange validation.
 
@@ -1184,7 +1186,7 @@ proof worker, production write, or source mutation occurs.
 
 ## Companion source import
 
-The reverse direction turns WikiLean or other FCA v2 shards into a local
+The reverse direction turns WikiLean or other FCA annotation shards into a local
 Markdown source catalog that Autoform's existing wiki, Obsidian, and renderer
 can read. Importing is source review, not a new formalization plan. It creates
 no roadmap nodes and does not change any proof or review state.
