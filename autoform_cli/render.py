@@ -19,7 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
-from . import graph_pages, graph_views, mermaid, status
+from . import companions, graph_pages, graph_views, mermaid, status
+from .companion_sources import CompanionImportError
 from .coverage import COVERAGE_DISPOSITIONS, CoverageSummary, load_coverage
 from .graph import Graph, Node, load_graph
 from .lean import SourceLinker, build_linker, declaration_names, index_failure_message
@@ -242,6 +243,7 @@ def render_site(
     repository_url: str | None = None,
     ref: str | None = None,
     clean: bool = True,
+    companion_config: str | Path | None = None,
 ) -> RenderReport:
     """Write deterministic, read-only projections of the Markdown blueprint.
 
@@ -286,6 +288,22 @@ def render_site(
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
     sources_base = _sources_base(blueprint, repo_root, linker)
+    try:
+        companion_project = companions.load_project_companions(repo_root, config=companion_config)
+        attachments = companions.index_attachments(companion_project, graph, project=repo_root)
+    except (CompanionImportError, OSError, ValueError) as error:
+        raise PublicationError([f"companion inputs: {error}"]) from error
+    if attachments and (blueprint / companions.INDEX_NAME).exists():
+        raise PublicationError([f"native companion index would overwrite authored {companions.INDEX_NAME}"])
+    companion_article_paths = {a.article_path: a.article for a in attachments if a.article_path is not None}
+    if any(path.name in _GENERATED_FILES for path in companion_article_paths):
+        raise PublicationError(["bound companion article is a generated publication path"])
+    companion_blocks = companions.render_article_attachment_blocks(attachments)
+    if companion_project.configured:
+        _verify_companion_article_capture(graph, attachments)
+    companion_manifest = ({"revision": companion_project.revision, "annotations": len(attachments),
+                           "selectors_resolved": False, "proof_verification": "not-performed"}
+                          if companion_project.configured else None)
 
     _prepare_destination(destination, clean=clean)
     _write_publication_manifest(
@@ -295,6 +313,7 @@ def render_site(
         linker,
         coverage=coverage,
         complete=False,
+        companion_manifest=companion_manifest,
     )
 
     report = RenderReport(output_dir=destination)
@@ -325,6 +344,8 @@ def render_site(
     node_sources = {
         node.path.resolve(): node_id for node_id, node in graph.nodes.items()
     }
+    for source, article in companion_article_paths.items():
+        targets.setdefault(article, (destination / source.relative_to(blueprint), ""))
 
     for source in sorted(blueprint.rglob("*")):
         relative = source.relative_to(blueprint)
@@ -334,7 +355,8 @@ def render_site(
             continue
         # Source notes leave the site entirely once readers can reach them in
         # the repository, so the book has one reference surface rather than two.
-        if sources_base is not None and relative.parts[:1] == (SOURCES_DIR,):
+        if (sources_base is not None and relative.parts[:1] == (SOURCES_DIR,)
+                and source not in companion_article_paths):
             continue
         target = destination / relative
         # Directories are created on demand below, so a directory holding
@@ -358,6 +380,9 @@ def render_site(
                 targets=targets,
                 sources_base=sources_base,
             )
+            companion_article = companion_article_paths.get(source.resolve())
+            if companion_article is not None:
+                rewritten += "\n\n" + companion_blocks[companion_article] + "\n"
             target.write_text(rewritten, encoding="utf-8")
         else:
             shutil.copy2(source, target)
@@ -400,6 +425,7 @@ def render_site(
             node_sources=node_sources,
             containers=containers,
             sources_base=sources_base,
+            companion_blocks=companion_blocks,
         )
         page.write_text(chapter, encoding="utf-8")
         if narrative is None:  # a milestone with no narrative page of its own
@@ -429,8 +455,14 @@ def render_site(
         encoding="utf-8",
     )
     report.pages += 1
+    if attachments:
+        companion_index = destination / companions.INDEX_NAME
+        companion_index.write_text(companions.render_companion_index(
+            attachments, article_links=_anchored_links(targets, companion_index)), encoding="utf-8")
+        report.pages += 1
     (destination / "SUMMARY.md").write_text(
-        _render_summary_nav(book_pages, destination=destination, overview=overview),
+        _render_summary_nav(book_pages, destination=destination, overview=overview,
+                            companion_index=bool(attachments)),
         encoding="utf-8",
     )
 
@@ -451,6 +483,8 @@ def render_site(
         asset = destination / relative
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_text(contents, encoding="utf-8")
+    if companion_project.configured:
+        _verify_companion_article_capture(graph, attachments)
     _write_publication_manifest(
         destination,
         blueprint,
@@ -458,8 +492,22 @@ def render_site(
         linker,
         coverage=coverage,
         complete=True,
+        companion_manifest=companion_manifest,
     )
     return report
+
+
+def _verify_companion_article_capture(graph: Graph, attachments) -> None:
+    """Never label attachments current against bytes other than the captured article."""
+    captured = {node.path: node.source_sha256 for node in graph.nodes.values()}
+    captured.update({a.article_path: a.article_sha256 for a in attachments if a.article_path is not None})
+    for path, expected in captured.items():
+        try:
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as error:
+            raise PublicationError(["article changed while capturing companion attachments"]) from error
+        if actual != expected:
+            raise PublicationError(["article changed while capturing companion attachments"])
 
 
 def _prepare_destination(destination: Path, *, clean: bool) -> None:
@@ -607,6 +655,7 @@ def _write_publication_manifest(
     *,
     coverage: CoverageSummary,
     complete: bool,
+    companion_manifest: dict | None = None,
 ) -> None:
     manifest = {
         "complete": complete,
@@ -625,6 +674,8 @@ def _write_publication_manifest(
         "dependencies": graph.edge_count,
         "views": ["book", "progress", "project", "chapter", "focus", "full"],
     }
+    if companion_manifest is not None:
+        manifest["companions"] = companion_manifest
     (destination / PUBLICATION_MANIFEST).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -999,6 +1050,7 @@ def _render_summary_nav(
     *,
     destination: Path,
     overview: Path,
+    companion_index: bool = False,
 ) -> str:
     """Write the site nav as Markdown so the Book tab holds real chapters.
 
@@ -1018,6 +1070,8 @@ def _render_summary_nav(
     # What counts as done belongs beside the book it qualifies. The landing
     # page used to be the only route to it, which made the page impossible to
     # simplify without stranding it.
+    if companion_index:
+        lines.append(f"    - [Companion sources]({companions.INDEX_NAME})")
     coverage = destination / "coverage/README.md"
     if coverage.is_file():
         title = _first_h1(coverage.read_text(encoding="utf-8")) or "Coverage"
@@ -1530,6 +1584,7 @@ def _render_chapter(
     node_sources: dict[Path, str],
     containers: frozenset[str],
     sources_base: "_SourceBase | None" = None,
+    companion_blocks: dict[str, str] | None = None,
 ) -> tuple[str, int, list[str]]:
     """Render one narrative article with statements at its authored link slots."""
     links = _anchored_links(targets, page)
@@ -1553,6 +1608,7 @@ def _render_chapter(
             node_sources=node_sources,
             targets=targets,
             sources_base=sources_base,
+            companion_html=(companion_blocks or {}).get(node_id, ""),
         )
         environments[node_id] = environment
         linked += node_linked
@@ -1643,6 +1699,7 @@ def _render_environment(
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
     sources_base: "_SourceBase | None" = None,
+    companion_html: str = "",
 ) -> tuple[str, int, list[str]]:
     node_status = statuses[node.id]
     caption, _, number = numbers[node.id].rpartition(" ")
@@ -1718,6 +1775,8 @@ def _render_environment(
         lines.append(meta)
     if dependencies:
         lines.append(dependencies)
+    if companion_html:
+        lines.append(companion_html)
     lines.append("</div>")
     return "\n".join(lines), linked, unresolved
 

@@ -14,7 +14,7 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from . import status
+from . import companions, status
 from .annotations import AnnotationExportError, export_annotations, write_annotation_shards
 from .article_identity import plan_article_ids
 from .audit import audit_blueprint
@@ -286,13 +286,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     render.add_argument("--lean-root", type=Path, help="Lean project to link code from")
     render.add_argument("--repository-url", help="project URL, e.g. https://github.com/owner/repo")
     render.add_argument("--ref", help="commit or branch the code links should pin")
+    render.add_argument("--companion-config", type=Path, help="explicit native FCA attachment configuration")
     render.add_argument(
         "--require-declarations",
         action="store_true",
         help="fail when a 'lean:' declaration is not found in the Lean sources",
     )
 
-    annotations = subparsers.add_parser("export-annotations", help="export committed blueprint links as FCA draft shards")
+    annotations = subparsers.add_parser("export-annotations", help="export workflow-derived committed links as FCA compatibility shards")
     annotations.add_argument("target", nargs="?", default=".", help="project root or blueprint directory")
     annotations.add_argument("--repo", required=True, help="explicit https://github.com/owner/repository identity")
     annotations.add_argument("--commit", required=True, help="full immutable Git commit ID")
@@ -306,6 +307,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     companion_import.add_argument("--exclude", action="append", default=[], help="exclude a shard glob (repeatable)")
     companion_import.add_argument("--project", type=Path, help="require output below this project's blueprint/sources")
     companion_import.add_argument("--json", action="store_true", help="write the catalog report as JSON")
+
+    native = subparsers.add_parser("companions", help="inspect, retain or export native FCA attachments")
+    native_sub = native.add_subparsers(dest="companion_command", required=True)
+    for command, help_text in (("inspect", "inspect original-source attachments without changing workflow state"),
+                               ("export", "export selected retained associations with explicit URI rebasing")):
+        command_parser = native_sub.add_parser(command, help=help_text)
+        command_parser.add_argument("target", nargs="?", default=".", help="project root or blueprint directory")
+        command_parser.add_argument("--config", type=Path, help="explicit project attachment config")
+        command_parser.add_argument("--json", action="store_true", help="write the full report as JSON")
+        if command == "export":
+            command_parser.add_argument("--output", required=True, type=Path, help="new export directory")
+    native_import = native_sub.add_parser("import", help="retain original FCA occurrences without making article copies")
+    native_import.add_argument("paths", nargs="+", help="shard files or directory roots")
+    native_import.add_argument("--output", required=True, type=Path, help="new retained archive directory")
+    native_import.add_argument("--include", action="append", help="select root-relative shard glob (repeatable)")
+    native_import.add_argument("--exclude", action="append", default=[], help="exclude shard glob (repeatable)")
+    native_import.add_argument("--json", action="store_true", help="write the retention report as JSON")
 
     args = parser.parse_args(argv)
 
@@ -329,6 +347,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _migrate(args)
     if args.command == "skeleton":
         return _skeleton(args)
+    if args.command == "companions":
+        return _companions(args)
     if args.command == "import-annotations":
         return _import_annotations(args)
     if args.command == "export-annotations":
@@ -336,6 +356,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "render":
         return _render(args)
     return 2
+
+
+def _companions(args: argparse.Namespace) -> int:
+    try:
+        if args.companion_command == "import":
+            from .companion_sources import _reference_api
+            collect, _check = _reference_api()
+            captured = collect(args.paths, include=args.include, exclude=args.exclude)
+            report = companions.write_retained_annotations(captured, output=args.output)
+        elif args.companion_command == "export":
+            paths = resolve_runtime_paths(args.target)
+            selected = companions.load_project_companions(paths.project_root, config=args.config)
+            report = companions.export_retained_annotations(selected.snapshot, output=args.output)
+        else:
+            report = companions.inspect_project_companions(args.target, config=args.config)
+    except (GraphValidationError, RuntimeProjectionError) as error:
+        for issue in error.issues:
+            print(f"error: {_human_text(issue)}", file=sys.stderr)
+        return 2
+    except (CompanionImportError, OSError, ValueError) as error:
+        print(f"error: {_human_text(error)}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, ensure_ascii=True, sort_keys=True))
+    else:
+        print(f"{report['annotations']} retained companion associations; no proof or selector verification")
+        for attachment in report.get("attachments", []):
+            print(_human_text(f"{attachment['occurrence']}: {attachment['state']} — {attachment['source']}"))
+    return 0
 
 
 def _import_annotations(args: argparse.Namespace) -> int:
@@ -1041,6 +1090,7 @@ def _render(args: argparse.Namespace) -> int:
             lean_root=args.lean_root,
             repository_url=args.repository_url,
             ref=args.ref,
+            companion_config=args.companion_config,
         )
     except (GraphValidationError, PublicationError) as exc:
         for issue in exc.issues:

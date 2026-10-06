@@ -74,6 +74,7 @@ def test_committed_atomic_source_and_target_are_independent_records(consumer, tm
     assert not extension["workflow_assertions"]["proof_formalized"]
     output = write_annotation_shards(result, tmp_path / "export")
     assert json.loads((output / "report.json").read_text()) == result.report()
+    assert result.report()["ownership"] == "autoform-workflow-derived-compatibility-view"
     shard = next((output / "annotations").glob("*.json"))
     assert json.loads(shard.read_text()) == record
     again = write_annotation_shards(result, tmp_path / "export-again")

@@ -1249,19 +1249,130 @@ This lets the Brain index and Autoform catalog consume the same source capture.
 `import_annotations(paths, output=..., include=..., exclude=..., project=...)`
 is the discovery-plus-catalog convenience API.
 
-These commands currently form an interchange bridge. Import followed by
-`export-annotations` is not an annotation round trip: export derives links from
-roadmap execution targets, while import retains external records in the catalog
-archive. Neither graph loading nor article rendering currently attaches those
-retained records to the original informal articles.
+## Native companion attachments
 
-The proposed native direction keeps Markdown wiki articles as independent
-informal sources and stores companion associations separately. Native attachment
-lookup would show retained links on the corresponding article and serve the
-original records, preserving their revisions and carrier bases. Stable article
-identity alone does not make an old selector valid against revised prose.
-Generated evidence pages remain views, and ordinary paper citations remain
-separate relationships. Autoform's checked execution targets, assertions,
-dependencies and reviews remain workflow data; arbitrary imported FCA links do
-not replace or establish them. Moving that workflow metadata out of Markdown is
-a separate refactor, not a prerequisite for independent articles with attachments.
+Markdown wiki articles remain independent informal resources. Native FCA records
+live separately in selected shards or retained captures, and attach to an article
+through an explicit source-URI binding. Zero, one, or many records can refer to
+one article. Ordinary article-to-paper citations remain a separate relationship;
+no transitive paper-to-formal association is inferred.
+
+Keep retained archives outside `blueprint/`, which remains the normal
+publication input tree. Place application configuration in the project root's
+`.autoform-companions.json` (outside `blueprint/`). This is an Autoform selection
+file, not an FCA manifest or a new annotation schema:
+
+```json
+{
+  "roots": ["companions/authored", "/another/project/links.jsonl"],
+  "archives": ["/local/workspace/current/autoform-native/records.jsonl"],
+  "include": ["*.json", "*.jsonl"],
+  "exclude": ["report.json"],
+  "bindings": [
+    {
+      "source": "https://example.org/wiki/immutable-revision/result.md",
+      "article": "blueprint/roadmap/result.md",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  ]
+}
+```
+
+Use actual source identities and the SHA-256 of the bound Markdown file's exact
+bytes. Paths in `roots` and `archives` are relative to the config file; absolute
+paths are accepted. Roots are traversed using the FCA reader, with optional
+include/exclude globs; archives are operational captures read separately, never
+mistaken for core shards. Select authored roots or a captured snapshot as the
+association authority. Selecting both intentionally retains every occurrence,
+including duplicates. Unknown config keys fail rather than silently broadening
+discovery. No implicit repository-wide annotation scan takes place.
+
+Bindings match resolved source URIs exactly. A path binding can identify any
+visible Markdown document inside `blueprint/`, including narrative source pages;
+it does not make that document a workflow node. An existing `article_id` can
+replace `article` for roadmap articles, but `sha256` is still required. An
+unchanged rename can then retain its attachment; changed bytes show a historical
+association with no locator applied. Missing articles, different representations,
+and unbound sources remain visible in the source index. PDF and LaTeX sources
+are not reinterpreted as Markdown articles. Generic and HTML bindings identify
+an explicitly chosen representation; matching local article bytes does not
+verify remote content or resolve an HTML selector.
+
+```bash
+autoform companions import /path/to/shards --output /path/to/new-retained --json
+autoform companions inspect /path/to/consumer --json
+autoform render /path/to/consumer/blueprint --lean-root /path/to/consumer \
+  --output /path/to/new-site-src
+autoform companions export /path/to/consumer --output /path/to/new-export --json
+```
+
+`inspect` and `export` accept `--config`; rendering accepts
+`--companion-config`. Otherwise the renderer finds configuration at `--lean-root`
+(or the blueprint's parent when no project root is supplied). With no config,
+normal rendering and Python 3.10 support are unchanged. Native commands use the
+same optional FCA 2.0.0a2 reference package described above, with Python 3.11+.
+Each selected annotation is reference-validated before output or render cleanup;
+validation is not a proof, correspondence, endpoint, or selector check.
+
+Rendering adds escaped attachment disclosures on original articles and a
+`companions.md` index grouped by informal resource. It uses the renderer's real
+chapter/anchor mapping, including articles embedded inside chapters. It never
+changes a source URI from Markdown to guessed HTML. Explicitly bound source
+notes also receive a local rendered view when ordinary source citations point
+to the repository. The generated index refuses to overwrite an authored file
+with that name. The publication manifest records the companion capture revision;
+a detected article change during rendering prevents a complete publication.
+
+The exact annotation is readable in each disclosure, including unknown
+extensions, all locations, and repeated IDs. Only safe HTTP(S) endpoints become
+links; relative HTTP references resolve against their captured carrier. Generic
+locations remain opaque and all selectors remain unresolved. Local carrier
+paths and origin metadata stay in the operational archive and inspection report,
+not in generated annotation disclosures. Authored annotation values themselves
+are displayed, so their contents should be appropriate for the intended reader.
+No input is fetched, selector executed, or proof worker launched.
+
+Native import writes a new directory containing `records.jsonl` and
+`report.json`, without manufacturing a wiki article per annotation. The archive
+retains `{annotation, origin}` entries, including duplicate occurrences, unknown
+extensions, object/array order, large integers, optional IDs, exact source types
+and locations. JSON whitespace changes. The original carrier URI remains the
+base even after an archive is moved or selected through a `current` symlink.
+This archive can also consume the earlier optional numbered catalog's records.
+The catalog command `import-annotations` remains available for explicit evidence
+inspection; it is not the native source-of-truth model.
+
+Native export retains this unchanged archive and writes core records to
+`annotations/links.jsonl`. To relocate core records safely it explicitly resolves
+only `source.uri`, `target`, and optional `$schema` against each original carrier,
+logging every lexical change in `report.json`. Absolute references remain
+unchanged. IDs, selectors, and unfamiliar extension values are never rewritten;
+unknown extension reference semantics still require the retained origin. An
+unresolvable relative reference fails portable export before writing. Scan only
+`annotations/`, not the operational archive/report. Output directories must be
+new, and their publication is atomic with no overwrite. Commands return 0 on
+success and 2 on validation or I/O errors.
+
+For coordinators, `autoform_cli.companions` exposes:
+
+- `capture_annotations(collection)`: reference-check and detach one captured FCA
+  collection without rereading its shards or resolving paths again.
+- `capture_retained_records(entries)`: check and detach operational entries with
+  original `origin.base_uri` and JSON `origin.pointer`. Optional `path`, `line`,
+  and unknown origin metadata are retained; HTTP carriers are supported.
+- `read_retained_annotations(path)`, `write_retained_annotations(capture,
+  output=...)`, and `export_retained_annotations(capture, output=...)`: retain or
+  export the same immutable capture used by another consumer.
+- `load_project_companions(project, config=...)` and
+  `inspect_project_companions(project, config=...)`: select and inspect native
+  attachments. Inspection reports include exact records/origins and attachment
+  states without modifying articles.
+
+The earlier `export-annotations` command is a **workflow-derived compatibility
+view**, labeled as such in its report. It derives associations from committed
+`lean:` targets; native export emits the selected actual FCA records. These are
+different authorities. Edit authored associations in their selected shards, not
+in a generated compatibility copy. Arbitrary FCA links, statuses, and extensions
+never replace checked `lean:` execution targets, assertions, dependencies,
+assumptions, or reviews, and never authorize a formalization job. Moving workflow
+metadata out of Markdown would be a separate refactor.

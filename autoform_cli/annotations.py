@@ -41,6 +41,7 @@ class AnnotationExport:
         """Operational report, deliberately separate from annotation shards."""
         return {
             "complete": not self.diagnostics,
+            "ownership": "autoform-workflow-derived-compatibility-view",
             "annotations": len(self.annotations),
             "repo": self.repo,
             "commit": self.commit,
