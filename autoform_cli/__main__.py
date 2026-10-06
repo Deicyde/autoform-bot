@@ -19,6 +19,7 @@ from .annotations import AnnotationExportError, export_annotations, write_annota
 from .article_identity import plan_article_ids
 from .audit import audit_blueprint
 from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_key
+from .companion_sources import CompanionImportError, import_annotations
 from .doctor import diagnose_project
 from .dashboard import publication_bound_live_state, serve_dashboard
 from .graph import GraphValidationError, load_graph
@@ -298,6 +299,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     annotations.add_argument("--output", required=True, type=Path, help="new output directory; must not already exist")
     annotations.add_argument("--json", action="store_true", help="write the export report as JSON")
 
+    companion_import = subparsers.add_parser("import-annotations", help="build a local Markdown source catalog from FCA shards")
+    companion_import.add_argument("paths", nargs="+", help="shard files or directory roots")
+    companion_import.add_argument("--output", required=True, type=Path, help="new source catalog directory")
+    companion_import.add_argument("--include", action="append", help="select a root-relative shard glob (repeatable)")
+    companion_import.add_argument("--exclude", action="append", default=[], help="exclude a shard glob (repeatable)")
+    companion_import.add_argument("--project", type=Path, help="require output below this project's blueprint/sources")
+    companion_import.add_argument("--json", action="store_true", help="write the catalog report as JSON")
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -320,11 +329,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _migrate(args)
     if args.command == "skeleton":
         return _skeleton(args)
+    if args.command == "import-annotations":
+        return _import_annotations(args)
     if args.command == "export-annotations":
         return _export_annotations(args)
     if args.command == "render":
         return _render(args)
     return 2
+
+
+def _import_annotations(args: argparse.Namespace) -> int:
+    try:
+        report = import_annotations(args.paths, output=args.output, include=args.include,
+                                    exclude=args.exclude, project=args.project)
+    except (GraphValidationError, RuntimeProjectionError) as error:
+        for issue in error.issues:
+            print(f"error: {_human_text(issue)}", file=sys.stderr)
+        return 2
+    except CompanionImportError as error:
+        print(f"error: {_human_text(error)}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, ValueError):
+        print("error: companion inputs or output cannot be read or written", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, ensure_ascii=True, sort_keys=True))
+    else:
+        print(f"Imported {report['annotations']} associations into {_human_text(args.output / 'README.md')}")
+    return 0
 
 
 def _export_annotations(args: argparse.Namespace) -> int:

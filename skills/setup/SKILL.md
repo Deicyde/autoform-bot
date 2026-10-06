@@ -117,6 +117,13 @@ theorem axioms on pull requests, and `blueprint-pages.yml`, which validates the
 DAG and its `lean:` declarations, renders the blueprint, builds MkDocs, and
 deploys GitHub Pages. Pass `--autoform-ref` to pin them at an immutable commit.
 
+When a user supplies companion annotation shards, import them as an existing
+source-evidence catalog using the [companion source import reference](../../autoform_cli/README.md#companion-source-import).
+Keep the catalog under a newly selected `blueprint/sources/` directory, preserve
+its carrier origins, and inspect the cited passages before planning from them.
+Producer annotations, statuses, and extensions do not establish a proof or a
+review result. Importing sources alone does not authorize a new roadmap plan.
+
 After it runs, fill in what only a human or a source can supply: the project
 description in `blueprint/README.md`, the coverage contract, and a verified
 `repo_url`. That URL is the *formalization project's own* repository, never

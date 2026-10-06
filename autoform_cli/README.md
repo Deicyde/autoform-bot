@@ -1181,3 +1181,68 @@ existing output. Identical inputs produce identical files. Exit 0 means all
 named associations were exported, 1 means an output was written with omissions
 (or no associations), and 2 means an input or output failure. No network request,
 proof worker, production write, or source mutation occurs.
+
+## Companion source import
+
+The reverse direction turns WikiLean or other FCA v2 shards into a local
+Markdown source catalog that Autoform's existing wiki, Obsidian, and renderer
+can read. Importing is source review, not a new formalization plan. It creates
+no roadmap nodes and does not change any proof or review state.
+
+```bash
+autoform import-annotations /path/to/shards /another/shard.jsonl \
+  --project /path/to/consumer \
+  --output /path/to/consumer/blueprint/sources/companion-001 --json
+```
+
+The output directory must be new and its parent must already exist. With
+`--project`, it must be under that project's existing `blueprint/sources/`.
+Omit `--project` to create a standalone catalog. `--include` and `--exclude`
+repeatable globs follow the reference reader's root-relative selection rules;
+use them to exclude unrelated package metadata and operational reports.
+Every selected input must validate before any output is written. Publication
+of the new local directory is atomic and never overwrites existing files.
+The command returns 0 on success and 2 on validation, dependency, or I/O failure.
+
+This optional command requires the unpublished **FCA 2.0.0a2 reference package**
+in the same Python environment as Autoform. Install the draft wheel and Autoform
+into a Python 3.11+ environment (the shared interoperability workspace uses
+Python 3.12). It is intentionally not a required Autoform dependency: the other
+commands continue to support Python 3.10, and an absent or mismatched checker
+produces an actionable error instead of skipping validation.
+
+The catalog has a `README.md`, one numbered Markdown page per occurrence, an
+operational `records.jsonl` archive, and `report.json`. Each page shows the
+informal source, formal destination, exact location, original carrier base,
+and complete annotation, including unfamiliar extensions. Repeated IDs and
+identical-looking records remain separate. Missing locations mean whole
+resources; supplied generic locations remain opaque and unresolved. Only
+absolute HTTP(S) endpoints without credentials become navigation links. Other
+URI schemes and relative endpoints remain readable text beside their original
+base; no resource is fetched and no selector is executed.
+
+The archive stores `{annotation, origin}` entries with the unchanged annotation
+value and original path, JSON pointer, physical JSONL line, and base URI. It is
+an operational archive, **not an FCA shard**. Do not scan it as relocated
+annotations: relative references still belong to their original carriers.
+JSON formatting changes, but extension values, object order, large integers,
+and occurrence multiplicity are retained. Imported producer assertions and
+statuses are displayed only as source data.
+
+Existing authored source indexes and roadmap articles are never edited. The
+report's `blueprint_relative_catalog` gives the escaped catalog path when
+`--project` is supplied. An authored article can cite an individual numbered
+page using its ordinary relative `## Sources` link. The existing renderer
+includes source pages in a local site without repository coordinates; when
+configured with repository coordinates, its normal source-note policy links
+to the repository instead. Imported records and their origin metadata are
+part of the selected source catalog, so they remain visible if that catalog
+is subsequently published by a separate authorized action.
+
+For coordinated local snapshots, `write_annotation_catalog(collection,
+output=..., project=...)` accepts an already captured FCA collection. It runs
+the reference checker again before staging and uses the captured absolute
+carrier paths directly, without rereading files or resolving their paths again.
+This lets the Brain index and Autoform catalog consume the same source capture.
+`import_annotations(paths, output=..., include=..., exclude=..., project=...)`
+is the discovery-plus-catalog convenience API.
