@@ -1,6 +1,8 @@
 """Interchange exercises an independent Git consumer, never the product tree."""
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
 import subprocess
 from pathlib import Path
@@ -66,11 +68,23 @@ def test_committed_atomic_source_and_target_are_independent_records(consumer, tm
     assert "version" not in record
     assert record["source"]["type"] == "generic"
     assert record["source"]["uri"].endswith(f"/{revision}/blueprint/roadmap/result.md")
-    assert record["target"] == f"{REPO}/blob/{revision}/Consumer.lean#L2"
+    assert record["source"]["pin"] == {
+        "type": "repository", "url": REPO, "commit": revision, "path": "blueprint/roadmap/result.md",
+        "sha256": hashlib.sha256((project / "blueprint/roadmap/result.md").read_bytes()).hexdigest(),
+    }
+    assert record["source"]["extensions"] == {"org.autoform": {"media_type": "text/markdown"}}
+    assert set(record["target"]) == {"uri", "pin"}
+    assert record["target"]["uri"] == f"{REPO}/blob/{revision}/Consumer.lean#L2"
+    assert record["target"]["pin"] == {
+        "type": "repository", "url": REPO, "commit": revision, "path": "Consumer.lean", "line": 2,
+        "declaration": "Consumer.result",
+        "sha256": hashlib.sha256((project / "Consumer.lean").read_bytes()).hexdigest(),
+    }
     extension = record["extensions"]["org.autoform"]
     assert extension["article_id"] == ARTICLE_ID
     assert extension["verification"] == "not-performed"
-    assert extension["declaration"]["name"] == "Consumer.result"
+    assert extension["declaration"] == {"name": "Consumer.result", "kind": "theorem"}
+    assert not {"repo", "commit", "line", "sha256"} & set(extension)
     assert not extension["workflow_assertions"]["proof_formalized"]
     output = write_annotation_shards(result, tmp_path / "export")
     assert json.loads((output / "report.json").read_text()) == result.report()
@@ -93,7 +107,8 @@ def test_multiple_declarations_split_and_repeated_names_do_not_duplicate(consume
     result = export_annotations(project, repo=REPO, commit=commit(project))
     assert len(result.annotations) == 2
     assert len({record["id"] for record in result.annotations}) == 2
-    assert {record["target"].split("#")[-1] for record in result.annotations} == {"L2", "L3"}
+    assert {record["target"]["uri"].split("#")[-1] for record in result.annotations} == {"L2", "L3"}
+    assert {record["target"]["pin"]["line"] for record in result.annotations} == {2, 3}
 
 
 @pytest.mark.parametrize("file", ["Consumer.lean", "blueprint/roadmap/result.md", "blueprint/roadmap/README.md"])
@@ -117,8 +132,8 @@ def test_byte_snapshot_is_used_after_indexing(consumer, monkeypatch) -> None:
 
     monkeypatch.setattr(module, "snapshot_project_sources", capture)
     record = export_annotations(project, repo=REPO, commit=revision).annotations[0]
-    assert record["target"].endswith("#L2")
-    assert record["extensions"]["org.autoform"]["declaration"]["name"] == "Consumer.result"
+    assert record["target"]["uri"].endswith("#L2")
+    assert record["target"]["pin"]["declaration"] == "Consumer.result"
 
 
 def test_article_changed_after_runtime_capture_fails(consumer, monkeypatch) -> None:
@@ -202,10 +217,11 @@ def test_paths_escape_uri_delimiters(consumer) -> None:
     git(project, "commit", "-qm", "URI path")
     revision = git(project, "rev-parse", "HEAD")
     record = export_annotations(project, repo=REPO, commit=revision).annotations[0]
-    parsed = urlsplit(record["target"])
+    parsed = urlsplit(record["target"]["uri"])
     assert parsed.fragment == "L2"
     assert not parsed.query
     assert unquote(parsed.path).endswith("/Result #1?.lean")
+    assert record["target"]["pin"]["path"] == "Result #1?.lean"
 
 
 @pytest.mark.parametrize("repo", ["../escape", "https://github.com/a/b/tree/main", "https://gitlab.com/a/b", "github.com/../b"])
@@ -274,7 +290,9 @@ def test_nested_project_urls_are_relative_to_repository_root(tmp_path: Path) -> 
     revision = commit(project)
     record = export_annotations(project, repo=REPO, commit=revision).annotations[0]
     assert record["source"]["uri"].endswith(f"/{revision}/packages/consumer/blueprint/roadmap/result.md")
-    assert record["target"].endswith(f"/{revision}/packages/consumer/Consumer.lean#L2")
+    assert record["source"]["pin"]["path"] == "packages/consumer/blueprint/roadmap/result.md"
+    assert record["target"]["uri"].endswith(f"/{revision}/packages/consumer/Consumer.lean#L2")
+    assert record["target"]["pin"]["path"] == "packages/consumer/Consumer.lean"
 
 
 def test_no_associations_is_explicit_and_output_has_no_fake_record(consumer, tmp_path: Path) -> None:
@@ -309,4 +327,16 @@ def test_public_declaration_after_private_helper_remains_linkable(consumer) -> N
     )
     result = export_annotations(project, repo=REPO, commit=commit(project))
     assert not result.diagnostics
-    assert result.annotations[0]["target"].endswith("#L3")
+    assert result.annotations[0]["target"]["uri"].endswith("#L3")
+    assert result.annotations[0]["target"]["pin"]["line"] == 3
+
+
+def test_exported_records_validate_against_the_reference_checker(consumer) -> None:
+    package = pytest.importorskip("formal_companion_annotations")
+    if package.__version__ != "2.0.0a2":
+        pytest.skip("requires the optional FCA 2.0.0a2 reference checker")
+    checker = importlib.import_module("formal_companion_annotations.companion")
+    project, revision = consumer
+    result = export_annotations(project, repo=REPO, commit=revision)
+    assert result.annotations
+    assert all(not checker.check(record).problems for record in result.annotations)

@@ -57,6 +57,12 @@ def _json_block(value: object) -> str:
     return fence + "json\n" + text + "\n" + fence
 
 
+def _target_reference(annotation: dict) -> str | None:
+    """The formal destination reference, or None for a record with no formal counterpart."""
+    target = annotation.get("target")
+    return target["uri"] if isinstance(target, dict) else target
+
+
 def _endpoint(label: str, reference: str) -> str:
     # Core acceptance is not permission to navigate. Only absolute HTTP(S)
     # endpoints become clickable; opaque, relative, file, and executable URIs
@@ -76,16 +82,22 @@ def _endpoint(label: str, reference: str) -> str:
 
 
 def _page(index: int, annotation: dict, origin: dict) -> str:
+    target = _target_reference(annotation)
     lines = [
         f"# Companion evidence {index}",
         "Imported association for source review. This page does not assert a proof, "
         "equivalence, human review, or that either endpoint or selector resolves.",
         _endpoint("Informal source", annotation["source"]["uri"]),
         "Source mode: " + _code(annotation["source"]["type"]),
-        _endpoint("Formal target", annotation["target"]),
+        _endpoint("Formal target", target) if target is not None else
+        "Formal target: none supplied. This record describes an informal passage with no formal counterpart.",
         "Relative references resolve against this original carrier URI: " + _code(origin["base_uri"]),
-        "## Location",
     ]
+    if "status" in annotation:
+        # A producer fact, shown as written. Pins inside it are citations, not checks.
+        lines.append("Producer status: " + _code(annotation["status"])
+                     + " (producer data, not Autoform proof or review state)")
+    lines.append("## Location")
     if "location" in annotation:
         lines.extend([
             "The producer supplied this location. Its meaning is retained exactly; "

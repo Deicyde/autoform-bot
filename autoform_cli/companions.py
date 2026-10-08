@@ -16,11 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from .companion_sources import CompanionImportError, REFERENCE_VERSION, _json, _reference_api
+from .companion_sources import CompanionImportError, REFERENCE_VERSION, _json, _reference_api, _target_reference
 from .skeleton import SkeletonError, _rename_no_replace
 
 CONFIG_NAME = ".autoform-companions.json"
 INDEX_NAME = "companions.md"
+_BUILTIN_PINS = frozenset({"website", "book", "paper", "repository"})
 _PARTS = re.compile(
     r"^(?:(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):)?(?://(?P<authority>[^/?#]*))?"
     r"(?P<path>[^?#]*)(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?$"
@@ -261,19 +262,35 @@ def resolve_reference(base: str, reference: str) -> str:
     return result
 
 
+def _reference_slots(value: dict) -> list[tuple[dict, str, str]]:
+    """Every core URI reference a record may carry, as (owner, key, JSON pointer).
+
+    A generic pin defines its own keys, so its ``url`` stays opaque.
+    """
+    target, status = value.get("target"), value.get("status")
+    slots = [(value["source"], "uri", "/source/uri")]
+    slots.append((target, "uri", "/target/uri") if isinstance(target, dict) else (value, "target", "/target"))
+    for owner, pointer in ((value["source"], "/source"), (target, "/target"), (status, "/status")):
+        pin = owner.get("pin") if isinstance(owner, dict) else None
+        if isinstance(pin, dict) and pin.get("type") in _BUILTIN_PINS:
+            slots.append((pin, "url", pointer + "/pin/url"))
+    slots.append((value, "$schema", "/$schema"))
+    return slots
+
+
 def export_retained_annotations(collection, *, output: str | Path) -> dict:
     """Export portable core records and retain originals alongside a rebase log.
 
-    Only source.uri, target and $schema have core URI-reference semantics.
-    IDs, locations and unknown extensions are never rewritten. Each occurrence
-    stays separate, even when content or IDs repeat.
+    Only source.uri, target or target.uri, the url of a built-in pin and
+    $schema have core URI-reference semantics. IDs, locations and unknown
+    extensions are never rewritten. Each occurrence stays separate, even when
+    content or IDs repeat.
     """
     snapshot = capture_annotations(collection)
     portable, changes = [], []
     for index, record in enumerate(snapshot.records, 1):
         value = record.annotation
-        for owner, key, pointer in ((value["source"], "uri", "/source/uri"),
-                                    (value, "target", "/target"), (value, "$schema", "/$schema")):
+        for owner, key, pointer in _reference_slots(value):
             if key not in owner:
                 continue
             original = owner[key]
@@ -469,7 +486,11 @@ def render_attachment(attachment: Attachment) -> str:
     # Display exact authored fields; only show resolved HTTP(S) destinations as
     # links. Local carrier paths are deliberately kept in the private archive.
     endpoints = []
-    for label, reference in (("Informal source", value["source"]["uri"]), ("Formal target", value["target"])):
+    target = _target_reference(value)
+    references = [("Informal source", value["source"]["uri"])]
+    if target is not None:
+        references.append(("Formal target", target))
+    for label, reference in references:
         endpoint = _html_endpoint(label, reference)
         match = _PARTS.fullmatch(reference)
         if match is None or match["scheme"] is None:
@@ -481,6 +502,13 @@ def render_attachment(attachment: Attachment) -> str:
             except (CompanionImportError, ValueError):
                 pass
         endpoints.append(endpoint)
+    if target is None:
+        endpoints.append("<p><strong>Formal target:</strong> none supplied. This record describes an "
+                         "informal passage with no formal counterpart.</p>")
+    if "status" in value:
+        status = html.escape(_json(value["status"]), quote=True)
+        endpoints.append(f"<p><strong>Producer status:</strong> <code>{status}</code> "
+                         "(producer data, not Autoform proof or review state)</p>")
     return (f'<details class="autoform-companion" data-companion-occurrence="{attachment.occurrence}" '
             f'data-companion-state="{attachment.state}"><summary>Companion association '
             f'{attachment.occurrence}</summary><p>{state}</p>' + "".join(endpoints) + location

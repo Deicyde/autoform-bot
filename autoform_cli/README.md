@@ -1147,32 +1147,40 @@ formal-companion-annotations scan /path/to/new-companion/annotations
 The exporter writes independent complete JSON records under `annotations/` and
 an operational `report.json` beside it. Scan the `annotations/` directory;
 `report.json` is not an annotation or a required manifest. Readers may regroup
-the records into other shard layouts. Every record has exactly one informal
-source and one formal target. This implementation follows the unreleased, unversioned
-single-record schema in Formal Companion Annotations' `schema/companion.schema.json`.
-Only `source` and `target` are required core fields; records carry no schema
-version number. `2.0.0a2` identifies the reference software package, not an
-annotation field.
+the records into other shard layouts. Every exported record has exactly one
+informal source and one formal target, although the format itself requires only
+`source`. This implementation follows the unreleased, unversioned single-record
+schema in Formal Companion Annotations' `schema/companion.schema.json`. Records
+carry no schema version number. `2.0.0a2` identifies the reference software
+package, not an annotation field.
 No FCA package is required to run Autoform, preserving Python 3.10 support;
 install the draft reference checker separately for interchange validation.
 
 The source is the entire authored Markdown article, represented by `generic`
-mode and a commit-pinned raw GitHub URI. The formal target is a commit-pinned
-Lean source URI with an exact line fragment. The exporter requires an explicit
-repository identity and full commit; it verifies the captured article and
-linked Lean bytes against that local Git commit. It does not check whether the
-remote repository exists or the commit has been published. GitHub is currently
-the only supported host. Authored citations remain inside the article; this
-export does not invent locations inside a cited PDF, LaTeX file, or webpage.
+mode and a commit-pinned raw GitHub URI. The formal target is an object whose
+`uri` is a commit-pinned Lean source URI with an exact line fragment. Both
+endpoints carry a `repository` pin: the source pin gives the repository URL,
+commit, article path, and SHA-256 of the article bytes; the target pin gives the
+repository URL, commit, Lean path, line, declaration name, and SHA-256 of the
+Lean file. The source's `media_type` stays in its `org.autoform` extension.
+The exporter requires an explicit repository identity and full commit; it
+verifies the captured article and linked Lean bytes against that local Git
+commit. It does not check whether the remote repository exists or the commit
+has been published. GitHub is currently the only supported host. Authored
+citations remain inside the article; this export does not invent locations
+inside a cited PDF, LaTeX file, or webpage.
 
 Articles naming declarations need durable `article_id` metadata. Each distinct
 local declaration produces a separate record; repeated names within one article
 produce one record. Annotation IDs include the repository, commit, article ID,
-and declaration name. The `org.autoform` extensions carry content hashes,
-declaration information, authored workflow assertions, and derived status.
-They are optional application data, not new core requirements. Resolution is
-lexical and marked `verification: not-performed`: export does not run Lean or
-establish correspondence, proof correctness, or human review.
+and declaration name. Pins carry the repository coordinates and content hashes;
+the `org.autoform` extension carries the article identity and title, the
+declaration name and keyword, authored workflow assertions, and derived status.
+Extensions are optional application data, not new core requirements. The
+exporter emits no `status`, `kind`, `label`, or `note` fact; derived workflow
+status is not a claim about the link. Resolution is lexical and marked
+`verification: not-performed`: export does not run Lean or establish
+correspondence, proof correctness, or human review.
 
 Missing identities, missing or ambiguous declarations, private/complex modifier
 forms, and external Mathlib declarations appear as omissions in the report.
@@ -1215,13 +1223,16 @@ produces an actionable error instead of skipping validation.
 
 The catalog has a `README.md`, one numbered Markdown page per occurrence, an
 operational `records.jsonl` archive, and `report.json`. Each page shows the
-informal source, formal destination, exact location, original carrier base,
-and complete annotation, including unfamiliar extensions. Repeated IDs and
-identical-looking records remain separate. Missing locations mean whole
-resources; supplied generic locations remain opaque and unresolved. Only
-absolute HTTP(S) endpoints without credentials become navigation links. Other
-URI schemes and relative endpoints remain readable text beside their original
-base; no resource is fetched and no selector is executed.
+informal source, the formal destination when one is supplied, any producer
+`status`, exact location, original carrier base, and complete annotation,
+including pins and unfamiliar extensions. A record without `target` is shown
+as an informal passage with no formal counterpart; a `target` object is shown
+by its `uri`. Repeated IDs and identical-looking records remain separate.
+Missing locations mean whole resources; supplied generic locations remain
+opaque and unresolved. Only absolute HTTP(S) endpoints without credentials
+become navigation links. Other URI schemes and relative endpoints remain
+readable text beside their original base; no resource is fetched and no
+selector is executed.
 
 The archive stores `{annotation, origin}` entries with the unchanged annotation
 value and original path, JSON pointer, physical JSONL line, and base URI. It is
@@ -1323,14 +1334,17 @@ to the repository. The generated index refuses to overwrite an authored file
 with that name. The publication manifest records the companion capture revision;
 a detected article change during rendering prevents a complete publication.
 
-The exact annotation is readable in each disclosure, including unknown
-extensions, all locations, and repeated IDs. Only safe HTTP(S) endpoints become
-links; relative HTTP references resolve against their captured carrier. Generic
-locations remain opaque and all selectors remain unresolved. Local carrier
-paths and origin metadata stay in the operational archive and inspection report,
-not in generated annotation disclosures. Authored annotation values themselves
-are displayed, so their contents should be appropriate for the intended reader.
-No input is fetched, selector executed, or proof worker launched.
+The exact annotation is readable in each disclosure, including pins, unknown
+extensions, all locations, and repeated IDs. A record without `target` is
+disclosed as an informal passage with no formal counterpart, a `target` object
+by its `uri`, and a producer `status` as data. Only safe HTTP(S) endpoints
+become links; relative HTTP references resolve against their captured carrier.
+Generic locations remain opaque and all selectors remain unresolved. Local
+carrier paths and origin metadata stay in the operational archive and
+inspection report, not in generated annotation disclosures. Authored annotation
+values themselves are displayed, so their contents should be appropriate for
+the intended reader. No input is fetched, selector executed, or proof worker
+launched.
 
 Native import writes a new directory containing `records.jsonl` and
 `report.json`, without manufacturing a wiki article per annotation. The archive
@@ -1343,15 +1357,18 @@ The catalog command `import-annotations` remains available for explicit evidence
 inspection; it is not the native source-of-truth model.
 
 Native export retains this unchanged archive and writes core records to
-`annotations/links.jsonl`. To relocate core records safely it explicitly resolves
-only `source.uri`, `target`, and optional `$schema` against each original carrier,
-logging every lexical change in `report.json`. Absolute references remain
-unchanged. IDs, selectors, and unfamiliar extension values are never rewritten;
-unknown extension reference semantics still require the retained origin. An
-unresolvable relative reference fails portable export before writing. Scan only
-`annotations/`, not the operational archive/report. Output directories must be
-new, and their publication is atomic with no overwrite. Commands return 0 on
-success and 2 on validation or I/O errors.
+`annotations/links.jsonl`. To relocate core records safely it explicitly
+resolves only the core references against each original carrier: `source.uri`,
+`target` or `target.uri`, the `url` of a built-in `source`, `target`, or
+`status` pin, and optional `$schema`. Every lexical change is logged in
+`report.json`. Absolute references remain unchanged. A `generic` pin defines
+its own keys, so its `url` is not rewritten. IDs, selectors, and unfamiliar
+extension values are never rewritten; unknown extension reference semantics
+still require the retained origin. An unresolvable relative reference fails
+portable export before writing. Scan only `annotations/`, not the operational
+archive/report. Output directories must be new, and their publication is atomic
+with no overwrite. Commands return 0 on success and 2 on validation or I/O
+errors.
 
 For coordinators, `autoform_cli.companions` exposes:
 

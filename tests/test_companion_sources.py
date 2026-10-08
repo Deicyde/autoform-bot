@@ -196,3 +196,25 @@ def test_old_top_level_version_is_rejected_before_writing_catalog(reference, sha
     with pytest.raises(CompanionImportError, match="reference validation"):
         import_annotations([shard], output=output)
     assert not output.exists()
+
+
+def test_absent_target_target_object_and_status_are_shown_as_data(reference, tmp_path):
+    library = {"type": "repository", "url": "https://example.invalid/lean", "commit": "0" * 40}
+    records = [
+        {"source": {"type": "generic", "uri": "urn:source:1"}, "kind": "remark",
+         "status": {"value": "not_formalized", "pin": library}},
+        {"source": {"type": "generic", "uri": "urn:source:2"}, "status": "formalized",
+         "target": {"uri": "https://example.invalid/formal#two", "pin": {**library, "declaration": "Test.two"}}},
+    ]
+    shard = tmp_path / "links.jsonl"
+    shard.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    output = tmp_path / "catalog"
+    assert import_annotations([shard], output=output)["annotations"] == 2
+    first = (output / "000001.md").read_text()
+    assert "no formal counterpart" in first
+    assert "Open formal target" not in first
+    assert "not_formalized" in first and "not Autoform proof" in first
+    second = (output / "000002.md").read_text()
+    assert "[Open formal target](<https://example.invalid/formal#two>)" in second
+    assert "Producer status: <code>&quot;formalized&quot;</code>" in second
+    assert [row["annotation"] for row in archive(output)] == records

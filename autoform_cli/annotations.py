@@ -164,18 +164,24 @@ def export_annotations(project_or_blueprint: str | Path, *, repo: str, commit: s
                 "id": "urn:autoform:annotation:" + hashlib.sha256(identity.encode("ascii")).hexdigest(),
                 "source": {
                     "type": "generic", "uri": source_uri,
-                    "extensions": {EXTENSION: {"media_type": "text/markdown", "sha256": digest}},
+                    # Repository pins carry the commit coordinates and the hash
+                    # of the committed bytes; the raw URI above serves the same bytes.
+                    "pin": {"type": "repository", "url": repo, "commit": commit, "path": path, "sha256": digest},
+                    "extensions": {EXTENSION: {"media_type": "text/markdown"}},
                 },
                 # No location means the whole authored Markdown article. We do
                 # not invent PDF/page coordinates for citations inside it.
-                "target": target_uri,
+                "target": {
+                    "uri": target_uri,
+                    "pin": {
+                        "type": "repository", "url": repo, "commit": commit, "path": lean_path,
+                        "line": declaration.line, "declaration": name,
+                        "sha256": hashlib.sha256(lean_content).hexdigest(),
+                    },
+                },
                 "extensions": {EXTENSION: {
                     "article_id": node.article_id, "article_path": path, "title": node.title,
-                    "repo": repo, "commit": commit,
-                    "declaration": {
-                        "name": name, "kind": declaration.keyword, "path": lean_path,
-                        "line": declaration.line, "sha256": hashlib.sha256(lean_content).hexdigest(),
-                    },
+                    "declaration": {"name": name, "kind": declaration.keyword},
                     "workflow_assertions": {**node.assertions.as_dict(), "mathlib": node.mathlib},
                     "derived_status": node.status.as_dict(),
                     "resolution": "lexical-source-index", "verification": "not-performed",

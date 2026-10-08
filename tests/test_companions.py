@@ -441,3 +441,47 @@ def test_native_attachment_views_build_with_real_mkdocs_and_correct_chapter_anch
     assert 'class="autoform-companion"' in chapter
     assert 'href="roadmap/index.html#result"' in index
     assert "&lt;tag&gt;" in chapter
+
+
+def test_absent_target_target_object_and_status_object_are_retained_rendered_and_rebased(consumer, tmp_path):
+    project, article = consumer
+    source = "https://example.invalid/wiki/result"
+    library = {"type": "repository", "url": "../lean", "commit": "0" * 40}
+    absent = {"source": {"type": "generic", "uri": source,
+                         "pin": {"type": "website", "url": "../wiki", "revision": "7"}},
+              "status": {"value": "not_formalized", "pin": library},
+              "kind": "proposition", "label": "Unlinked passage", "note": "No formal counterpart yet."}
+    linked = {"source": {"type": "generic", "uri": source, "pin": {"type": "generic", "url": "../opaque"}},
+              "target": {"uri": "../Result.lean#L2",
+                         "pin": {**library, "path": "Result.lean", "line": 2, "declaration": "Result"},
+                         "extensions": {"org.example": {"reviewed": False}}},
+              "status": "partial"}
+    configure(project, article, tmp_path, [entry(absent), entry(linked)])
+    report = companions.inspect_project_companions(project)
+    assert [a["annotation"] for a in report["attachments"]] == [absent, linked]
+    assert {a["state"] for a in report["attachments"]} == {"bound-revision"}
+    output = tmp_path / "site"
+    render_site(project / "blueprint", output, lean_root=project)
+    chapter = (output / "roadmap/README.md").read_text()
+    assert chapter.count('class="autoform-companion"') == 2
+    assert "no formal counterpart" in chapter
+    assert "not_formalized" in chapter and "partial" in chapter
+    rendered = site_converter().convert(chapter)
+    assert 'href="https://example.invalid/Result.lean#L2"' in rendered
+    assert 'href="https://example.invalid/wiki"' not in rendered  # pins are cited, never navigated
+    portable = tmp_path / "portable"
+    report = companions.export_retained_annotations(companions.load_project_companions(project).snapshot,
+                                                    output=portable)
+    rows = [json.loads(line) for line in (portable / report["shards"]).read_text().splitlines()]
+    assert "target" not in rows[0]
+    assert rows[0]["source"]["pin"]["url"] == "https://example.invalid/wiki"
+    assert rows[0]["status"]["pin"]["url"] == "https://example.invalid/lean"
+    assert rows[1]["source"]["pin"] == {"type": "generic", "url": "../opaque"}
+    assert rows[1]["target"]["uri"] == "https://example.invalid/Result.lean#L2"
+    assert rows[1]["target"]["pin"]["url"] == "https://example.invalid/lean"
+    assert rows[1]["target"]["extensions"] == {"org.example": {"reviewed": False}}
+    assert rows[1]["status"] == "partial"
+    assert [(c["occurrence"], c["pointer"]) for c in report["rebased"]] == [
+        (1, "/source/pin/url"), (1, "/status/pin/url"), (2, "/target/uri"), (2, "/target/pin/url")]
+    checker = importlib.import_module("formal_companion_annotations.companion")
+    assert all(not checker.check(row).problems for row in rows)
