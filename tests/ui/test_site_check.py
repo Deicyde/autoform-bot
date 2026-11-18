@@ -205,21 +205,60 @@ def test_check_reads_each_page_once_and_never_scans_the_pages_for_a_link(
     assert counted[0].scans == 0
 
 
-def test_cli_prints_problems_as_warnings_and_never_fails_on_them(tmp_path: Path, capsys) -> None:
+def test_cli_fails_on_reported_problems_only_in_strict_mode(tmp_path: Path, capsys) -> None:
     site = _site(
         tmp_path / "site", {"index.html": '<a href="missing.html">missing</a><a href="#x&#10;warning: forged">x</a>'}
     )
 
     assert main(["site", "check", str(site)]) == 0
-    assert capsys.readouterr().out == (
+    warnings = (
         f"{site}: 1 pages, 2 problem(s)\n"
         "warning: index.html: missing.html names missing.html, which the site does not contain\n"
         "warning: index.html: #x\\nwarning: forged names no anchor #xwarning: forged on index.html\n"
     )
+    assert capsys.readouterr().out == warnings
+    assert main(["site", "check", str(site), "--strict"]) == 1
+    assert capsys.readouterr().out == warnings.replace("\nwarning:", "\nerror:")
+    (site / "index.html").write_text("<p>Ready</p>", encoding="utf-8")
+    assert main(["site", "check", str(site), "--strict"]) == 0
+    assert capsys.readouterr().out == f"{site}: 1 pages, 0 problem(s)\n"
     assert main(["site", "check", str(tmp_path / "absent")]) == 1
     assert capsys.readouterr().out == f"error: {tmp_path / 'absent'} is not a directory\n"
     with pytest.raises(SiteCheckError, match="is not a directory"):
         check_site(site, tmp_path / "no-source")
+
+
+def test_empty_site_is_a_problem(tmp_path: Path) -> None:
+    assert check_site(tmp_path).issues == ("the site contains no HTML pages",)
+
+
+def test_map_follows_child_shards_and_checks_the_part_they_hold(tmp_path: Path) -> None:
+    from autoform_cli.ui.project_map import MAP_DIRECTORY, SCHEMA, part_file
+
+    region, child = "region", "region/topic"
+    parent_shard, child_shard = part_file(region), part_file(child)
+    parent = f"{MAP_DIRECTORY}/parts/{parent_shard}"
+    child_name = f"{MAP_DIRECTORY}/parts/{child_shard}"
+    assert parent != child_name
+    site = _site(
+        tmp_path / "site",
+        {
+            "index.html": "<h1>Home</h1>",
+            f"{MAP_DIRECTORY}/index.json": json.dumps({
+                "schema": SCHEMA, "regions": [{"id": region, "file": parent_shard}],
+            }),
+            parent: json.dumps({"schema": SCHEMA, "parts": {
+                region: {"children": [{"id": child, "file": child_shard}]},
+            }}),
+            child_name: json.dumps({"schema": SCHEMA, "parts": {}}),
+        },
+    )
+
+    assert check_site(site).issues == (f"{parent}: map part {child!r} is missing from {child_name}",)
+    (site / child_name).write_text(
+        json.dumps({"schema": SCHEMA, "parts": {child: {"children": []}}}), encoding="utf-8",
+    )
+    assert check_site(site).issues == ()
 
 
 def test_check_reports_only_the_broken_anchor_in_a_rendered_project_mkdocs_built(tmp_path: Path) -> None:
@@ -276,6 +315,25 @@ def test_check_reports_only_the_broken_anchor_in_a_rendered_project_mkdocs_built
     assert "The last result." not in alias
     assert report.pages > 0
     assert report.issues == ("roadmap/ch/index.html: #nowhere names no anchor #nowhere on roadmap/ch/index.html",)
+
+    site = project / "site"
+    source = project / "site-src"
+    index = site / "dependencies/index.json"
+    search = json.loads(index.read_text(encoding="utf-8"))
+    result = next(row for row in search["nodes"] if row["id"] == "ch/third")
+    result["route"] = "../roadmap/ch/index.html#missing-from-search"
+    index.write_text(json.dumps(search), encoding="utf-8")
+    data = site / "dependencies/map/data"
+    project_map = json.loads((data / "index.json").read_text(encoding="utf-8"))
+    shard = data / "parts" / project_map["regions"][0]["file"]
+    shard.unlink()
+
+    assert check_site(site, source).issues == (
+        *report.issues,
+        "dependencies/index.json: ../roadmap/ch/index.html#missing-from-search names no anchor "
+        "#missing-from-search on roadmap/ch/index.html",
+        f"{shard.relative_to(site).as_posix()}: missing explorer data",
+    )
 
 
 def _need_node() -> None:
@@ -438,16 +496,17 @@ def test_typesetting_gets_more_time_for_more_formulas(tmp_path: Path, monkeypatc
     assert limits == [30.005, 40.0]
 
 
-@pytest.mark.parametrize("refused", ["site", "source"])
-def test_a_directory_that_cannot_be_examined_is_unreadable_on_every_python(
+@pytest.mark.parametrize("refused", ["site", "source", "explorer"])
+def test_a_path_that_cannot_be_examined_is_unreadable_on_every_python(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refused: str
 ) -> None:
-    # From Python 3.14, is_dir() gives False for a path it cannot examine, which said it was not a directory.
-    # Before 3.14 it raised out of `site check` with a traceback.
+    # From Python 3.14, Path.exists() and is_dir() silently treat unreadable paths as missing.
+    from autoform_cli.ui.graph_pages import SEARCH_INDEX
+
     site = _site(tmp_path / "site", {"index.html": "<html><body></body></html>"})
     source = tmp_path / "source"
     source.mkdir()
-    path = site if refused == "site" else source
+    path = {"site": site, "source": source, "explorer": site / SEARCH_INDEX}[refused]
     unexaminable(monkeypatch, path)
 
     with pytest.raises(SiteCheckError) as caught:

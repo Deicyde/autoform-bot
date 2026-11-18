@@ -635,7 +635,7 @@ def _add_site_parser(subparsers: argparse._SubParsersAction) -> None:
     site = subparsers.add_parser("site", help="inspect a site MkDocs built from rendered source")
     site_subparsers = site.add_subparsers(dest="site_command", required=True)
     site_check = site_subparsers.add_parser(
-        "check", help="report dead internal links, missing anchors and statement cards the build lost"
+        "check", help="report broken links, missing explorer data and statement cards the build lost"
     )
     site_check.add_argument("site_dir", help="the built site: MkDocs's site_dir")
     site_check.add_argument(
@@ -648,6 +648,7 @@ def _add_site_parser(subparsers: argparse._SubParsersAction) -> None:
         type=Path,
         help="an unpacked MathJax 3.2.2 package, to typeset every article formula as the site does with Node.js",
     )
+    site_check.add_argument("--strict", action="store_true", help="exit 1 if the check finds any problems")
 
 
 def _site_check(args: argparse.Namespace) -> int:
@@ -660,10 +661,10 @@ def _site_check(args: argparse.Namespace) -> int:
         return 1
 
     print(f"{_human_text(args.site_dir)}: {report.pages} pages, {len(report.issues)} problem(s)")
+    level = "error" if args.strict else "warning"
     for issue in report.issues:
-        print(f"warning: {_human_text(issue)}")
-    # It informs: what it finds never fails the build.
-    return 0
+        print(f"{level}: {_human_text(issue)}")
+    return 1 if args.strict and report.issues else 0
 
 
 def _add_project_parser(subparsers: argparse._SubParsersAction) -> None:

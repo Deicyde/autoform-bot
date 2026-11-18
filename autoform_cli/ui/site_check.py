@@ -24,8 +24,11 @@ from .. import lean_probe
 from .._fs import path_is
 from ..markdown import FORMULA_CLASS
 from ..tex_macros import TEX_MACROS
+from .graph_pages import SEARCH_INDEX
 from .mathjax import CARD_CLASS, MATHJAX_SCRIPT, MATHJAX_VERSION
+from .project_map import MAP_DIRECTORY, SCHEMA as MAP_SCHEMA
 from .publishable import _TEX_DEFINITION
+from .site_index import SEARCH_SCHEMA, _openable_route
 
 #: The attribute through which each element links to, or loads, another file.
 _LINK_ATTRIBUTES = {
@@ -148,8 +151,8 @@ def _is_directory(path: Path) -> bool:
 def check_site(
     site_dir: str | Path, source_dir: str | Path | None = None, mathjax_dir: str | Path | None = None
 ) -> SiteReport:
-    """Report the internal links, fragments and statement cards a built site
-    lacks, and the formulas it cannot typeset.
+    """Report the internal links, explorer data, fragments and statement cards
+    a built site lacks, and the formulas it cannot typeset.
 
     Every HTML page under *site_dir* is read once. A link with a scheme or a
     network location, or a path from the site root, depends on where the site
@@ -199,12 +202,119 @@ def check_site(
     for index, linking in missing.values():
         if len(linking) > 1:
             issues[index] += f"; {len(linking) - 1} other page(s) link to it too"
+    if not pages:
+        issues.append("the site contains no HTML pages")
+    issues.extend(_explorer_problems(site, source, pages, files))
     if source is not None:
         issues.extend(_card_problems(source, pages))
     if mathjax_dir is not None:
         issues.extend(_formula_problems(site, Path(mathjax_dir), pages))
     # Render repeats a body link in a hidden validation copy, so one broken link can appear twice.
     return SiteReport(len(pages), tuple(dict.fromkeys(issues)))
+
+
+def _explorer_payload(site: Path, name: str, schema: str, issues: list[str]) -> dict | None:
+    try:
+        data = json.loads((site / name).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        issues.append(f"{name}: missing explorer data")
+        return None
+    except (OSError, ValueError, RecursionError) as error:
+        issues.append(f"{name}: could not read explorer data: {error}")
+        return None
+    if not isinstance(data, dict) or data.get("schema") != schema:
+        issues.append(f"{name}: expected explorer data with schema {schema}")
+        return None
+    return data
+
+
+def _explorer_problems(
+    site: Path, source: Path | None, pages: dict[str, _Page], files: dict[str, str | None],
+) -> list[str]:
+    """Check known renderer files, using the same bases as the explorer.
+
+    Search links are relative to the search index. Map summaries name a shard
+    basename relative to the map's parts directory, even inside another shard.
+    Each shard is read at most once, and only if a summary names it.
+    """
+    issues: list[str] = []
+
+    def expected(name: str) -> bool:
+        for root in (site, source):
+            if root is None:
+                continue
+            path = root / name
+            try:
+                if path_is(path, lambda _: True, follow_symlinks=False):
+                    return True
+            except OSError as error:
+                raise SiteCheckError(f"{path} cannot be read: {error.strerror}") from error
+        return False
+
+    if expected(SEARCH_INDEX):
+        index = _explorer_payload(site, SEARCH_INDEX, SEARCH_SCHEMA, issues)
+        if index is not None:
+            rows = index.get("nodes")
+            if not isinstance(rows, list):
+                issues.append(f"{SEARCH_INDEX}: expected a list of nodes")
+            else:
+                for row in rows:
+                    if not isinstance(row, dict):
+                        issues.append(f"{SEARCH_INDEX}: invalid node")
+                        continue
+                    route = row.get("route")
+                    destination = route if _openable_route(route) else row.get("url")
+                    for link in (destination, row.get("data_url")):
+                        if isinstance(link, str) and (problem := _link_problem(site, pages, files, SEARCH_INDEX, link)):
+                            issues.append(f"{SEARCH_INDEX}: {problem[0]}")
+
+    map_index = f"{MAP_DIRECTORY}/index.json"
+    if not expected(map_index):
+        return issues
+    index = _explorer_payload(site, map_index, MAP_SCHEMA, issues)
+    if index is None:
+        return issues
+    regions = index.get("regions")
+    if not isinstance(regions, list):
+        return [*issues, f"{map_index}: expected a list of regions"]
+
+    pending = [(map_index, region) for region in reversed(regions)]
+    seen: set[tuple[str, str]] = set()
+    shards: dict[str, dict | None] = {}
+    while pending:
+        name, summary = pending.pop()
+        part = summary.get("id") if isinstance(summary, dict) else None
+        basename = summary.get("file") if isinstance(summary, dict) else None
+        if (
+            not isinstance(part, str) or not part
+            or not isinstance(basename, str) or re.fullmatch(r"[0-9a-f]{2}\.json", basename) is None
+        ):
+            issues.append(f"{name}: invalid map part id or shard name")
+            continue
+        shard = f"{MAP_DIRECTORY}/parts/{basename}"
+        key = (shard, part)
+        if key in seen:
+            continue
+        seen.add(key)
+        if shard not in shards:
+            data = _explorer_payload(site, shard, MAP_SCHEMA, issues)
+            parts = data.get("parts") if data is not None else None
+            if data is not None and not isinstance(parts, dict):
+                issues.append(f"{shard}: expected a map of parts")
+            shards[shard] = parts if isinstance(parts, dict) else None
+        parts = shards[shard]
+        if parts is None:
+            continue
+        body = parts.get(part)
+        if not isinstance(body, dict):
+            issues.append(f"{name}: map part {part!r} is missing from {shard}")
+            continue
+        children = body.get("children")
+        if not isinstance(children, list):
+            issues.append(f"{shard}: expected a list of children for map part {part!r}")
+            continue
+        pending.extend((shard, child) for child in reversed(children))
+    return issues
 
 
 def _link_problem(

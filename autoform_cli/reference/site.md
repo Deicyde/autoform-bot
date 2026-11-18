@@ -112,3 +112,13 @@ contract fails `render` before it writes anything, but `MAPPED` rows (each an
 audit `declared-coverage-gap`; a new project lists the template's row) and
 coverage-role issues, which `render` prints as warnings, still publish. To block
 merges on findings, run `autoform audit` in CI without `continue-on-error`.
+
+Run `autoform site check site --source site-src --strict` after MkDocs to fail
+CI on a missing link, anchor, statement card or explorer file. The checker
+follows the published search index's routes and payload links, and the map
+index's shard references down to each child part. With `--source` it also
+reports either index if render wrote it but the build dropped it. An empty
+site is a problem. With `--mathjax`, strict mode also fails on formula
+problems or an unavailable formula check. Without `--strict`, findings
+remain warnings and leave the exit code at 0; unreadable input directories
+still exit 1. The generated workflow keeps its existing advisory behavior.

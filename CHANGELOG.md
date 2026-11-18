@@ -45,6 +45,11 @@ date when the release is tagged.
 
 ### Added
 
+- **Strict site checks.** `autoform site check --strict` exits 1 on findings;
+  the default remains advisory. The check also follows the generated search
+  routes and map shard references, so an HTML build that drops a required
+  explorer file can be caught before deployment.
+
 - **Interactive Lean tools.** The LSP adapter gains `lean_goal` (the tactic
   goal at a position), `lean_check_buffer` (diagnostics for caller-supplied
   text, never written to disk), `lean_try_tactics` (up to eight candidates,
@@ -83,8 +88,8 @@ date when the release is tagged.
   with its first formula and page, how many formulas and pages use it, and the
   fix: a macro in `tex-macros.json`. The commands `check` names are left to it.
   Without Node.js, a usable package or the site's settings, or past a time limit
-  that grows with the formulas, it says so once, and the exit status never
-  changes. The generated `blueprint-pages.yml` fetches MathJax 3.2.2 by checksum
+  that grows with the formulas, it says so once and keeps the default exit
+  status at 0. The generated `blueprint-pages.yml` fetches MathJax 3.2.2 by checksum
   before the build and passes `--mathjax` where its `AUTOFORM_REF`'s site check
   takes it; a project set up before this release gets both steps by copying them
   from the template (#815).
